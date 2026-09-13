@@ -46,10 +46,12 @@ function scopeKeyOf(v) {
   return typeof v === "string" && v.trim() ? v.trim() : null;
 }
 
-// v0.8.0 A2（issue #17）scope 检索加权系数：当前会话 scope 两维都命中 → 加成；
-// 任一维度带着他 scope → 降权但保留可见（硬过滤是 A3 strictScope）。未标注行
-// （NULL）与无法比较的维度恒中性——全局/存量记忆不因加权掉位。系数是模块常量
-// 而非配置项：A2 只定性行为，数值要等线上检索质量反馈再调（加配置面=提前优化）。
+// v0.8.0 A2（issue #17）scope 检索加权系数：两维都无法确立 foreign 的候选
+// （命中行、未标注行、当前侧维度解析不到的行）→ 加成；只有确立了 foreign
+// （记忆带标注 + 当前维度可解析 + 值不等）→ 降权但保留可见（硬过滤是 A3
+// strictScope）。即未标注行与命中行同列、不吃惩罚，但注意它们吃的是 BOOST
+// 而非 ×1 中性。系数是模块常量而非配置项：A2 只定性行为，数值要等线上检索
+// 质量反馈再调（加配置面=提前优化）。
 const SCOPE_MATCH_BOOST = 1.25;
 const SCOPE_FOREIGN_PENALTY = 0.5;
 
@@ -78,6 +80,22 @@ function inOccurredBounds(m, bounds) {
   if (!Number.isFinite(t)) return true;
   if (bounds.from && t < Date.parse(bounds.from)) return false;
   if (bounds.to && t > Date.parse(bounds.to)) return false;
+  return true;
+}
+
+/**
+ * v0.8.0 A3（issue #17）strictScope 可见性谓词：issue 的四象限可见性公式
+ * （agent 不对称可见性）——记忆对当前会话可见 ⇔ (agent 维：未标注 或 命中当前
+ * agent) AND (workspace 维：未标注 或 命中当前 workspace)。NULL=未标注=全局；
+ * 当前会话某维度解析不到时，该维度带标注的记忆一律不可见（fail-closed：身份
+ * 不明的会话只见全局，不冒认）。sensitivity 是标签不参与可见性判定（其语义
+ * 留给后续批次）。store.list 的 SQL 过滤与此谓词同口径（见 store.js visibility）。
+ */
+function isVisibleInScope(m, current) {
+  const agent = scopeKeyOf(m.agent_scope);
+  if (agent !== null && (current.agent_scope === null || agent !== current.agent_scope)) return false;
+  const ws = scopeKeyOf(m.workspace_scope);
+  if (ws !== null && (current.workspace_scope === null || ws !== current.workspace_scope)) return false;
   return true;
 }
 
@@ -711,6 +729,13 @@ export function createService({ store, mirror, config, onWrite, logger }) {
 
     const { merged: fusedMerged, signals } = fuseRecall({ keyword, vector, bm25, lim, mode, wv, wk, wb });
     let merged = fusedMerged;
+    // v0.8.0 A3（issue #17）：strictScope 硬过滤——他 scope 的候选直接出局
+    // （区别于 A2 的降权保留可见）；未标注行与命中行保留。strict 与 A2 加权
+    // 叠加：过滤后剩下的命中行仍吃加成。scope 未传（flag 关）或完全解析不到
+    // 时跳过——identity 为空的对象（{null,null}）按 fail-closed 过滤。
+    if (config.strictScope === true && scope) {
+      merged = merged.filter((m) => isVisibleInScope(m, scope));
+    }
     // v0.8.0 A2：occurred_at 时间过滤——在融合池上先滤再 dedup/slice，rerank
     // 只看窗内候选，topK 槽位不被窗外行占用。
     const occurredBounds = updatedAtBounds(occurredFrom, occurredTo);
@@ -746,10 +771,11 @@ export function createService({ store, mirror, config, onWrite, logger }) {
         .slice(0, lim);
     }
 
-    // v0.8.0 A2（issue #17）：scope 检索加权——当前会话 scope 两维命中的候选
-    // 加成、带他 scope 的候选降权但保留可见（硬过滤是 A3 strictScope）。未标注
-    // 行与无法比较的维度恒中性；flag 关或调用方未传 scope 时不动分，排序与
-    // A2 前逐字节一致。与 epistemic 加权同款收尾：乘分 → 降序 → 截 topK。
+    // v0.8.0 A2（issue #17）：scope 检索加权——两维都无法确立 foreign 的候选
+    // （命中/未标注/当前侧解析不到）加成，确立 foreign 的候选降权但保留可见
+    // （硬过滤是 A3 strictScope）；未标注行与命中行同列吃 BOOST、不被压制。
+    // flag 关或调用方未传 scope 时不动分，排序与 A2 前逐字节一致。与
+    // epistemic 加权同款收尾：乘分 → 降序 → 截 topK。
     if (config.scopeEnabled === true && scope && (scope.agent_scope || scope.workspace_scope)) {
       result = result
         .map((m) => ({ ...m, score: (m.score ?? 0) * scopeMultiplier(m, scope) }))
@@ -1164,7 +1190,7 @@ export function createService({ store, mirror, config, onWrite, logger }) {
    * fills + dedupes the remaining slots. Empty query / no cached recall /
    * hybridInject off → pure legacy rule-based selection.
    */
-  function injectCandidates({ query = "", maxItems = 5, threshold = 3, queryVector } = {}) {
+  function injectCandidates({ query = "", maxItems = 5, threshold = 3, queryVector, scope = null } = {}) {
     const q = String(query ?? "").trim();
     // codingRetrospect 读取侧门控：编码记忆（rejected_solution / pitfall /
     // constraint）只在编码任务时注入，防噪声污染其他业务；编码任务时按
@@ -1253,6 +1279,11 @@ export function createService({ store, mirror, config, onWrite, logger }) {
           candidates = [...candidates].sort((a, b) => (sim.get(b.id) ?? -1) - (sim.get(a.id) ?? -1));
         }
       } catch { /* topic re-rank unavailable: keep rule-based order */ }
+    }
+    // v0.8.0 A3（issue #17）：strictScope 硬过滤同样作用于自动注入——scoped 记忆
+    // 泄进无关注入上下文是最典型的越权通道，检索侧过滤挡不住这里。
+    if (config?.strictScope === true && scope) {
+      candidates = candidates.filter((m) => isVisibleInScope(m, scope));
     }
     const selected = candidates.slice(0, maxItems);
     touchRecalled(selected);
@@ -1613,6 +1644,7 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     injectCandidates,
     mergeHumanEdits,
     toApiList,
+    isVisibleInScope,
     transaction,
     enqueue,
     setDreamHook(fn) { dreamHook = fn; },
