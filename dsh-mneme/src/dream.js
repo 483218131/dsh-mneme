@@ -1,5 +1,6 @@
 import { validateDecisions, applyDecisions } from "./dream/decisions.js";
 import { clusterMemories, findPotentialConflicts, cosineSimilarity } from "./dream/clustering.js";
+import { scopeKeyOf } from "./scope.js";
 import { createHash, randomUUID } from "node:crypto";
 import { STR, langOf } from "./lang.js";
 export { validateDecisions, applyDecisions, withEffortFallback, describeStreamFailure, resolveDreamEffort, resolveRoute };
@@ -989,7 +990,21 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
     // bounds the review queue; overflow is skipped with a warning.
     let frozenCount = 0;
     const frozenIds = [];
-    const applyList = freezeEnabled ? decisions.filter((d) => d.action !== "conflict") : decisions;
+    // v0.8.1（issue #170 复核项 3）：跨 scope 的 conflict 决策两种模式都一律
+    // 停车人工裁决、绝不自动归档——否则普通 dream 的 LLM 能归档别的 scope 的
+    // 唯一副本，sleep 路径（scope-candidate-queue）的保护在这里缺位。同 scope
+    // 的 conflict 决策照旧：freeze 停车 / 非 freeze 自动裁决。
+    const isCrossScopeDecision = (d) => {
+      const a = snapshot.get(d.winner);
+      const b = snapshot.get(d.loser);
+      return !!a && !!b && (
+        scopeKeyOf(a.agent_scope) !== scopeKeyOf(b.agent_scope)
+        || scopeKeyOf(a.workspace_scope) !== scopeKeyOf(b.workspace_scope)
+      );
+    };
+    const applyList = freezeEnabled
+      ? decisions.filter((d) => d.action !== "conflict")
+      : decisions.filter((d) => d.action !== "conflict" || !isCrossScopeDecision(d));
     if (freezeEnabled) {
       const conflictsToFreeze = decisions.filter((d) => d.action === "conflict");
       if (conflictsToFreeze.length > 0) {
@@ -1003,7 +1018,10 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
           }
           for (const d of toFreeze) {
             try {
-              service.saveConflictPending({ run_id: runId, memory_a: d.winner, memory_b: d.loser, reason: d.reason });
+              // 返回 undefined = 该对已被人工裁决且两侧内容未变（issue #170 复核
+              // 项 4：内容变了才重新入队）——不算停车、不进 frozenIds。
+              const parked = service.saveConflictPending({ run_id: runId, memory_a: d.winner, memory_b: d.loser, reason: d.reason });
+              if (parked == null) continue;
               frozenCount++;
               frozenIds.push(d.winner, d.loser);
             } catch (error) {
@@ -1013,6 +1031,29 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
         } catch (error) {
           logger?.warn?.(`dsh-mneme dream: conflict freeze lookup failed: ${String(error)}`);
         }
+      }
+    } else {
+      // 非 freeze：跨 scope conflict 停车（绝不进 applyDecisions）。带专属
+      // reason + 模型给出的裁决理由，队列里读起来是「归属裁决」而非重复项。
+      const crossScope = decisions.filter((d) => d.action === "conflict" && isCrossScopeDecision(d));
+      for (const d of crossScope) {
+        try {
+          const parked = service.saveConflictPending({
+            run_id: runId,
+            memory_a: d.winner,
+            memory_b: d.loser,
+            reason: STR.scopeConflictParkReason[language](d.reason)
+          });
+          if (parked != null) {
+            frozenCount++;
+            frozenIds.push(d.winner, d.loser);
+          }
+        } catch (error) {
+          logger?.warn?.(`dsh-mneme dream: failed to park cross-scope conflict ${d.winner}/${d.loser}: ${String(error)}`);
+        }
+      }
+      if (crossScope.length > 0) {
+        logger?.info?.(`[dsh-mneme] dream: parked ${crossScope.length} cross-scope conflict(s) for human ownership review`);
       }
     }
 
