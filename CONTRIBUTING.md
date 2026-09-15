@@ -98,9 +98,20 @@ Common scripts (all run under `dsh-mneme/`):
   ```
 
 - Run `npm test` before committing and confirm green (note any environment-only known exceptions in the commit message).
-- **Small fixes**: can push straight to `main` (this is the project's workflow).
+- **Small fixes**: maintainers can push straight to `main` (maintainers-only shortcut — contributors always go through the workflow below).
 - **Larger features / breaking changes**: open an Issue first to state the motivation and design, then submit a PR — the PR triggers CI (Node 24 + full suite + Codecov).
 - Release operations (version bumps, tags, Releases, npm publish) are performed by maintainers — see the next section.
+
+---
+
+## Contributor Workflow: Issue → Claim → PR
+
+Almost every change — **fixes and small features included** — starts from an Issue. Actionable work is labelled `good first issue` / `help wanted`.
+
+1. **Claim before you start**: comment on the Issue with a short plan (what you will change, which files/tests). If the approach has open questions (path conventions, response shapes), settle them in that thread first — maintainer feedback on the claim is the fastest way to a merged PR. Opening a PR with no related Issue will be closed as unexpected (exceptions: typos and pure docs fixes).
+2. **One PR per Issue**: reference it in the PR body (`Closes #N` / `Fixes #N` when the PR fully resolves it).
+3. **Keep the PR minimal**: behavior changes belong in `src/` (+ `test/`); run `npm run sync` so `lib/` follows (`check-sync` will fail CI otherwise); `npm test` green; user-visible changes include their README line in the same PR.
+4. **CI must be green** (Node 22/24 × Linux/Windows, full suite, Codecov) before review.
 
 ---
 
