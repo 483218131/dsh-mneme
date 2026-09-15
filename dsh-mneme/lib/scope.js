@@ -8,8 +8,11 @@
 // 硬约束：解析失败绝不阻塞写入——任何一步取不到就落 NULL（读侧 NULL = 未标注
 // = 全局可见），任何异常都被吞掉（registry 故障 warn 一次后降级）。
 //
-// scopeEnabled 关闭时 resolveWriteScope 返回 null，调用方一个字段都不该标注，
-// 写入与去重行为和 A1 之前逐字节一致。
+// v0.8.1（issue #170 复核项 2）：scopeEnabled 的闸门从解析器挪到「写标注」处
+// （memory_save 的 auto 分支）。解析器恒返回会话身份（真取不到才是 null）——
+// 读取侧（strictVisibility / memory_get / inject）与显式声明都依赖它：flag 关
+// 只关「自动标注」，不能连读取身份一起关，否则 strictScope 硬墙被静默拆掉
+// （fail-open）。
 
 /**
  * @param {object} deps
@@ -31,8 +34,6 @@ export function createScopeResolver({ ctx, config, logger } = {}) {
   };
 
   return function resolveWriteScope(exec) {
-    if (config?.scopeEnabled !== true) return null;
-
     let session = null;
     try {
       session = exec?.agent?.session ?? null;
@@ -80,4 +81,25 @@ export function createScopeResolver({ ctx, config, logger } = {}) {
 
     return { agent_scope: agentScope, workspace_scope: workspaceScope };
   };
+}
+
+/**
+ * v0.8.1 底座（issue #170）：显式 scope 参数（memory_save / memory_update /
+ * 面板编辑）的归一化。约定：
+ *   - 省略（undefined，由调用方判断）= 该维不声明，回落载体自动标注；
+ *   - "global"（大小写不敏感）/ "*" / 空白 = 显式声明全局 → 存储 NULL
+ *     （行上的 agent_scope_source='explicit' 承担「显式全局」与「从未标注」
+ *     的区分，NULL 本身继续表示全局可见）；
+ *   - 其余非空 trim 字符串 = 收窄到该标签。
+ * 脏输入（非字符串）落 NULL（等同声明全局）——与 resolveWriteScope 的「解析
+ * 绝不阻塞写入」同一哲学：显式声明是用户意图，形状不对时宁可放宽不报错。
+ *
+ * @param {unknown} raw 工具/HTTP 参数原值
+ * @returns {string|null} 归一化后的标签值（null=显式全局）
+ */
+export function normalizeExplicitScope(raw) {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s || s === "*" || s.toLowerCase() === "global") return null;
+  return s;
 }
