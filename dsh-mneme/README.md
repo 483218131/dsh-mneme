@@ -470,6 +470,8 @@ dsh web
 > 🔐 **API 安全**：DSH 无内置鉴权且默认仅监听 `127.0.0.1`。插件 API 默认开放（便于 Web 面板即装即用）。如需防护（如局域网暴露），在配置中设置 `apiToken`：写操作（画像/规则/命令）与密钥端点（`vector-config`、`vector-reindex`）需携带 `Authorization: Bearer <token>`（前端设置面板可填入同一 token），只读的 `list` / `search` / `semantic` 保持开放。`/api/dsh-mneme/vector-config` 返回的 `apiKey` 已掩码（`sk-***…`），存储仍保留明文供调用；前端回传空或掩码值表示"不改 key"。
 
 
+> ⚠️ **已知边界：极简模式（minimal agent preset）下不注入**（宿主设计，非插件缺陷）：minimal 预设的组合文件显式 `complete: true` + `includeRuntimeContext: false`——整条系统提示词被 persona 钉死、全部 runtime context 快照被压制，**记忆注入 / 用户画像 / hot memory 在极简模式会话中一律不送达模型**（宿主内置 context 同样消失）。判断与解法：会话头部显示「极简模式」即为该形态；需要记忆注入请改用标准模式（会话级切换，或 `~/.dsh/settings.yaml` 设 `agent-presets.default: standard`——注意 `--dump-config` 显示的是 bundle 默认值，会被用户层覆盖，不能反映实际生效值）；极简模式下的过渡方案是把画像/规则写入 `AGENTS.md`（agent-instructions 走 section 路径，不受该压制影响）。
+
 ## 外部 API 与 CLI
 
 除 DSH 内部端口外，插件还可以开启一个**独立的 HTTP 外部 API**（默认 `http://127.0.0.1:8790`，Bearer token 鉴权），供其他插件、CLI 脚本或桌面工具读写记忆，不依赖 DSH 内部端口。
