@@ -102,6 +102,13 @@ Common scripts (all run under `dsh-mneme/`):
 - **Larger features / breaking changes**: open an Issue first to state the motivation and design, then submit a PR — the PR triggers CI (Node 24 + full suite + Codecov).
 - Release operations (version bumps, tags, Releases, npm publish) are performed by maintainers — see the next section.
 
+**Commit attribution is mandatory.** Every commit in a PR must be attributable to the PR author:
+
+- Use an author email that belongs to **your own GitHub account** — preferably your noreply address (`ID+username@users.noreply.github.com`, see Settings → Emails). Check with `git config user.email`.
+- **Signed commits are strongly recommended** (GPG/SSH — the "Verified" badge); they are the only cryptographic proof of authorship.
+- Commits whose author email resolves to **someone else's GitHub account**, or that cannot be linked to you at all, **will not be merged**: unattributed code means nobody owns the responsibility when review questions or regressions arrive.
+- You are expected to participate in review and answer questions about your own code — attribution is what makes that possible.
+
 ---
 
 ## Contributor Workflow: Issue → Claim → PR
@@ -298,6 +305,13 @@ npm run test:coverage # c8 覆盖率
 - **小改动 / 修复**：可直推 `main`（本项目采用此工作流）。
 - **较大功能 / 破坏性改动**：建议先开 Issue 说明动机与方案，再通过 PR 提交，PR 会触发 CI 校验（node 24 + 全量测试 + Codecov）。
 - 发布相关操作（改版本号、打 tag、发 Release、npm publish）由维护者执行，详见下节。
+
+**提交署名是硬性要求。** PR 里的每个 commit 都必须可归属到 PR 作者本人：
+
+- 提交邮箱必须属于**你自己的 GitHub 账号**——推荐用 noreply 地址（`ID+用户名@users.noreply.github.com`，见 Settings → Emails）。用 `git config user.email` 自查。
+- **强烈建议签名提交**（GPG/SSH，即 "Verified" 徽章）——这是作者身份的唯一密码学证明。
+- 提交邮箱被 GitHub 归属到**他人账号**、或完全无法归属到你的 commit，**不予合并**：无法署名的代码，在 review 提问或出现回归时找不到责任人。
+- 你需要参与 review 并能回答自己代码的问题——这正是署名的意义。
 
 ---
 
