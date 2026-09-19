@@ -418,6 +418,8 @@ dsh web
 | `summarizeMaxEntriesPerRun` | `0` | 单次蒸馏产出记忆条数上限（0-50，0=不限）：节流防单会话大量重复条目（#127） |
 | `summarizeMinWindowChars` | `0` | 蒸馏前零 LLM 预判：窗口可蒸馏文本不足此字符数直接跳过调用（0-100000，0=关）；skip 原因写入审计（#239） |
 | `summarizeMaxRunsPerSession` | `0` | 每会话最多发起多少次蒸馏 LLM 调用（0-1000，0=不限）；只计真实调用，被预判拦下的不占额度（#239） |
+| `summarizePeakHours` | 空 | 高峰时段（本地时间，逗号分隔、可带星期前缀，支持跨零点）：空=关；命中时蒸馏顺延到非高峰、窗口累积后一次蒸、skip 原因入审计。例：按高峰计费的供应商可写 `mon-fri 08:00-12:00,14:00-18:00`（如 DeepSeek，以其官方定价页为准）（#239） |
+| `summarizePeakMaxDeferMinutes` | `120` | 高峰顺延上限（0-1440 分钟，0=不设上限）：到点仍处高峰就照常跑，避免长高峰把蒸馏饿死（#239） |
 | `summarizeDedupeMode` | `off` | 落库前去重档位：`off`（默认=现状）/ `title`（零成本，仅拦完全同名）/ `vector`（复用 embedding 列做同会话语义近邻，无 LLM 调用，#127） |
 | `summarizeDedupeMinSim` | `0.92` | vector 去重档的相似度阈值（0.5-0.99） |
 | `summarizeDedupeWindowHours` | `24` | vector 去重的同会话时间窗（小时，0-168） |
