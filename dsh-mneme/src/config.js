@@ -35,6 +35,20 @@ export const Config = z.object({
   // 额度浪费在零成本窗口上。计数是进程内 per-session（与最小间隔闸门同生命
   // 周期），宿主重启即清零，与 #229 的游标持久化是两件事。
   summarizeMaxRunsPerSession: z.natural().min(0).max(1000).default(0),
+  // Issue #239（第 4 项，错峰队列）：高峰期蒸馏顺延。空串 = 关闭，行为与现状逐
+  // 字节一致。取值是本地时间的时段列表（逗号分隔，支持跨零点），可带**星期前缀**
+  // （可省；ISO 1=周一…7=周日，也认 mon..sun；省略 = 每天）：
+  //   "09:00-18:00"                      每天 09:00-18:00
+  //   "mon-fri 08:00-12:00,14:00-18:00"  工作日两段（按高峰计费的供应商即此形态）
+  //   "sat,sun 23:00-06:00"              周末跨零点段
+  // 命中高峰时：不调 LLM、不消费游标（窗口继续累积，留到非高峰一次性蒸馏——批量
+  // 比逐轮碎蒸更省），登记一行 status='skipped' / error_message='peak-hours' 审计，
+  // 并按下面的上限择时补跑。任一写法非法则整串按「未配置」处理：排程是省钱
+  // 手段，绝不该因为写错格式把蒸馏停掉。
+  summarizePeakHours: z.string().default(""),
+  // 高峰顺延上限（分钟，0 = 不设上限）：到点仍处高峰就照常跑，避免整天高峰把蒸馏
+  // 饿死。默认 120 分钟。仅在上面的时段串非空时生效。
+  summarizePeakMaxDeferMinutes: z.natural().min(0).max(1440).default(120),
   // 落库前去重档位：off（默认，等同现状）/ title（零成本，仅拦完全同名）/
   // vector（复用已有 embedding 列做同会话语义近邻，无 LLM 调用）。
   summarizeDedupeMode: z.union([z.const("off"), z.const("title"), z.const("vector")]).default("off"),
@@ -58,6 +72,11 @@ export const Config = z.object({
   // 默认 300 = 与既有行为一致。
   injectContentMaxChars: z.natural().min(60).max(4000).default(300),
   importanceThreshold: z.natural().min(1).max(5).default(3),
+  // Issue #239（第 5 项）：注入条数的查询自适应（默认关）。确定性强的话题收缩注入
+  // 条数（减半、下限 1），模糊话题（回指/时间线索，或极短查询）维持
+  // maxInjectedItems 上限——只做**单向收缩**，绝不越过用户配置的上限；判据只看
+  // 查询本身，不做额外检索（先探针检索等于白付一次 fuseRecall）。
+  injectUncertaintyAdaptive: z.boolean().default(false),
   // 编码记忆蒸馏（codingRetrospect，opt-in，默认关）。开启时，turn/end 蒸馏
   // 额外提取三类编码专属记忆：rejected_solution（被否决方案）/ pitfall（踩坑）/
   // constraint（工程约束）。蒸馏上下文为整轮完整对话（用户输入 → 助手思考/回答
@@ -146,6 +165,17 @@ export const Config = z.object({
   ]).default("window"),
   // hybrid 的候选总量上限；0 = 复用 dreamMaxSnapshotSize（不迁移，需要时显式覆盖）。
   dreamCandidateMax: z.natural().min(0).max(5000).default(0),
+  // Issue #258：总览（dream_summarize）独立路由。consolidate 有 dreamMaxSnapshotSize
+  // 窗口、总览原为全库无界——两者对 ctx 的需求差 4 倍以上却强制共用 dream 路由，
+  // dreamProvider 指向小 ctx 模型时总览当场 CONTEXT_WINDOW_EXCEEDED（实测 120,969
+  // tokens > 32,768），指向大 ctx 模型则 consolidate 的卸载收益归零。未配置 = 回落
+  // dream 路由，行为逐字节不变。
+  dreamSummaryProvider: z.string().default("").description("记忆总览（dream_summarize）专用模型服务商，留空用巩固模型。总览输入为全库（或 dreamSummaryMaxInputs 上限），ctx 需求远大于 consolidation，建议大 ctx 模型（issue #258）。"),
+  dreamSummaryModel: z.string().default("").description("记忆总览（dream_summarize）专用模型，留空用巩固模型；总览输入随库增长，建议大 ctx 非思考模型（issue #258）。"),
+  // Issue #258：总览输入条数硬上限。0 = 不设上限（历史行为，库增长可能撑爆小
+  // ctx 模型）；>0 时按 updated_at 倒序保留最新的 N 条（与 consolidate 窗口同一
+  // 排序口径）。总览是常驻叙述而非逐条巩固，限输入只影响口径脚注里的条数。
+  dreamSummaryMaxInputs: z.natural().min(0).max(100000).default(0),
   // hybrid 判"高相似"的阈值；0.85 与 sleep normal 档对齐——两个模块对"高相似"
   // 保持同一个定义。
   dreamCandidateMinSim: z.number().min(0.5).max(0.99).default(0.85),
@@ -407,6 +437,12 @@ export const Config = z.object({
     z.const("high"),
     z.const("none")
   ]).description("同 dreamReasoningEffort：sleep 各阶段 LLM 的推理档位，未配置 = 自动取模型支持的最低档；显式 'none' = 不发送字段、用服务商自带默认。"),
+  // Issue #257：sleep 冲突/模式两阶段的输出预算（原硬编码 2048）。实测默认档
+  // 每对裁决约 90 token、24 对 2097——2048 恰好压在边界（53 次运行 48 败）；
+  // full 档六分支实测约 290 token/对、24 对 6967，2048 必然截断。默认 8192
+  // 覆盖实测峰值（候选对按「每记忆至多一对」去重，饱和在 ~25 对、不随库无限
+  // 增长）；流式计费按实际用量，不按上限。
+  sleepMaxTokens: z.natural().min(256).max(131072).default(8192).description("sleep 冲突消解与模式发现阶段的 LLM 输出预算上限（token）。原为硬编码 2048，sleepActionSet=full 实测需约 7000 导致裁决被截断而整轮失败；流式计费按实际用量，调大不增加成本。"),
 
   // --- epistemic trust: memory source credibility (v0.4.5) -----------------
   // Distinguish memories by source: observation (measured / witnessed),

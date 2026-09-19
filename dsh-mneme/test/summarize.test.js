@@ -2,8 +2,47 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createStore } from "../src/store.js";
 import { createService } from "../src/service.js";
-import { createSummarizer, parseSummaryJson } from "../src/summarize.js";
+import { createSummarizer, parseSummaryJson, parsePeakSpec, isInPeakWindow, nextOffPeakAt } from "../src/summarize.js";
 import { createSettings } from "../src/settings.js";
+
+// Issue #239 第 4 项：可注入的假时钟 + 定时器——错峰队列的测试必须能「推进时间」，
+// 真实 setTimeout 会让补跑路径要么测不到、要么拖慢测试。
+function fakeClock(start) {
+  let current = start.getTime();
+  const timers = [];
+  const deps = {
+    now: () => current,
+    setTimeoutFn: (fn, ms) => {
+      const entry = { fn, at: current + ms };
+      timers.push(entry);
+      return entry;
+    },
+    clearTimeoutFn: (entry) => {
+      const i = timers.indexOf(entry);
+      if (i !== -1) timers.splice(i, 1);
+    }
+  };
+  const flush = async () => {
+    // 补跑是异步链（enqueueDistill → stream）：推完时间要给微任务与一轮宏任务机会。
+    for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+  return {
+    deps,
+    pending: () => timers.length,
+    async advanceTo(date) {
+      current = date.getTime();
+      for (const entry of [...timers].sort((a, b) => a.at - b.at)) {
+        if (entry.at > current) continue;
+        timers.splice(timers.indexOf(entry), 1);
+        entry.fn();
+      }
+      await flush();
+    },
+    async advance(ms) {
+      await this.advanceTo(new Date(current + ms));
+    }
+  };
+}
 
 function setup(over = {}, opts = {}) {
   const store = createStore(":memory:");
@@ -36,7 +75,7 @@ function setup(over = {}, opts = {}) {
     }
   };
   const config = { autoSummarize: true, ...over };
-  const summarizer = createSummarizer(ctx, service, config);
+  const summarizer = createSummarizer(ctx, service, config, opts.deps ?? {});
   return { store, service, events, calls, summarizer };
 }
 
@@ -232,6 +271,135 @@ test("#239 预算只计真实调用：被预判拦下的窗口不消耗额度", 
   session.events.push(userMessage("第二轮写得足够长，应该放行并消耗唯一的一次额度", 3), { seq: 4, type: "turn/end" });
   await handler(session, { seq: 4, type: "turn/end" });
   assert.equal(calls.length, 1, "零成本窗口不该吃掉预算");
+});
+
+// --- Issue #239 第 4 项：错峰队列 -------------------------------------------------
+
+test("#239-4 高峰时段解析：合法 / 多段 / 跨零点 / 星期前缀 / 非法一律按未配置", () => {
+  assert.equal(parsePeakSpec(""), null);
+  assert.equal(parsePeakSpec("   "), null);
+  assert.deepEqual(parsePeakSpec("09:00-18:00"), { days: null, windows: [{ start: 540, end: 1080 }] });
+  assert.deepEqual(parsePeakSpec("09:00-12:00, 14:00-18:00"), {
+    days: null,
+    windows: [{ start: 540, end: 720 }, { start: 840, end: 1080 }]
+  });
+  assert.deepEqual(parsePeakSpec("23:00-06:00"), { days: null, windows: [{ start: 1380, end: 360 }] });
+  // 星期前缀：ISO 1=周一…7=周日，也认 mon..sun；支持列表与跨周环绕
+  assert.deepEqual(parsePeakSpec("mon-fri 08:00-12:00,14:00-18:00"), {
+    days: [1, 2, 3, 4, 5],
+    windows: [{ start: 480, end: 720 }, { start: 840, end: 1080 }]
+  });
+  assert.deepEqual(parsePeakSpec("1-5 08:00-12:00").days, [1, 2, 3, 4, 5]);
+  assert.deepEqual(parsePeakSpec("sat,sun 10:00-12:00").days, [6, 7]);
+  assert.deepEqual(parsePeakSpec("fri-mon 10:00-12:00").days, [1, 5, 6, 7], "跨周环绕");
+  // 排程是省钱手段，绝不该因为写错格式把蒸馏停掉：任何非法写法都当作「关闭」。
+  for (const bad of ["09:00~18:00", "24:00-06:00", "09:60-18:00", "09:00-09:00", "abc", "09:00-18:00,oops", "weekday 09:00-18:00", "8 09:00-18:00"]) {
+    assert.equal(parsePeakSpec(bad), null, `${bad} 应视为未配置`);
+  }
+});
+
+test("#239-4 高峰判定与补跑时刻（跨零点、右开区间）", () => {
+  const at = (h, m) => new Date(2026, 8, 19, h, m, 30);
+  assert.equal(isInPeakWindow(at(10, 0), "09:00-18:00"), true);
+  assert.equal(isInPeakWindow(at(18, 0), "09:00-18:00"), false, "右开区间：18:00 已出高峰");
+  assert.equal(isInPeakWindow(at(3, 0), "23:00-06:00"), true, "跨零点时段");
+  assert.equal(isInPeakWindow(at(12, 0), "23:00-06:00"), false);
+  assert.equal(isInPeakWindow(at(10, 0), ""), false, "未配置 = 永不高峰");
+  const next = nextOffPeakAt(at(10, 30), "09:00-18:00");
+  assert.equal(next.getHours(), 18);
+  assert.equal(next.getMinutes(), 0);
+  assert.equal(nextOffPeakAt(at(3, 0), "23:00-06:00").getHours(), 6, "跨零点取次日 06:00 结束点");
+  assert.equal(nextOffPeakAt(at(20, 0), "09:00-18:00"), null, "非高峰时刻无需补跑");
+});
+
+// 夹具：按 ISO 星期几（1=周一…7=周日）从当月 1 号推算出日期，避免把星期写死在测试里。
+function dateOnIsoDay(isoDay, hour, minute) {
+  const first = new Date(2026, 8, 1, hour, minute, 0);
+  const firstIso = first.getDay() === 0 ? 7 : first.getDay();
+  return new Date(2026, 8, 1 + ((isoDay - firstIso + 7) % 7), hour, minute, 0);
+}
+
+test("#239-4 星期过滤：工作日高峰不误伤周末（跨零点段按「开窗那天」认星期）", () => {
+  const spec = "mon-fri 08:00-12:00,14:00-18:00";
+  assert.equal(dateOnIsoDay(1, 9, 0).getDay(), 1, "夹具自检：周一");
+  assert.equal(dateOnIsoDay(6, 9, 0).getDay(), 6, "夹具自检：周六");
+  assert.equal(isInPeakWindow(dateOnIsoDay(1, 9, 0), spec), true, "工作日 09:00 在高峰");
+  assert.equal(isInPeakWindow(dateOnIsoDay(1, 12, 30), spec), false, "工作日午休不在高峰");
+  assert.equal(isInPeakWindow(dateOnIsoDay(6, 9, 0), spec), false, "周六同刻不在高峰（按周计费）");
+  assert.equal(isInPeakWindow(dateOnIsoDay(7, 15, 0), spec), false, "周日下午不在高峰");
+  assert.equal(nextOffPeakAt(dateOnIsoDay(1, 9, 0), spec).getHours(), 12, "工作日顺延到 12:00");
+  assert.equal(nextOffPeakAt(dateOnIsoDay(6, 9, 0), spec), null, "周末无需顺延");
+  // 跨零点段：周五 23:00 开的窗口延续到周六凌晨，仍算高峰；周六开的则不覆盖周日
+  const overnight = "mon-fri 23:00-06:00";
+  assert.equal(isInPeakWindow(dateOnIsoDay(6, 2, 0), overnight), true, "周六 02:00 属周五开的窗口");
+  assert.equal(isInPeakWindow(dateOnIsoDay(7, 2, 0), overnight), false, "周日 02:00 属周六开的窗口（周六不在集合内）");
+});
+
+test("#239-4 默认关：未配置高峰时行为与现状一致", async () => {
+  const clock = fakeClock(new Date(2026, 8, 19, 10, 0, 0));
+  const { events, calls } = setup({}, { deps: clock.deps });
+  const handler = events.find((e) => e.name === "session/event").fn;
+  const session = {
+    id: "s239-peak-off",
+    requestHeader: () => ({ config: { provider: "deepseek", model: "deepseek-chat" } }),
+    events: [userMessage("普通一轮", 1), { seq: 2, type: "turn/end" }]
+  };
+  await handler(session, { seq: 2, type: "turn/end" });
+  assert.equal(calls.length, 1, "未配置高峰 → 照常蒸馏");
+  assert.equal(clock.pending(), 0, "不该挂补跑定时器");
+});
+
+test("#239-4 高峰内不调模型：skip 审计 + 不消费游标，非高峰补跑整窗", async () => {
+  const clock = fakeClock(new Date(2026, 8, 19, 10, 0, 0));
+  const { events, calls, service, store } = setup(
+    { summarizePeakHours: "09:00-18:00", distillRateLimitIntervalMs: 0 },
+    { deps: clock.deps }
+  );
+  const handler = events.find((e) => e.name === "session/event").fn;
+  const session = {
+    id: "s239-peak",
+    requestHeader: () => ({ config: { provider: "deepseek", model: "deepseek-chat" } }),
+    events: [userMessage("高峰里的第一段", 1), { seq: 2, type: "turn/end" }]
+  };
+  await handler(session, { seq: 2, type: "turn/end" });
+  assert.equal(calls.length, 0, "高峰期不得调模型");
+  assert.equal(store.count(), 0, "不该写入记忆");
+  const rows = service.listLlmAudits();
+  assert.equal(rows[0].status, "skipped");
+  assert.equal(rows[0].error_message, "peak-hours", "skip 原因必须可观测");
+  assert.equal(clock.pending(), 1, "应挂一个补跑定时器");
+
+  // 高峰期间又来一轮：游标未消费 → 窗口累积；仍不调模型、定时器不叠加
+  session.events.push(userMessage("高峰里的第二段", 3), { seq: 4, type: "turn/end" });
+  await handler(session, { seq: 4, type: "turn/end" });
+  assert.equal(calls.length, 0);
+  assert.equal(clock.pending(), 1, "每会话只挂一个定时器");
+
+  // 推到非高峰：一次补跑，且蒸到的是累积后的整窗
+  await clock.advanceTo(new Date(2026, 8, 19, 18, 0, 5));
+  assert.equal(calls.length, 1, "非高峰补跑一次");
+  const prompt = JSON.stringify(calls[0].messages);
+  assert.ok(prompt.includes("高峰里的第一段") && prompt.includes("高峰里的第二段"),
+    "补跑应蒸馏累积后的完整窗口");
+  assert.ok(store.count() > 0, "补跑真的写入了记忆");
+});
+
+test("#239-4 顺延上限：长高峰到点照跑，不饿死蒸馏", async () => {
+  const clock = fakeClock(new Date(2026, 8, 19, 9, 0, 0));
+  const { events, calls } = setup(
+    { summarizePeakHours: "09:00-18:00", summarizePeakMaxDeferMinutes: 30, distillRateLimitIntervalMs: 0 },
+    { deps: clock.deps }
+  );
+  const handler = events.find((e) => e.name === "session/event").fn;
+  const session = {
+    id: "s239-peak-cap",
+    requestHeader: () => ({ config: { provider: "deepseek", model: "deepseek-chat" } }),
+    events: [userMessage("长高峰里的一轮", 1), { seq: 2, type: "turn/end" }]
+  };
+  await handler(session, { seq: 2, type: "turn/end" });
+  assert.equal(calls.length, 0, "高峰内先顺延");
+  await clock.advance(31 * 60000);
+  assert.equal(calls.length, 1, "上限到点仍处高峰也照跑（bypassPeak）");
 });
 
 test("does not call the LLM when no event was added after the last successful seq", async () => {

@@ -256,8 +256,125 @@ function enqueueDistill(task, intervalMs = 0) {
   return run;
 }
 
-export function createSummarizer(ctx, service, config) {
+// Issue #239（第 4 项，错峰队列）：高峰时段解析与判定。纯函数、可单测——排程判断
+// 不绑死真实时钟，测试才能确定性地覆盖跨零点、多段、星期过滤与非法写法。
+// spec 语法：`[<星期> ]<时段>[,<时段>...]`，星期前缀可省（省 = 每天）：
+//   "09:00-18:00"                        每天 09:00-18:00
+//   "mon-fri 08:00-12:00,14:00-18:00"    工作日两段（ISO 1=周一…7=周日，也认 mon..sun）
+//   "sat,sun 23:00-06:00"                周末跨零点段
+// 时间取宿主本地时区。任一写法非法 → 整串视为未配置（返回 null）：排程是省钱手段，
+// 绝不该因为写错格式把蒸馏停掉。
+const DAY_NAMES = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 7 };
+
+function parseDayToken(token) {
+  const days = new Set();
+  const normalize = (value) => (/^\d$/.test(value) ? Number(value) : DAY_NAMES[value] ?? null);
+  for (const piece of token.split(",")) {
+    const matched = /^([a-z]{3}|\d)(?:-([a-z]{3}|\d))?$/.exec(piece.trim().toLowerCase());
+    if (!matched) return null;
+    const from = normalize(matched[1]);
+    const to = matched[2] === undefined ? from : normalize(matched[2]);
+    if (from === null || to === null || from < 1 || from > 7 || to < 1 || to > 7) return null;
+    // 支持跨周环绕（fri-mon）：从 from 起逐天推进到 to，最多绕一圈。
+    for (let day = from; ; day = (day % 7) + 1) {
+      days.add(day);
+      if (day === to) break;
+    }
+  }
+  return days.size > 0 ? [...days].sort((a, b) => a - b) : null;
+}
+
+/** JS 的 getDay() 是 0=周日…6=周六；这里统一成 ISO（1=周一…7=周日）。 */
+function isoDay(date) {
+  const day = date.getDay();
+  return day === 0 ? 7 : day;
+}
+
+export function parsePeakSpec(spec) {
+  if (typeof spec !== "string" || spec.trim() === "") return null;
+  let rest = spec.trim();
+  let days = null;
+  // 星期前缀 = 第一个空白之前的部分，但**头段含冒号就不是前缀**（那是时段本身，
+  // 例如 "09:00-12:00, 14:00-18:00" 里的逗号空格）。前缀解析失败一律按未配置处理，
+  // 不做猜测——宁可不省，也不能误停。
+  const sep = rest.search(/\s/);
+  if (sep > 0) {
+    const head = rest.slice(0, sep);
+    if (!head.includes(":")) {
+      days = parseDayToken(head);
+      if (days === null) return null;
+      rest = rest.slice(sep).trim();
+    }
+  }
+  const windows = [];
+  for (const part of rest.split(",")) {
+    const matched = /^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$/.exec(part);
+    if (!matched) return null;
+    const [sh, sm, eh, em] = [Number(matched[1]), Number(matched[2]), Number(matched[3]), Number(matched[4])];
+    if (sh > 23 || eh > 23 || sm > 59 || em > 59) return null;
+    const start = sh * 60 + sm;
+    const end = eh * 60 + em;
+    if (start === end) return null;
+    windows.push({ start, end });
+  }
+  return windows.length > 0 ? { days, windows } : null;
+}
+
+/**
+ * 该时刻是否落在高峰内。跨零点段（start > end）按「窗口所属的那一天」认星期：
+ * `mon-fri 23:00-06:00` 的周六 02:00 属于周五开的那个窗口，仍算高峰。
+ */
+export function isInPeakWindow(date, spec) {
+  const parsed = parsePeakSpec(spec);
+  if (!parsed) return false;
+  const minutes = date.getHours() * 60 + date.getMinutes();
+  const today = isoDay(date);
+  const yesterday = today === 1 ? 7 : today - 1;
+  const allowed = (day) => !parsed.days || parsed.days.includes(day);
+  return parsed.windows.some(({ start, end }) => {
+    if (start < end) return minutes >= start && minutes < end && allowed(today);
+    return (minutes >= start && allowed(today)) || (minutes < end && allowed(yesterday));
+  });
+}
+
+/**
+ * 高峰内则返回「距当前最近的一个高峰结束时刻」（择时补跑用），否则 null。
+ * 落在多个时段重叠处时取最早结束的那个——早跑不亏，晚跑才亏。
+ */
+export function nextOffPeakAt(date, spec) {
+  const parsed = parsePeakSpec(spec);
+  if (!parsed) return null;
+  const minutes = date.getHours() * 60 + date.getMinutes();
+  const today = isoDay(date);
+  const yesterday = today === 1 ? 7 : today - 1;
+  const allowed = (day) => !parsed.days || parsed.days.includes(day);
+  let bestDelta = null;
+  const consider = (delta) => {
+    if (bestDelta === null || delta < bestDelta) bestDelta = delta;
+  };
+  for (const { start, end } of parsed.windows) {
+    if (start < end) {
+      if (minutes >= start && minutes < end && allowed(today)) consider(end - minutes);
+      continue;
+    }
+    if (minutes >= start && allowed(today)) consider((1440 - minutes) + end);
+    else if (minutes < end && allowed(yesterday)) consider(end - minutes);
+  }
+  if (bestDelta === null) return null;
+  const at = new Date(date.getTime());
+  at.setSeconds(0, 0);
+  at.setMinutes(at.getMinutes() + bestDelta);
+  return at;
+}
+
+export function createSummarizer(ctx, service, config, deps = {}) {
   if (!config.autoSummarize) return { dispose: () => {} };
+
+  // Issue #239（第 4 项）：时钟与定时器可注入——排程不绑死真实时钟，测试才能确定性
+  // 覆盖「高峰顺延 → 非高峰补跑」。房型同 dream/sleep.js 的注入参数。
+  const now = typeof deps.now === "function" ? deps.now : () => Date.now();
+  const setTimer = typeof deps.setTimeoutFn === "function" ? deps.setTimeoutFn : setTimeout;
+  const clearTimer = typeof deps.clearTimeoutFn === "function" ? deps.clearTimeoutFn : clearTimeout;
 
   const inFlight = new Map();
   // Issue #127：per-session 上一次实际开跑时刻（最小间隔闸门用）。与 inFlight
@@ -266,6 +383,9 @@ export function createSummarizer(ctx, service, config) {
   // Issue #239：per-session 已发起的蒸馏次数（有界检查点用）。只在实际发起 LLM
   // 调用时自增，因此被零 LLM 预判挡下的窗口不消耗预算。
   const runsUsed = new Map();
+  // Issue #239（第 4 项）：每会话最多挂一个待补跑定时器（错峰队列用）；dispose 时
+  // 一并清理，避免插件卸载后还留着一个会调模型的定时器。
+  const deferredRuns = new Map();
   // Issue #210：只在一次蒸馏完整成功后记录已消费的最后事件 seq。
   const lastDistilledSeq = new Map();
   let disposed = false;
@@ -285,7 +405,34 @@ export function createSummarizer(ctx, service, config) {
     }
   }
 
-  async function summarize(session, triggerEvent) {
+  /**
+   * Issue #239（第 4 项）：把这一轮蒸馏推迟到最近的「高峰结束」时刻。每会话只挂
+   * 一个定时器（重复触发不叠加）；被 summarizePeakMaxDeferMinutes 截断时到点照跑
+   * （bypassPeak），长高峰不会把蒸馏饿死。定时器 unref——不阻止宿主退出。
+   */
+  function scheduleDeferredRun(session) {
+    if (disposed || deferredRuns.has(session.id)) return;
+    const at = nextOffPeakAt(new Date(now()), config.summarizePeakHours ?? "");
+    if (!at) return;
+    const maxDeferMs = (config.summarizePeakMaxDeferMinutes ?? 0) * 60000;
+    let delay = Math.max(0, at.getTime() - now());
+    const capped = maxDeferMs > 0 && delay > maxDeferMs;
+    if (capped) delay = maxDeferMs;
+    const timer = setTimer(() => {
+      deferredRuns.delete(session.id);
+      if (disposed) return;
+      // 不传触发事件：补跑要蒸的是「累积后的整窗」（从上次成功游标到最新事件），
+      // 拿老 triggerEvent 反而会把窗口卡在它那个 seq 上。
+      summarize(session, undefined, { bypassPeak: capped }).catch((error) => {
+        if (disposed || error?.name === "AbortError") return;
+        ctx.logger?.warn?.(`dsh-mneme: deferred summarization failed: ${String(error)}`);
+      });
+    }, delay);
+    timer?.unref?.();
+    deferredRuns.set(session.id, timer);
+  }
+
+  async function summarize(session, triggerEvent, opts = {}) {
     if (disposed || inFlight.has(session.id)) return;
 
     const header = session.requestHeader?.()?.config;
@@ -318,6 +465,19 @@ export function createSummarizer(ctx, service, config) {
     // 游标刻意不消费：预算是「这个会话先不再蒸馏了」，把窗口留在原地，日后调高
     // 额度（或宿主重启）仍能蒸馏到它；这与 window-too-small 主动消费游标相反——
     // 后者是「这些事件不值得蒸馏」，留着只会每个 turn/end 重评一次。
+    // Issue #239（第 4 项，错峰队列）：高峰期不调模型——只登记一行 skip 审计并择时
+    // 补跑。游标刻意不消费：窗口继续累积，留到非高峰一次性蒸馏（批量比逐轮碎蒸更
+    // 省）。被 maxDefer 截断后到点仍处高峰时，由 opts.bypassPeak 放行。
+    if (!opts.bypassPeak && isInPeakWindow(new Date(now()), config.summarizePeakHours ?? "")) {
+      writeAudit({
+        timestamp: new Date(now()).toISOString(),
+        model_id: route ? `${route.provider}:${route.model}` : "unknown",
+        status: "skipped",
+        error_message: "peak-hours"
+      });
+      scheduleDeferredRun(session);
+      return;
+    }
     const prevRuns = runsUsed.get(session.id);
     const maxRuns = config.summarizeMaxRunsPerSession ?? 0;
     if (maxRuns > 0 && (prevRuns ?? 0) >= maxRuns) {
@@ -618,6 +778,8 @@ export function createSummarizer(ctx, service, config) {
       if (disposed) return;
       disposed = true;
       unsubscribe?.();
+      for (const timer of deferredRuns.values()) clearTimer(timer);
+      deferredRuns.clear();
       for (const controller of inFlight.values()) controller.abort();
       inFlight.clear();
       lastRunAt.clear();

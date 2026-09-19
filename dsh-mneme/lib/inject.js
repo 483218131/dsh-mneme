@@ -1,6 +1,7 @@
 import { createScopeResolver } from "./scope.js";
 import { createHotMemory } from "./hot-memory.js";
 import { STR, langOf } from "./lang.js";
+import { adaptiveInjectBudget } from "./search/adaptive.js";
 
 // Best-effort extraction of the current user's latest message text from the
 // live session, for semantic-first injection (Bug4). The system-prompt
@@ -92,7 +93,7 @@ function extractRounds(ctx, maxRounds) {
 
 export function createInjector(ctx, service, settings, config) {
   const language = langOf(config);
-  const maxItems = config.maxInjectedItems ?? 5;
+  const baseMaxItems = config.maxInjectedItems ?? 5;
   const threshold = config.importanceThreshold ?? 3;
   // Issue #205：注入位跨轮轮换。rotationTurns = 最近 N 个「不同用户查询」轮次
   // 注入过的记忆本轮不再优先（0 = 关闭，保持既有行为）。历史按会话维护——
@@ -270,6 +271,12 @@ export function createInjector(ctx, service, settings, config) {
         const rotate = recentInjectedIds(sessionId, query);
         // rotateWindow 随集合一起传入：候选池按 maxItems×(N+1) 扩容——窗口要的
         // 牌比既有 maxItems×2 池多时，轮换才有新鲜牌可换（#205 补测）。
+        // Issue #239（第 5 项）：注入条数的查询自适应（默认关）。确定性强的话题收缩
+        // 条数、模糊话题维持上限——单向收缩，绝不越过 maxInjectedItems；判据只看查询
+        // 本身，不做额外检索（先探针检索等于白付一次 fuseRecall）。
+        const maxItems = config.injectUncertaintyAdaptive === true
+          ? adaptiveInjectBudget(query, baseMaxItems)
+          : baseMaxItems;
         const candidates = service.injectCandidates({ query, queryVector, maxItems, threshold, scope, rotate, rotateWindow: rotationTurns });
         recordInjection(sessionId, query, candidates);
         // Hot memory (v0.5.0 1.3) leads the single memory block: the agent

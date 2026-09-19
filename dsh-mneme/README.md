@@ -418,6 +418,8 @@ dsh web
 | `summarizeMaxEntriesPerRun` | `0` | 单次蒸馏产出记忆条数上限（0-50，0=不限）：节流防单会话大量重复条目（#127） |
 | `summarizeMinWindowChars` | `0` | 蒸馏前零 LLM 预判：窗口可蒸馏文本不足此字符数直接跳过调用（0-100000，0=关）；skip 原因写入审计（#239） |
 | `summarizeMaxRunsPerSession` | `0` | 每会话最多发起多少次蒸馏 LLM 调用（0-1000，0=不限）；只计真实调用，被预判拦下的不占额度（#239） |
+| `summarizePeakHours` | 空 | 高峰时段（本地时间，逗号分隔、可带星期前缀，支持跨零点）：空=关；命中时蒸馏顺延到非高峰、窗口累积后一次蒸、skip 原因入审计。例：按高峰计费的供应商可写 `mon-fri 08:00-12:00,14:00-18:00`（如 DeepSeek，以其官方定价页为准）（#239） |
+| `summarizePeakMaxDeferMinutes` | `120` | 高峰顺延上限（0-1440 分钟，0=不设上限）：到点仍处高峰就照常跑，避免长高峰把蒸馏饿死（#239） |
 | `summarizeDedupeMode` | `off` | 落库前去重档位：`off`（默认=现状）/ `title`（零成本，仅拦完全同名）/ `vector`（复用 embedding 列做同会话语义近邻，无 LLM 调用，#127） |
 | `summarizeDedupeMinSim` | `0.92` | vector 去重档的相似度阈值（0.5-0.99） |
 | `summarizeDedupeWindowHours` | `24` | vector 去重的同会话时间窗（小时，0-168） |
@@ -426,6 +428,7 @@ dsh web
 | `distillRateLimitRetries` | `3` | 命中 429 限流时的指数退避重试次数（0-10） |
 | `distillRateLimitBaseDelayMs` | `1000` | 429 退避基准延迟（ms）：1s→2s→4s… |
 | `maxInjectedItems` | `5` | 最多注入几条记忆 |
+| `injectUncertaintyAdaptive` | `false` | 注入条数的查询自适应：确定性强的话题把条数收缩到一半（下限 1），模糊话题（回指/时间线索，或极短查询）维持 `maxInjectedItems` 上限；**只做单向收缩**，判据只看查询本身、不做额外检索（#239 第 5 项） |
 | `injectRotationTurns` | `0` | 注入位跨轮轮换：同一条记忆在最近 N 个查询轮次注入过后本轮不再优先（新鲜优先、不足回填，槽位数不变；会话边界自动重置；`0` = 关闭保持现状） |
 | `injectContentMaxChars` | `300` | 注入单条正文截断上限（60-4000，原硬编码 300，#164①/#225）：截断尾部带上限/原长/全文 `memory_get` 指引；块预算 `Math.max(1500, 上限+600)` 随上限放大 |
 | `importanceThreshold` | `3` | 注入的最低重要性（1-5） |
@@ -445,6 +448,8 @@ dsh web
 | `dreamImplicitKeep` | `true` | 显式决策覆盖率不足时的隐式 keep（未提及条目保持原样）；`false` + `dreamMinExplicitCoverage: 0` 恢复旧严格行为 |
 | `dreamMinExplicitCoverage` | `0.5` | 显式决策覆盖率下限（0-1）：合法子集低于该值降级 degraded 而非整单拒绝（#104 方向 1，PR #200） |
 | `dreamMaxSnapshotSize` | `200` | autoDream 滑动窗口上限：每次只对最近 N 条做 consolidation，窗口外不进 snapshot（防 LLM 输入撑爆） |
+| `dreamSummaryProvider` / `dreamSummaryModel` | 空 | 总览（dream_summarize）专用模型路由（留空 = 沿用 `dreamProvider`/`dreamModel`）。consolidate 有窗口（`dreamMaxSnapshotSize`）而总览输入随库增长，ctx 需求差数倍——用小 ctx 模型跑巩固时把总览指到大 ctx 模型（issue #258） |
+| `dreamSummaryMaxInputs` | `0` | 总览输入条数硬上限（0 = 不设上限）：超过时按 `updated_at` 倒序只保留最新 N 条进总览，防小 ctx 模型被全库输入撑爆；总览口径脚注的条数随实际输入变化 |
 | `dreamMinIntervalMinutes` | `0` | autoDream 最小触发间隔（0-10080，0=不限）：失败/degraded run 也占用 |
 | `dreamNarrativeEnabled` | `false` | 叙述条总开关（#164 对齐，v0.8.4）：按共享 tag 主题簇合成叙述 + evidence 证据链，注入候选排除（按需检索，常驻位只留 dream 总览）；也走 feature_flags 白名单，lightMode 强制关 |
 | `dreamNarrativeMinCluster` | `3` | 主题簇合成叙述的最小成员数（2-20，v0.8.4） |

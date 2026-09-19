@@ -6,7 +6,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { STR, langOf } from "./lang.js";
 export { validateDecisions, applyDecisions, withEffortFallback, describeStreamFailure, resolveDreamEffort, resolveRoute };
 
-
 // Extract the first JSON array from LLM output, tolerating markdown fences,
 // leading/trailing prose, and common wrapper noise. Returns an array or null.
 function extractJsonArray(text) {
@@ -1211,15 +1210,21 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
     let summaryStreamFailure = "";
     const runSummary = (withEffort) => {
       summaryStreamFailure = "";
+      // Issue #258：总览阶段可用 dreamSummaryProvider/dreamSummaryModel 走独立路由
+      //（默认空 = 沿用 dream 路由）；输入侧有 dreamSummaryMaxInputs 硬上限，
+      // 按窗口同款 updated_at 倒序保留最新的（见下方 summaryInputs）。
+      const summaryRoute = (config.dreamSummaryProvider && config.dreamSummaryModel)
+        ? { provider: config.dreamSummaryProvider, model: config.dreamSummaryModel }
+        : route;
       return runAuditedLlm(ctx, service, config, {
       triggerSource: "autoDream",
       operationType: "dream_summarize",
-      modelId: `${route.provider}:${route.model}`,
+      modelId: `${summaryRoute.provider}:${summaryRoute.model}`,
       relatedMemoryIds: [],
       streamError: () => summaryStreamFailure
     }, (reportUsage) => streamText(ctx, {
-      provider: route.provider,
-      model: route.model,
+      provider: summaryRoute.provider,
+      model: summaryRoute.model,
       purpose: "compaction",
       maxTokens: config.dreamMaxTokens ?? 2048,
       ...(withEffort && effort ? { reasoningEffort: effort } : {}),
@@ -1234,7 +1239,25 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
     // v1, content_history traceable). Its 口径 (what snapshot produced it) is
     // stamped into the content so the standing answer is always auditable; the
     // formal evidence column lands with the narrative-bars batch.
-    const summaryInputs = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
+    // Issue #258：输入硬上限（条数）——原全库无界，把 dream 路由指向小 ctx
+    // 模型时 120k token 当场 CONTEXT_WINDOW_EXCEEDED（#258 实测），且随库增长
+    // 渐进恶化。倒序排序与 consolidate 窗口同款（updated_at desc, id tiebreak），
+    // 保留最新的；0 = 关闭上限（回归全库行为，调用方自担 ctx）。
+    // #230：document 指针行不进总览（与 dream/sleep 五个候选池的同款排除）。
+    const summaryAll = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
+    const summaryMaxInputs = Number.isInteger(config.dreamSummaryMaxInputs) ? config.dreamSummaryMaxInputs : 0;
+    const summaryInputs = summaryMaxInputs > 0 && summaryAll.length > summaryMaxInputs
+      ? [...summaryAll]
+        .sort((a, b) => {
+          const ta = String(a.updated_at ?? "");
+          const tb = String(b.updated_at ?? "");
+          if (ta < tb) return 1;
+          if (ta > tb) return -1;
+          return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+        })
+        .slice(0, summaryMaxInputs)
+      : summaryAll;
+
     const summaryScope = STR.summaryScope[language](
       summaryInputs.length,
       runId.slice(0, 8),

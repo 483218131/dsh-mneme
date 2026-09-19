@@ -43,6 +43,8 @@ const FEATURE_FLAG_BOOLEANS = [
   "autoInject",
   "autoSummarize",
   "hotMemoryEnabled",
+  // Issue #239 第 5 项：注入条数的查询自适应（确定性强则收缩注入条数，默认关）。
+  "injectUncertaintyAdaptive",
   "entityExtractionEnabled",
   // Issue #219：图召回轴——查询命中实体名时把挂联记忆并入检索融合池
   // （默认关；依赖实体抽取产出，lightMode 强制关闭）。
@@ -103,6 +105,8 @@ const FEATURE_FLAG_INT_RANGES = {
   // Issue #239：蒸馏零 LLM 预判（窗口最小字符数）与每会话 run 预算（0 = 零行为变化）。
   summarizeMinWindowChars: [0, 100000],
   summarizeMaxRunsPerSession: [0, 1000],
+  // Issue #239 第 4 项：高峰顺延上限（分钟，0 = 不设上限）。
+  summarizePeakMaxDeferMinutes: [0, 1440],
   // Issue #125：hybrid 候选量上限（0 = 复用 dreamMaxSnapshotSize）。
   dreamCandidateMax: [0, 5000],
   // Issue #164①：注入单条正文截断上限（默认 300 = 既有行为）。
@@ -110,7 +114,11 @@ const FEATURE_FLAG_INT_RANGES = {
   // Issue #164：叙述条成簇门槛（共享同一 tag 的记忆数下限）。
   dreamNarrativeMinCluster: [2, 20],
   // Issue #230：document 摘要行的注入预算（次优先档内最多几条指针行）。
-  documentInjectBudget: [1, 5]
+  documentInjectBudget: [1, 5],
+  // Issue #257：sleep 冲突/模式阶段的 LLM 输出预算（原硬编码 2048，实测不足）。
+  sleepMaxTokens: [256, 131072],
+  // Issue #258：总览（dream_summarize）输入条数硬上限（0 = 不设上限）。
+  dreamSummaryMaxInputs: [0, 100000]
 };
 // 浮点开关的闭区间（与 config.js 的 z.number().min().max() 对齐）。与整数开关
 // 分开：面板的整数控件要求 Number.isInteger，而余弦相似度阈值必须允许小数。
@@ -133,8 +141,13 @@ const FEATURE_FLAG_STRINGS = [
   // 留空 = 用当前默认模型。
   "entityExtractionProvider",
   "entityExtractionModel",
+  // Issue #258：总览（dream_summarize）专用路由，留空 = 用巩固模型。
+  "dreamSummaryProvider",
+  "dreamSummaryModel",
   "localEmbedModel",
-  "ollamaModel"
+  "ollamaModel",
+  // Issue #239 第 4 项：高峰时段串（"09:00-18:00"，空串 = 关闭）。
+  "summarizePeakHours"
 ];
 // URL 字符串开关：trim 后必须为空或合法 http/https URL（new URL() 校验协议，
 // 拒绝其余协议——这是 SSRF 防线的一部分）。

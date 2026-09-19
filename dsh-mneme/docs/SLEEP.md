@@ -51,6 +51,7 @@ flowchart TD
 | `sleepProvider` | `''` | 睡眠模式专用 LLM Provider（留空则复用默认） |
 | `sleepModel` | `''` | 睡眠模式专用 LLM Model（留空则复用默认） |
 | `sleepReasoningEffort` | （未配置） | 睡眠 LLM 推理强度透传：`off` / `low` / `medium` / `high` / `none`。未配置 = 自动取模型支持的最低档（#135：避免思考模型用自带默认档烧光预算返回空体）；显式 `none` = 不传该字段，使用模型默认（与 `dreamReasoningEffort` 语义一致） |
+| `sleepMaxTokens` | `8192` | 冲突消解与模式发现阶段的 LLM 输出预算上限（token，#257：原硬编码 2048——`sleepActionSet: full` 实测 24 对需约 7000，截断即整轮裁决失败）。流式计费按实际用量，调大不增加成本 |
 
 ## 四阶段详解
 每个阶段独立包裹 `try/catch`，任一阶段失败仅跳过该阶段，不阻塞后续流程。

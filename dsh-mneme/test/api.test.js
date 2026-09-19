@@ -656,9 +656,13 @@ test("GET /api/dsh-mneme/features returns empty overrides and effective config d
   // dreamProvider/dreamModel 无 schema 默认值（Config({}) 解析为 undefined），
   // 不编造给前端 → 62 - 2 = 60（issue #164① 新增 injectContentMaxChars，
   // issue #164 叙述条批次新增 dreamNarrativeEnabled/dreamNarrativeMinCluster，
-  // issue #239 新增 summarizeMinWindowChars/summarizeMaxRunsPerSession，
-  // issue #230 新增 documentMemoryEnabled/documentInjectBudget）
-  assert.equal(Object.keys(data.effective).length, 60);
+  // issue #239 新增 summarizeMinWindowChars/summarizeMaxRunsPerSession、
+  // 第 4 项的 summarizePeakHours/summarizePeakMaxDeferMinutes 与
+  // 第 5 项的 injectUncertaintyAdaptive、
+  // issue #257 新增 sleepMaxTokens、issue #258 新增总览路由两键与
+  // dreamSummaryMaxInputs、issue #230 新增 documentMemoryEnabled/
+  // documentInjectBudget）
+  assert.equal(Object.keys(data.effective).length, 59 + 3 + 2 + 1 + 2);
   assert.equal(data.effective.dreamSkipInvalid, true);
   assert.equal(data.effective.allowCrossTypeMerge, false);
   assert.equal(data.effective.dreamMinIntervalMinutes, 0);
