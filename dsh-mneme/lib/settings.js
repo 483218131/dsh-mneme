@@ -43,6 +43,8 @@ const FEATURE_FLAG_BOOLEANS = [
   "autoInject",
   "autoSummarize",
   "hotMemoryEnabled",
+  // Issue #239 第 5 项：注入条数的查询自适应（确定性强则收缩注入条数，默认关）。
+  "injectUncertaintyAdaptive",
   "entityExtractionEnabled",
   // Issue #219：图召回轴——查询命中实体名时把挂联记忆并入检索融合池
   // （默认关；依赖实体抽取产出，lightMode 强制关闭）。

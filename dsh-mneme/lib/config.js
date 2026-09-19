@@ -58,6 +58,11 @@ export const Config = z.object({
   // 默认 300 = 与既有行为一致。
   injectContentMaxChars: z.natural().min(60).max(4000).default(300),
   importanceThreshold: z.natural().min(1).max(5).default(3),
+  // Issue #239（第 5 项）：注入条数的查询自适应（默认关）。确定性强的话题收缩注入
+  // 条数（减半、下限 1），模糊话题（回指/时间线索，或极短查询）维持
+  // maxInjectedItems 上限——只做**单向收缩**，绝不越过用户配置的上限；判据只看
+  // 查询本身，不做额外检索（先探针检索等于白付一次 fuseRecall）。
+  injectUncertaintyAdaptive: z.boolean().default(false),
   // 编码记忆蒸馏（codingRetrospect，opt-in，默认关）。开启时，turn/end 蒸馏
   // 额外提取三类编码专属记忆：rejected_solution（被否决方案）/ pitfall（踩坑）/
   // constraint（工程约束）。蒸馏上下文为整轮完整对话（用户输入 → 助手思考/回答

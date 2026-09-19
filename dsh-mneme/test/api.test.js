@@ -654,13 +654,13 @@ test("GET /api/dsh-mneme/features returns empty overrides and effective config d
   // scopeEnabled/strictScope、issue #194 新增的 resilientModelDownload），
   // 未覆盖时取 bundle 配置的解析默认值；
   // dreamProvider/dreamModel 无 schema 默认值（Config({}) 解析为 undefined），
-  // 不编造给前端 → 60 - 2 = 58（issue #164① 新增 injectContentMaxChars，
+  // 不编造给前端 → 61 - 2 = 59（issue #164① 新增 injectContentMaxChars，
   // issue #164 叙述条批次新增 dreamNarrativeEnabled/dreamNarrativeMinCluster，
-  // issue #239 新增 summarizeMinWindowChars/summarizeMaxRunsPerSession、
+  // issue #239 新增 summarizeMinWindowChars/summarizeMaxRunsPerSession
+  // 与第 5 项的 injectUncertaintyAdaptive、
   // issue #257 新增 sleepMaxTokens、issue #258 新增总览路由两键与
   // dreamSummaryMaxInputs）
-  assert.equal(Object.keys(data.effective).length, 59 + 3);
-  assert.equal(data.effective.dreamSkipInvalid, true);
+  assert.equal(Object.keys(data.effective).length, 59 + 3 + 1);  assert.equal(data.effective.dreamSkipInvalid, true);
   assert.equal(data.effective.allowCrossTypeMerge, false);
   assert.equal(data.effective.dreamMinIntervalMinutes, 0);
   assert.equal(data.effective.dreamMaxTokens, 131072);
