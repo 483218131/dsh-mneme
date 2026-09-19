@@ -168,16 +168,25 @@ export function readJsonSafe(file) {
  * 而 loader 又把那个对象直接当字符串外发）。形状归一收在这里，两边都只调它。
  *
  * 它只回答「清单里声称什么」，不重新验算 —— 原始 tarball 落盘后就没了，重算无从谈起。
- * @param {string|{status?: string, detail?: string}|null|undefined} recorded - 清单里的 integrity 字段。
- * @returns {{status: string, detail: string|null}} 状态词；缺失一律为 "unverified"。
+ *
+ * 形状非法（`false` / `0` / `[]` / `{}` / `{status: 5}` 这类）给 `"malformed"`：判据不认
+ * 它，于是 fail-closed。这类值既不能证明一致、也不是「没记录过」，按 ok:true 放行等于把
+ * 形状错误读成「已经验过了」（#269 评审）。
+ *
+ * @param {unknown} recorded - 清单里的 integrity 字段。
+ * @returns {{status: string, detail: string|null}} 状态词；缺失（null/undefined）为 "unverified"。
  */
 export function recordedIntegrity(recorded) {
-  const asStatus = (value) => (typeof value === "string" && value.trim() !== "" ? value.trim() : "unverified");
-  if (typeof recorded === "string") return { status: asStatus(recorded), detail: null };
-  return {
-    status: asStatus(recorded?.status),
-    detail: typeof recorded?.detail === "string" ? recorded.detail : null
-  };
+  const asStatus = (value) => (typeof value === "string" && value.trim() !== "" ? value.trim() : null);
+  if (recorded === undefined || recorded === null) return { status: "unverified", detail: null };
+  if (typeof recorded === "string") return { status: asStatus(recorded) ?? "unverified", detail: null };
+  if (typeof recorded !== "object" || Array.isArray(recorded)) {
+    const shape = Array.isArray(recorded) ? "array" : typeof recorded;
+    return { status: "malformed", detail: `integrity 字段形状非法（${shape}），无法据此判定` };
+  }
+  const status = asStatus(recorded.status);
+  if (!status) return { status: "malformed", detail: "integrity 对象里没有可用的 status" };
+  return { status, detail: typeof recorded.detail === "string" ? recorded.detail : null };
 }
 
 /**

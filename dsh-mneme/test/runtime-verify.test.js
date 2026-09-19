@@ -184,6 +184,20 @@ test("三件套：清单里记下的不一致照样判失败（别把「读到�
   assert.equal(result.ok, false);
 });
 
+test("三件套：清单里的 integrity 形状非法时 fail-closed，不读成「没验过」（#269 评审）", async () => {
+  const dir = makePayload();
+  writeFileSync(join(dir, "mneme-runtime.json"), JSON.stringify({ procedure: "downloaded", integrity: false }));
+  const result = await verifyPayload(dir, {
+    platform: "win32",
+    arch: "x64",
+    engine: engineReturning(fakeRows(2, 8))
+  });
+  assert.equal(result.integrity.status, "malformed");
+  assert.equal(result.integrity.ok, false, "形状错误不是「验过了」，也不能当成「没记录」放过");
+  assert.equal(result.ok, false);
+  assert.match(result.integrity.detail, /形状非法/);
+});
+
 test("三件套：显式报 unverified 与「没传」同判，不因为说出口就变失败", async () => {
   const dir = makePayload();
   const result = await verifyPayload(dir, {
