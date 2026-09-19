@@ -468,6 +468,15 @@ window.__ModuleLoader__.load({
         "memory.status.conflictsHint": "冻结的矛盾记忆，等待人工确认",
         "memory.status.injectSuppressed": "极简模式下注入按宿主设计关闭",
         "memory.status.injectSuppressedHint": "当前会话使用 minimal 预设，记忆注入 / 用户画像 / hot memory 不送达模型（宿主设计，非插件缺陷）。解法：切换标准模式，或在 ~/.dsh/settings.yaml 设 agent-presets.default: standard；过渡方案：把画像与规则写入 AGENTS.md",
+        "memory.status.injectPreview": "注入预览",
+        "memory.status.injectPreviewNone": "暂无预览——尚未发生注入（新会话或注入已关闭）",
+        "memory.status.injectPreview.chars": "总体积 {chars} 字符",
+        "memory.status.injectPreview.charsUnit": " 字符",
+        "memory.status.injectPreview.query": "查询「{query}…」",
+        "memory.status.injectPreview.hot": "hot memory",
+        "memory.status.injectPreview.adaptiveOn": "自适应条数",
+        "memory.status.injectPreview.rotated": "轮换抑制 ",
+        "memory.status.injectPreview.empty": "本次组装未注入任何跨会话记忆（阈值或轮换过滤）",
         "memory.status.conflictQueue.reason": "原因",
         "memory.status.conflictQueue.sideA": "A 方",
         "memory.status.conflictQueue.sideB": "B 方",
@@ -835,6 +844,15 @@ window.__ModuleLoader__.load({
         "memory.status.conflictsHint": "Frozen contradictory memories awaiting confirmation",
         "memory.status.injectSuppressed": "Injection disabled by host minimal preset",
         "memory.status.injectSuppressedHint": "This session uses the minimal preset: memory injection / user profile / hot memory never reach the model (by host design, not a plugin defect). Fix: switch to standard mode, or set agent-presets.default: standard in ~/.dsh/settings.yaml. Interim: put profile and rules in AGENTS.md",
+        "memory.status.injectPreview": "Injection preview",
+        "memory.status.injectPreviewNone": "No preview yet — no injection has happened (new session or injection off)",
+        "memory.status.injectPreview.chars": "total {chars} chars",
+        "memory.status.injectPreview.charsUnit": " chars",
+        "memory.status.injectPreview.query": "query \"{query}…\"",
+        "memory.status.injectPreview.hot": "hot memory",
+        "memory.status.injectPreview.adaptiveOn": "adaptive budget",
+        "memory.status.injectPreview.rotated": "rotation-suppressed ",
+        "memory.status.injectPreview.empty": "No cross-session memories injected this assembly (threshold or rotation filter)",
         "memory.status.conflictQueue.reason": "Reason",
         "memory.status.conflictQueue.sideA": "Side A",
         "memory.status.conflictQueue.sideB": "Side B",
@@ -3127,6 +3145,55 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // --- 注入预览（issue #179，状态页）---------------------------------------
+    // 展示最近一帧 prompt 组装注入了什么：条目构成（类型/标题/重要性/字符数）、
+    // hot memory 与总体积、当前生效参数（maxItems/threshold/自适应/scope/轮换）。
+    // 数据来自 /inject-preview 的旁路快照——就是上次真实渲染用的同一份候选，
+    // 不二次检索。无快照（autoInject 关/新会话/旧宿主）整卡退化为「暂无预览」。
+    function InjectPreviewCard({ t }) {
+      const [snap, setSnap] = useState(null);
+      const [loading, setLoading] = useState(true);
+      useEffect(() => {
+        let cancelled = false;
+        apiFetch("/api/dsh-mneme/inject-preview")
+          .then((res) => { if (!res.ok) throw new Error("http"); return res.json(); })
+          .then((j) => { if (!cancelled) { setSnap(j && j.snapshot); setLoading(false); } })
+          .catch(() => { if (!cancelled) setLoading(false); });
+        return () => { cancelled = true; };
+      }, []);
+      if (loading) return null;
+      if (!snap) {
+        return h("div", { className: "mneme-statuscard" },
+          h("h3", { className: "mneme-xcolhead" }, t("memory.status.injectPreview")),
+          h("div", { className: "mneme-statuscap" }, t("memory.status.injectPreviewNone"))
+        );
+      }
+      const params = [
+        `maxItems=${snap.maxItems}`,
+        `threshold=${snap.threshold}`,
+        snap.adaptive ? t("memory.status.injectPreview.adaptiveOn") : null,
+        snap.scoped ? `scope=${snap.scoped}` : null,
+        snap.rotated > 0 ? `${t("memory.status.injectPreview.rotated")}${snap.rotated}` : null
+      ].filter(Boolean).join(" · ");
+      return h("div", { className: "mneme-statuscard", style: { gridColumn: "1 / -1" } },
+        h("h3", { className: "mneme-xcolhead" }, t("memory.status.injectPreview")),
+        h("div", { className: "mneme-statuscap" },
+          params,
+          ` · ${t("memory.status.injectPreview.chars").replace("{chars}", String(snap.totalChars))}`,
+          snap.query ? ` · ${t("memory.status.injectPreview.query").replace("{query}", snap.query.slice(0, 24))}` : ""
+        ),
+        snap.hotChars > 0 && h("div", { className: "mneme-statuscap", style: { marginTop: 4 } },
+          `${t("memory.status.injectPreview.hot")} · ${snap.hotChars}${t("memory.status.injectPreview.charsUnit")}`),
+        h("div", { style: { marginTop: 6 } },
+          (snap.entries || []).length === 0
+            ? h("div", { className: "mneme-statuscap" }, t("memory.status.injectPreview.empty"))
+            : (snap.entries || []).map((m) => h("div", { key: m.id, style: { display: "flex", gap: 8, alignItems: "baseline", fontSize: 12, padding: "2px 0" } },
+                h("span", { className: "mneme-xcolhead" }, typeLabel(t, m.type)),
+                h("span", { style: { flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, m.title || "—"),
+                h("span", { className: "mneme-xcolhead" }, `★${m.importance ?? "—"} · ${m.chars}${t("memory.status.injectPreview.charsUnit")}`))))
+      );
+    }
+
     // --- 冲突集中处理队列（v0.8.0，状态页）---------------------------------
     // 此前冻结冲突只有计数与散落徽章，resolveConflictPending 无任何调用方——
     // 这里是第一处理入口：并排展示双方内容 + reason，人工选保留方后走
@@ -3444,7 +3511,8 @@ window.__ModuleLoader__.load({
           h(DreamStatusCards, { t, onGotoQueue: gotoQueue }),
           h(HeatStatusCard, { t }),
           h(RecallStatsCard, { t }),
-          h(InjectStatusCard, { t })
+          h(InjectStatusCard, { t }),
+          h(InjectPreviewCard, { t })
         ),
         h("div", { ref: queueRef }, h(ConflictsQueue, { t })),
         h(WorkbenchSection, { t, onBrowse })

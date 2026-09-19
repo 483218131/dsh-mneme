@@ -843,3 +843,19 @@ test("a11y: entity graph svg exposes a count summary", () => {
     assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
   }
 });
+
+// --- issue #179：注入预览（状态页卡片 + /inject-preview 端点透传的旁路快照） ---
+
+test("a11y+preview: inject preview card is wired on the status tab", () => {
+  assert.ok(clientSource.includes('"/api/dsh-mneme/inject-preview"'), "card must fetch the preview endpoint");
+  assert.ok(clientSource.includes("h(InjectPreviewCard, { t })"), "status grid must render the preview card");
+  for (const key of [
+    "memory.status.injectPreview",
+    "memory.status.injectPreviewNone",
+    "memory.status.injectPreview.chars",
+    "memory.status.injectPreview.empty"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
