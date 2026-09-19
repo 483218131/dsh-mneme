@@ -67,13 +67,17 @@ test("#249: pinned entries lead the block and sit outside maxInjectedItems", () 
   assert.equal(seq.length, 4, "pinned entries do not consume maxInjectedItems slots");
 });
 
-test("#249: over-budget pinned entries are annotated, never silently dropped", () => {
+test("#249: over-budget pinned entries are annotated with the truly hidden count", () => {
   const { service, text } = setup({ maxInjectedItems: 1, pinnedInjectBudget: 1 });
   for (let i = 0; i < 3; i++) {
     service.saveWithDedupe({ type: "preference", title: `偏好${i}`, content: `第 ${i} 条偏好内容`, importance: 5 });
   }
   const body = text();
-  assert.ok(body.includes("另有 2 条未展示"), `annotation must carry the hidden count: ${body}`);
+  // 3 条同类里 pref0 被 pin、pref1 进了 general 槽（真的在块内），只有 pref2 没展示。
+  // 按 eligible - pinned 直接相减会把 pref1 也算成未展示——虚报（#266 评审实测）。
+  assert.ok(body.includes("偏好1"), "the over-budget one that made it into a general slot is really shown");
+  assert.ok(body.includes("另有 1 条未展示"), `annotation must carry the hidden count: ${body}`);
+  assert.ok(!body.includes("另有 2 条"), "no double counting");
 });
 
 test("#249: pinned entries are exempt from cross-turn rotation", () => {

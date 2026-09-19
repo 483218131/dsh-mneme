@@ -150,12 +150,13 @@ export function createInjector(ctx, service, settings, config) {
   // 失真，同时给「一条超长约束每轮吃满常驻段」留一道闸（超顶仍带截断提示）。
   const PINNED_CONTENT_MAX = Math.max(maxContent, 2000);
 
-  // Compressed injection (v0.5.0 2.1): a sleep-demoted row already carries its
-  // summary in `content` with the original parked in `_full_content` — inject
-  // the summary verbatim instead of re-truncating the (already short) text.
-  // Regular long rows keep the hard truncate.
+  // Compressed injection (v0.5.0 2.1): a sleep-demoted row carries its summary in
+  // `content` with the original parked in `_full_content` — inject the summary
+  // verbatim instead of re-truncating the (already short) text. 但「降级过」不等于
+  // 「天然够短」：原先那条 `_full_content` 早返回的唯一效果就是**跳过 maxLength**
+  // （两条分支取的都是 m.content），于是 pin 的硬顶在这一路上形同不存在（#266 评审）。
+  // 现在只有一条截断路径：超限照旧带提示，原文永远可通过 memory_get 取回。
   function injectMemory(m, maxLength = maxContent) {
-    if (m?._full_content) return String(m.content ?? "");
     const text = String(m?.content ?? "");
     if (text.length <= maxLength) return text;
     return `${text.slice(0, maxLength)}…${STR.truncatedHint[language](maxLength, text.length, m.id)}`;

@@ -1483,21 +1483,13 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     // 名额、也不被 document 预算截断，因此不会把当前任务需要的情景候选挤出去；
     // 超预算的条数回报给调用方，在块内如实标注（绝不静默省略）。
     const pinnedBudget = Math.max(0, Math.min(5, Math.floor(config?.pinnedInjectBudget ?? 0)));
+    // eligible 留到块外：未展示条数要等 general 槽选完才算得准（见 selected 之后）。
+    const eligible = pinnedBudget > 0 ? candidates.filter((m) => PINNED_MEMORY_TYPES.has(m.type)) : [];
     let pinned = [];
-    if (pinnedBudget > 0) {
-      const eligible = candidates.filter((m) => PINNED_MEMORY_TYPES.has(m.type));
+    if (pinnedBudget > 0 && eligible.length > 0) {
       pinned = eligible.slice(0, pinnedBudget);
-      if (pinned.length > 0) {
-        const pinnedIds = new Set(pinned.map((m) => m.id));
-        candidates = candidates.filter((m) => !pinnedIds.has(m.id));
-      }
-      if (pinnedStats) {
-        pinnedStats.shown = pinned.length;
-        pinnedStats.suppressed = eligible.length - pinned.length;
-      }
-    } else if (pinnedStats) {
-      pinnedStats.shown = 0;
-      pinnedStats.suppressed = 0;
+      const pinnedIds = new Set(pinned.map((m) => m.id));
+      candidates = candidates.filter((m) => !pinnedIds.has(m.id));
     }
     // Issue #205：注入位跨轮轮换。rotate = 最近 N 轮注入过的 id 集合（由注入层
     // 按会话维护并传入）：这些条目本轮不再优先——新鲜者前置（各自内部相对次序
@@ -1525,6 +1517,15 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     // #249 第一批：pin 前置到块内相关性排序之前（验收项），且不占 maxItems 名额。
     // pinned 为空时 selected 就是 general 本身——关闭态与改动前逐字节一致。
     const selected = pinned.length > 0 ? [...pinned, ...general] : general;
+    if (pinnedStats) {
+      // 「未展示」只数**真的没进块**的 pin 类条目：被 pin 预算挤下来的条目会回到
+      // 候选池，仍可能被 general 槽选中——那就是展示了。按 eligible - pinned 直接
+      // 相减会把它们也算成未展示，块头那一行于是虚报（评审实测：pref#2 已在块内，
+      // 仍报「另有 2 条未展示」）。所以统一按「有没有进 selected」判。
+      const shownIds = new Set(selected.map((m) => m.id));
+      pinnedStats.shown = pinned.length;
+      pinnedStats.suppressed = eligible.filter((m) => !shownIds.has(m.id)).length;
+    }
     touchRecalled(selected);
     // #217 口径（2026-09-19 拍板）：注入是曝光型访问事件，与检索命中同表分账
     // （mode='inject'，candidates 存实际注入集）。跟随 recallRecordDefault——
