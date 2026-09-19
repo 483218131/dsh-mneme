@@ -480,6 +480,7 @@ export function createTools(ctx, service, config, embedder) {
         importance: { type: "integer", description: "1-5 (default 3); the summary row injects at the next-priority tier within documentInjectBudget when importance >= threshold" },
         evidence: { type: "array", items: { type: "string" }, description: "Memory ids this document is grounded in; each is verified against the store (fabricated evidence is rejected; unknown/archived ids are dropped and the row is tagged evidence_degraded)" },
         source: { type: "string", description: "Optional provenance" },
+        sensitivity: { type: "string", description: "Optional sensitivity label (free-form, e.g. personal). Part of the supersede matching key — same path/title with a different sensitivity stays a separate document." },
         agent_scope: { type: "string", description: "Optional explicit agent-scope declaration (issue #170): 'global' or '*' makes this document visible to every agent; any other value narrows it to that label. Overrides the automatic carrier label for this write; honored even when automatic scope labeling is disabled." },
         workspace_scope: { type: "string", description: "Optional explicit workspace-scope declaration (issue #170): 'global' or '*' makes this document visible in every workspace; any other value narrows it to that label. Overrides the automatic carrier label for this write; honored even when automatic scope labeling is disabled." }
       },
@@ -513,6 +514,19 @@ export function createTools(ctx, service, config, embedder) {
         const workspaceLabel = args.workspace_scope !== undefined
           ? { value: normalizeExplicitScope(args.workspace_scope), source: "explicit" }
           : autoStamping && scope ? { value: scope.workspace_scope, source: "auto" } : null;
+        // strictScope（#170 复核项 4 同款无存在性泄漏）：他 scope 的 evidence id
+        // 按「不存在」处理——注册器用全局 getById 求交，看不见的行在这里先标出，
+        // 与 unknown/archived 同落 dropped，不进持久化 evidence（不得为跨 scope
+        // id 建立引用）。
+        const hiddenEvidence = [];
+        if (config?.strictScope === true && scope && Array.isArray(args.evidence)) {
+          for (const raw of args.evidence) {
+            const id = String(raw ?? "").trim();
+            if (!id) continue;
+            const row = service.getById(id);
+            if (row && !service.isVisibleInScope(row, scope)) hiddenEvidence.push(id);
+          }
+        }
         const result = await service.registerDocument({
           path: args.path,
           title: args.title,
@@ -521,9 +535,10 @@ export function createTools(ctx, service, config, embedder) {
           ...(args.importance !== undefined ? { importance: args.importance } : {}),
           evidence: args.evidence ?? [],
           source: args.source ?? "tool",
+          ...(args.sensitivity !== undefined ? { sensitivity: args.sensitivity } : {}),
           ...(agentLabel ? { agent_scope: agentLabel.value, agent_scope_source: agentLabel.source } : {}),
           ...(workspaceLabel ? { workspace_scope: workspaceLabel.value, workspace_scope_source: workspaceLabel.source } : {})
-        });
+        }, { hiddenEvidenceIds: hiddenEvidence });
         return {
           action: result.action,
           id: result.memory.id,

@@ -1341,11 +1341,14 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     // 生成总闸 dreamNarrativeEnabled 约束（flag 关 = 该类行不再注入，存量行
     // 仍可检索）；②document 摘要行同落次优先档，另有独立预算（见下方选取）。
     const injectTypes = config?.documentMemoryEnabled === true ? INJECT_TYPES_WITH_DOCUMENT : INJECT_TYPES;
+    // #230 拍板：叙述条解禁进注入受生成总闸约束——门必须对全部候选路径一致
+    // （规则/向量/缓存/BM25），只锁规则路的话语义路仍会漏进 narrative 行。
+    const allowNarrative = config?.dreamNarrativeEnabled === true;
     const filtered = store.list({ limit: Math.max(200, poolSize), includeForgotten: false })
       .filter((m) => !m.archived && injectTypes.has(m.type) && !m.forgotten &&
         // 叙述条：#228 落地为纯按需检索；#230 合并拍板解禁为次优先档注入
         // （per-topic 叙述常驻位仍只留给 dream 总览 source=dream）。
-        (m.source !== "narrative" || config?.dreamNarrativeEnabled === true) &&
+        (m.source !== "narrative" || allowNarrative) &&
         codingGate(m) &&
         (m.type === "summary" || m.type === "preference" || m.importance >= threshold));
     // #218 v1: heat 乘数——heatEnabled 时在优先级层内给 importance×quality 乘
@@ -1393,6 +1396,7 @@ export function createService({ store, mirror, config, onWrite, logger }) {
           const hits = vectorIndex.search(queryVector, { limit: poolSize, threshold: 0 });
           for (const m of hits) {
             if (m && !m.archived && injectTypes.has(m.type) && !m.forgotten &&
+              (m.source !== "narrative" || allowNarrative) &&
               codingGate(m) &&
               (m.type === "summary" || m.type === "preference" || m.importance >= threshold)) {
               semanticItems.push(m);
@@ -1402,7 +1406,8 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       }
       if (!semanticItems.length && lastSemanticRecall?.query === q && lastSemanticRecall.items?.length) {
         for (const m of lastSemanticRecall.items) {
-          if (m && !m.archived && injectTypes.has(m.type) && !m.forgotten && codingGate(m)) semanticItems.push(m);
+          if (m && !m.archived && injectTypes.has(m.type) && !m.forgotten &&
+            (m.source !== "narrative" || allowNarrative) && codingGate(m)) semanticItems.push(m);
         }
       }
       // Issue #198：首轮（无向量、无缓存召回）的同步兜底——BM25 词法召回领位。
@@ -1415,6 +1420,7 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       if (!semanticItems.length) {
         for (const hit of bm25Recall(q, poolSize)) {
           if (hit && !hit.archived && injectTypes.has(hit.type) && !hit.forgotten &&
+            (hit.source !== "narrative" || allowNarrative) &&
             codingGate(hit) &&
             (hit.type === "summary" || hit.type === "preference" || hit.importance >= threshold)) {
             semanticItems.push(hit);
@@ -2052,7 +2058,8 @@ export function createService({ store, mirror, config, onWrite, logger }) {
 
   // document 型记忆注册（#230）：内聚块在 src/document.js（AGENTS.md 尺寸
   // 约定，同 recallStats 先例），这里只做依赖注入 + barrel 出口，调用方零改动。
-  // finalize 是唯一写后语（镜像同步 + 通知 + 重嵌入），新旧两行共用一份。
+  // 写后语只做重嵌入：镜像同步与写通知由 transaction 的 commit 路径统一执行
+  // （notifyWrite 在 txDepth>0 时 deferred 到 finally），这里再调就是双份。
   const registerDocument = createDocumentRegistrar({
     store,
     config,
@@ -2060,8 +2067,6 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     pushContentHistory,
     transaction,
     finalize: (rows) => {
-      afterSync("write");
-      notifyWrite();
       for (const row of rows) scheduleEmbed(row);
     }
   });

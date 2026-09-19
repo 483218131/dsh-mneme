@@ -41,7 +41,7 @@ const supersededByPointer = (id) => `\n\n[superseded by ${id}]`;
  *   捏造 / 仅 vector 近重复（疑似重复外档，交 agent 裁决而不是静默二选一）。
  */
 export function createDocumentRegistrar({ store, config, embedQuery, pushContentHistory, transaction, finalize }) {
-  return async function registerDocument(payload) {
+  return async function registerDocument(payload, { hiddenEvidenceIds = [] } = {}) {
     // opt-in 总闸（#230 对齐 #228 形态）：关 = 注册入口整体不存在，错误信息
     // 指回配置键，agent 能准确转告用户去开。
     if (config?.documentMemoryEnabled !== true) {
@@ -59,10 +59,15 @@ export function createDocumentRegistrar({ store, config, embedQuery, pushContent
     // 只展开 ~ / ~/（~user 形式拒收为普通相对路径走 isAbsolute 拦截——不猜测
     // 其他用户的 home，错展开比报错更糟）。
     const isTilde = rawPath === "~" || rawPath.startsWith("~/") || rawPath.startsWith("~\\");
-    const expanded = isTilde ? resolve(homedir(), rawPath.slice(2)) : rawPath;
-    if (!isAbsolute(expanded)) {
+    const absolute = isTilde ? resolve(homedir(), rawPath.slice(2)) : rawPath;
+    if (!isAbsolute(absolute)) {
       throw new Error(`registerDocument: path must be absolute (got "${rawPath}")`);
     }
+    // 所有绝对路径统一 resolve 归一化（. / .. / 重复分隔符）——归一化不做的话，
+    // D:\a\.\b.md 与 D:\a\b.md 会被判成两个路径，同文件绕过 same-path
+    // supersede，留下双活跃指针。realpathSync 刻意不用：符号链接合并会改写
+    // agent 提交的路径字面量，指针的可读性比追符号链更重要。
+    const expanded = resolve(absolute);
     let stat = null;
     try { stat = statSync(expanded); } catch { /* missing/unreadable → null */ }
     if (!stat?.isFile() || stat.size <= 0) {
@@ -78,15 +83,19 @@ export function createDocumentRegistrar({ store, config, embedQuery, pushContent
         .map((id) => String(id ?? "").trim())
         .filter(Boolean)
     )];
+    // strictScope（tools 层传入，#170 复核项 4 同款）：调用者 scope 看不见的
+    // 行按「不存在」处理——不得为跨 scope id 建立引用（存在性泄漏），与
+    // unknown/archived 同落 dropped，evidence_kept/dropped 计数保持诚实。
+    const hidden = new Set((Array.isArray(hiddenEvidenceIds) ? hiddenEvidenceIds : []).map((id) => String(id)));
     const kept = [];
     const dropped = [];
     for (const id of wanted) {
-      const row = store.getById(id);
+      const row = hidden.has(id) ? null : store.getById(id);
       (row && !row.archived ? kept : dropped).push(id);
     }
     if (wanted.length > 0 && kept.length === 0) {
       throw new Error(
-        `registerDocument: all ${wanted.length} evidence ids are unknown or archived — fabricated evidence is rejected`
+        `registerDocument: all ${wanted.length} evidence ids are unknown, archived or out of scope — fabricated evidence is rejected`
       );
     }
 
@@ -112,15 +121,20 @@ export function createDocumentRegistrar({ store, config, embedQuery, pushContent
       const norm = (p) => (process.platform === "win32" ? String(p).toLowerCase() : String(p));
       return norm(a) === norm(b);
     };
-    const candidates = store
-      .list({ type: "document", limit: CANDIDATE_LIMIT })
+    // 精确层（同路径/同标题）必须全量扫描、不允许窗口截断：>200 行活跃
+    // document 时，窗口外的同路径旧版漏检会留下双活跃版本——supersede 判定
+    // 是正确性要求，不是性能优化对象。vector 档比对保留 CANDIDATE_LIMIT
+    // （getEmbeddings + 两两 cosine 才是有界对象）。
+    const scopeMatched = store
+      .list({ type: "document", limit: null })
       .filter((m) => scopeMatches(m));
-    const explicitTarget = candidates.find((m) => samePath(m.doc_path, expanded))
-      ?? candidates.find((m) => m.title.trim() === title);
+    const explicitTarget = scopeMatched.find((m) => samePath(m.doc_path, expanded))
+      ?? scopeMatched.find((m) => m.title.trim() === title);
     if (!explicitTarget) {
       // vector 档：embedder 不可用/向量缺失一律跳过——去重是增强不是写入依赖
       // （findSessionDuplicate 同原则）。probe 用 title+summary，与行向量
       // （同两段拼接 embed）同构。
+      const candidates = scopeMatched.slice(0, CANDIDATE_LIMIT);
       try {
         const vecs = store.getEmbeddings(candidates.map((m) => m.id));
         if (vecs.size) {
@@ -168,6 +182,9 @@ export function createDocumentRegistrar({ store, config, embedQuery, pushContent
         source: payload?.source ?? "tool",
         evidence: kept,
         doc_path: expanded,
+        // sensitivity 进 supersede 匹配键（scopeKeyOf 第三维）：不落库的话，
+        // 首注册带 sensitivity、重注册同键会在匹配时判成两 scope，旧版漏检。
+        ...(payload?.sensitivity !== undefined ? { sensitivity: payload.sensitivity } : {}),
         ...(payload?.agent_scope !== undefined
           ? { agent_scope: payload.agent_scope, agent_scope_source: payload.agent_scope_source }
           : {}),

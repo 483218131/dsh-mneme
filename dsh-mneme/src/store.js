@@ -874,6 +874,14 @@ export function createStore(path) {
     const id = memory.id ?? randomUUID();
     const type = memory.type;
     if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
+    // #230 写入权分离（存储层不变量）：document 是指针行，doc_path 是它的
+    // 存在依据——没有指针的 document 行无法按需读全文，等于死行。通用写路径
+    // （saveWithDedupe / bootstrap / 直接 store 调用）从不携带 doc_path，在此
+    // 结构性拒绝；registerDocument 恒带归一化后的 doc_path，不受影响。
+    // service 层另有两条业务守卫（saveWithDedupe / updateMemory），这是底线。
+    if (type === "document" && !(typeof memory.doc_path === "string" && memory.doc_path.trim())) {
+      throw new Error("document rows are pointer rows: doc_path is required (minted only via registerDocument)");
+    }
     if (memory.tags !== undefined && !Array.isArray(memory.tags)) {
       throw new Error("tags must be an array");
     }
@@ -933,6 +941,12 @@ export function createStore(path) {
     if (!existing) throw new Error(`memory not found: ${id}`);
     const type = patch.type ?? existing.type;
     if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
+    // #230：type 不许改入/改出 document——铸造与退役都只经 registerDocument
+    // （摘要修复走同 type 的 content/title 更新，doc_path 不在本 UPDATE 的
+    // SET 里，天然保持不变）。
+    if ((existing.type === "document") !== (type === "document")) {
+      throw new Error("memory type cannot be changed to or from 'document' (registerDocument is the only mint path)");
+    }
     if (patch.tags !== undefined && !Array.isArray(patch.tags)) {
       throw new Error("tags must be an array");
     }
@@ -1024,6 +1038,11 @@ export function createStore(path) {
     if (!existing) throw new Error(`memory not found: ${id}`);
     const type = patch.type ?? existing.type;
     if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
+    // 同 update：document 类型转换在这里同样封死（CAS 路径绕过 updateMemory
+    // 的 service 守卫，必须在存储层兜住）。
+    if ((existing.type === "document") !== (type === "document")) {
+      throw new Error("memory type cannot be changed to or from 'document' (registerDocument is the only mint path)");
+    }
     if (patch.tags !== undefined && !Array.isArray(patch.tags)) {
       throw new Error("tags must be an array");
     }
@@ -1144,11 +1163,15 @@ export function createStore(path) {
   // Live memories that have not been touched since `cutMs` (never-touched ones
   // fall back to created_at). Ordered by last access ascending — the coldest
   // first. Used by sleep phase 2 to pick archival-demotion candidates.
+  // #230: document pointer rows are excluded — they are heat-immune by design
+  // (λ=0) and their "unread" state is normal (full text lives outside the DB),
+  // so the cold scan must never demote/archive them for lacking access.
   function getUnrecalledSince(cutMs, { limit = 500 } = {}) {
     const cutIso = new Date(cutMs).toISOString();
     const rows = db.prepare(
       `SELECT * FROM memories
        WHERE forgotten = 0 AND archived = 0
+         AND type <> 'document'
          AND (last_accessed_at IS NULL OR last_accessed_at < ?)
        ORDER BY COALESCE(last_accessed_at, created_at) ASC, id
        LIMIT ?`
@@ -1156,12 +1179,19 @@ export function createStore(path) {
     return rows.map(toRow);
   }
 
-  function list({ type, limit = 50, offset = 0, order = "importance", includeForgotten = false, includeArchived = false, onlyArchived = false, depositedOnly = false, minImportance = null, source = null, updatedFrom = null, updatedTo = null, occurredFrom = null, occurredTo = null, visibility = null } = {}) {
+  function list({ type, excludeTypes = null, limit = 50, offset = 0, order = "importance", includeForgotten = false, includeArchived = false, onlyArchived = false, depositedOnly = false, minImportance = null, source = null, updatedFrom = null, updatedTo = null, occurredFrom = null, occurredTo = null, visibility = null } = {}) {
     const clauses = [];
     const params = [];
     if (type) {
       clauses.push("type = ?");
       params.push(type);
+    }
+    // #230：整类排除必须在 LIMIT 之前做——sleep 的模式扫描池（limit 200 +
+    // sleepPatternMinMemories 门槛）若先截断后过滤，document 行一多就会把
+    // 普通记忆挤出窗口，池子被饿空。
+    if (Array.isArray(excludeTypes) && excludeTypes.length) {
+      clauses.push(`type NOT IN (${excludeTypes.map(() => "?").join(", ")})`);
+      params.push(...excludeTypes);
     }
     // Optional server-side filters: importance floor and exact source match.
     // Both stay out of the query when unset so existing callers are unaffected.
@@ -1236,15 +1266,20 @@ export function createStore(path) {
         "(id IN (SELECT record_id FROM receipt_chain WHERE kind IN ('merge', 'update') AND verdict = 'live') OR source = 'dream')"
       );
     }
+    // limit == null = 无界（#230 注册器的精确 supersede 全量扫描用——同路径/
+    // 同标题判定不允许窗口截断）。其余调用传数字，走 sanitizePage 默认档。
+    const unbounded = limit == null;
     const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     // "chrono" is pure newest-first — the stable order paged browsing (month
     // tree, infinite scroll) needs; importance ordering would interleave
     // months across pages.
     const orderBy = order === "chrono" ? "updated_at DESC, id DESC" : "importance DESC, updated_at DESC, id";
-    const rows = db.prepare(
-      `SELECT * FROM memories ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
-    ).all(...params, lim, off);
+    const rows = unbounded
+      ? db.prepare(`SELECT * FROM memories ${where} ORDER BY ${orderBy}`).all(...params)
+      : db.prepare(
+          `SELECT * FROM memories ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
+        ).all(...params, lim, off);
     return rows.map(toRow);
   }
 
