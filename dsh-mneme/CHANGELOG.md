@@ -4,6 +4,8 @@
 
 ## 🆕 新增
 
+- **总览（dream_summarize）独立路由与输入硬上限（issue #258）**：`dreamSummaryProvider` / `dreamSummaryModel`（默认空 = 沿用巩固路由，行为逐字节不变）——consolidate 有 `dreamMaxSnapshotSize` 窗口而总览输入为全库无界，两者 ctx 需求差数倍却强制共用 dream 路由：`dreamProvider` 指向小 ctx 模型时总览当场 `CONTEXT_WINDOW_EXCEEDED`（实测 120,969 > 32,768 tokens），指向大 ctx 模型则 consolidate 的卸载收益归零；`dreamSummaryMaxInputs`（默认 0 = 不设上限，0–100000 可调）>0 时按 `updated_at` 倒序保留最新 N 条（与 consolidate 窗口同一排序口径），总览口径脚注的条数随实际输入变化。三键 schema 与 settings 白名单成对落位，面板可调。
+
 - **注入命中留痕与注入命中率（issue #217 增量，2026-09-19 口径确认）**：注入终选集落一行 `mode='inject'` 审计（candidates 存实际注入条目，跟随 `recallRecordDefault` 不设新配置键；`heatEnabled=false` 时照写——留痕与消费解耦）；recall-stats 新增注入口径（轮数 / 注入条数 / 槽位填充率 `slotFillRate`，注入候选计入 Top-N 与僵尸零曝光判定）；面板「记忆复用」卡追加注入段（窗口内无注入行时省略）。
 
 - **蒸馏的成本感知级联与有界检查点（issue #239，第一批）**：两个 opt-in 旋钮，默认 `0` = 行为逐字节不变。① `summarizeMinWindowChars`——**蒸馏前的零 LLM 预判**：窗口内可蒸馏文本不足阈值时直接跳过 LLM 调用（纯规则判定、无模型参与；被挡下的窗口照常消费游标，否则每个 `turn/end` 都会重评同一段短文本），skip 原因写进 `llm_audit_logs`（`status='skipped'` / `error_message='window-too-small'`）——此前只有最小间隔一档留痕，「这一轮为什么没蒸馏」基本不可观测；② `summarizeMaxRunsPerSession`——每会话最多发起多少次蒸馏，只统计**真正发起过** LLM 调用的 run（被预判挡下的窗口不占额度），aborted 调用按既有口径回滚，游标刻意不消费（预算恢复或重启后仍能蒸馏到该窗口）。两键在 `config.js` schema 与 `settings.js` 整数白名单成对落位，面板可调；第 4 项（错峰队列）与第 5 项（注入侧不确定性召回）留后续批次。

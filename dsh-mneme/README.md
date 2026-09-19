@@ -445,6 +445,8 @@ dsh web
 | `dreamImplicitKeep` | `true` | 显式决策覆盖率不足时的隐式 keep（未提及条目保持原样）；`false` + `dreamMinExplicitCoverage: 0` 恢复旧严格行为 |
 | `dreamMinExplicitCoverage` | `0.5` | 显式决策覆盖率下限（0-1）：合法子集低于该值降级 degraded 而非整单拒绝（#104 方向 1，PR #200） |
 | `dreamMaxSnapshotSize` | `200` | autoDream 滑动窗口上限：每次只对最近 N 条做 consolidation，窗口外不进 snapshot（防 LLM 输入撑爆） |
+| `dreamSummaryProvider` / `dreamSummaryModel` | 空 | 总览（dream_summarize）专用模型路由（留空 = 沿用 `dreamProvider`/`dreamModel`）。consolidate 有窗口（`dreamMaxSnapshotSize`）而总览输入随库增长，ctx 需求差数倍——用小 ctx 模型跑巩固时把总览指到大 ctx 模型（issue #258） |
+| `dreamSummaryMaxInputs` | `0` | 总览输入条数硬上限（0 = 不设上限）：超过时按 `updated_at` 倒序只保留最新 N 条进总览，防小 ctx 模型被全库输入撑爆；总览口径脚注的条数随实际输入变化 |
 | `dreamMinIntervalMinutes` | `0` | autoDream 最小触发间隔（0-10080，0=不限）：失败/degraded run 也占用 |
 | `dreamNarrativeEnabled` | `false` | 叙述条总开关（#164 对齐，v0.8.4）：按共享 tag 主题簇合成叙述 + evidence 证据链，注入候选排除（按需检索，常驻位只留 dream 总览）；也走 feature_flags 白名单，lightMode 强制关 |
 | `dreamNarrativeMinCluster` | `3` | 主题簇合成叙述的最小成员数（2-20，v0.8.4） |
