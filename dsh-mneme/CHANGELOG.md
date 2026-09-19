@@ -10,6 +10,8 @@
 
 ## 🐛 修复
 
+- **睡眠冲突/模式阶段的输出预算可配（issue #257）**：`src/dream/sleep.js` 冲突消解与模式发现两处 `maxTokens: 2048` 硬编码提为 `sleepMaxTokens`（默认 8192，schema + 整数白名单成对落位，面板可调）。实测依据（报告者 llama.cpp 环境）：默认档 24 对裁决需 2097 token，恰好压在 2048 边界（53 次运行 48 败 5 胜的「间歇性失败」指纹）；`sleepActionSet: full` 六分支实测需 6967（3.4 倍越界）——该档位自 #126 引入起从未跑通过。流式计费按实际用量，调大不增加成本。
+
 - **审计记账改读 `chunk.usage`，token 不再恒为 0（issue #242）**：dsh-llm 的 StreamChunk 契约把用量嵌在 `{type:"usage", usage:TokenUsage}`（TokenUsage = inputTokens / outputTokens / …），chunk 顶层没有 token 字段——dream / summarize 的审计读取把整个 chunk 当用量对象，input/output 恒为 undefined，审计行落 0（实测 7 天 49 次 success 调用 token 全 0，面板「LLM 消耗」长期显示 0）。改读 `chunk.usage ?? chunk`，`?? chunk` 兜底兼容用量平铺在顶层的替身（嵌套 + 平铺双形状回归测试）。
 
 ## 🧪 工程
