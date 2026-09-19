@@ -10,6 +10,8 @@
 
 - **蒸馏的成本感知级联与有界检查点（issue #239，第一批）**：两个 opt-in 旋钮，默认 `0` = 行为逐字节不变。① `summarizeMinWindowChars`——**蒸馏前的零 LLM 预判**：窗口内可蒸馏文本不足阈值时直接跳过 LLM 调用（纯规则判定、无模型参与；被挡下的窗口照常消费游标，否则每个 `turn/end` 都会重评同一段短文本），skip 原因写进 `llm_audit_logs`（`status='skipped'` / `error_message='window-too-small'`）——此前只有最小间隔一档留痕，「这一轮为什么没蒸馏」基本不可观测；② `summarizeMaxRunsPerSession`——每会话最多发起多少次蒸馏，只统计**真正发起过** LLM 调用的 run（被预判挡下的窗口不占额度），aborted 调用按既有口径回滚，游标刻意不消费（预算恢复或重启后仍能蒸馏到该窗口）。两键在 `config.js` schema 与 `settings.js` 整数白名单成对落位，面板可调；第 4 项（错峰队列）与第 5 项（注入侧不确定性召回）留后续批次。
 
+- **注入条数的查询自适应（issue #239 第 5 项）**：`injectUncertaintyAdaptive`（默认关）。开启后：确定性强的话题把注入条数收缩到一半（下限 1），模糊话题（回指/时间线索，或极短查询）维持 `maxInjectedItems` 上限——**只做单向收缩**，绝不越过用户配置的上限。依据是不确定性驱动的读路径（模糊多召回、确定少召回），但「注入相关却带偏生成」的内容可能比不注入更糟（两处独立出处），所以宁可少注入也不新增这个风险面。判据只看查询本身、零额外检索（先探针检索等于白付一次 `fuseRecall`）；拿不到查询时维持现状不猜。纯函数 `needsBroadRecall` / `adaptiveInjectBudget` 落在 `src/search/adaptive.js`（与既有的查询自适应向量阈值同源），可单测。
+
 ## 🐛 修复
 
 - **睡眠冲突/模式阶段的输出预算可配（issue #257）**：`src/dream/sleep.js` 冲突消解与模式发现两处 `maxTokens: 2048` 硬编码提为 `sleepMaxTokens`（默认 8192，schema + 整数白名单成对落位，面板可调）。实测依据（报告者 llama.cpp 环境）：默认档 24 对裁决需 2097 token，恰好压在 2048 边界（53 次运行 48 败 5 胜的「间歇性失败」指纹）；`sleepActionSet: full` 六分支实测需 6967（3.4 倍越界）——该档位自 #126 引入起从未跑通过。流式计费按实际用量，调大不增加成本。

@@ -426,6 +426,7 @@ dsh web
 | `distillRateLimitRetries` | `3` | 命中 429 限流时的指数退避重试次数（0-10） |
 | `distillRateLimitBaseDelayMs` | `1000` | 429 退避基准延迟（ms）：1s→2s→4s… |
 | `maxInjectedItems` | `5` | 最多注入几条记忆 |
+| `injectUncertaintyAdaptive` | `false` | 注入条数的查询自适应：确定性强的话题把条数收缩到一半（下限 1），模糊话题（回指/时间线索，或极短查询）维持 `maxInjectedItems` 上限；**只做单向收缩**，判据只看查询本身、不做额外检索（#239 第 5 项） |
 | `injectRotationTurns` | `0` | 注入位跨轮轮换：同一条记忆在最近 N 个查询轮次注入过后本轮不再优先（新鲜优先、不足回填，槽位数不变；会话边界自动重置；`0` = 关闭保持现状） |
 | `injectContentMaxChars` | `300` | 注入单条正文截断上限（60-4000，原硬编码 300，#164①/#225）：截断尾部带上限/原长/全文 `memory_get` 指引；块预算 `Math.max(1500, 上限+600)` 随上限放大 |
 | `importanceThreshold` | `3` | 注入的最低重要性（1-5） |
