@@ -201,7 +201,7 @@ test("vector near-duplicate on a different path/title is rejected (agent decides
   const { writeDoc, cleanup } = await makeDocDir();
   const store = createStore(":memory:");
   try {
-    store.save({
+    store.saveDocument({
       type: "document", title: "Alpha", content: "existing summary",
       doc_path: "X:\\elsewhere\\a.md", embedding: [1, 0, 0], source: "tool"
     });
@@ -283,9 +283,10 @@ test("updateMemory cannot retype a row into document, but document summary repai
 function seedInjectionFixtures(service, store) {
   service.saveWithDedupe({ type: "summary", title: "当前项目状态", content: "resident digest", source: "dream", importance: 5, _overwrite: true });
   service.saveWithDedupe({ type: "summary", title: "叙述：topic", content: "narrative bar", source: "narrative", tags: ["topic-n"], importance: 3 });
-  // document 行铸造口唯一：测试种子也走 store.save（saveWithDedupe 有守卫）。
+  // document 行铸造口唯一：测试种子也走 store.saveDocument（saveWithDedupe
+  // 有 service 守卫、store.save 有存储层守卫）。
   for (let i = 1; i <= 3; i++) {
-    store.save({ type: "document", title: `Doc${i}`, content: `d${i}`, source: "tool", doc_path: `X:\\${i}.md`, importance: 3 });
+    store.saveDocument({ type: "document", title: `Doc${i}`, content: `d${i}`, source: "tool", doc_path: `X:\\${i}.md`, importance: 3 });
   }
 }
 
@@ -370,9 +371,9 @@ test("exact supersede tiers scan beyond any window (>200 active documents)", asy
     // 209 行用虚构路径垫量。Bulk0 先种 = updated_at 最早 = list(DESC) 末位。
     const pathA = await writeDoc("a.md");
     const pathB = await writeDoc("b.md");
-    store.save({ type: "document", title: "Bulk0", content: "c0", source: "tool", doc_path: pathA });
+    store.saveDocument({ type: "document", title: "Bulk0", content: "c0", source: "tool", doc_path: pathA });
     for (let i = 1; i < 210; i++) {
-      store.save({ type: "document", title: `Bulk${i}`, content: `c${i}`, source: "tool", doc_path: `X:\\bulk\\${i}.md` });
+      store.saveDocument({ type: "document", title: `Bulk${i}`, content: `c${i}`, source: "tool", doc_path: `X:\\bulk\\${i}.md` });
     }
     const oldest = store.list({ type: "document", limit: null }).at(-1);
     assert.equal(oldest.title, "Bulk0", "precondition: oldest row is outside the 200 window");
@@ -415,13 +416,23 @@ test("sensitivity is persisted and participates in the supersede matching key", 
 test("store guards: generic paths cannot mint or retype document rows", () => {
   const { store, close } = makeService({});
   try {
-    // save：无 doc_path 的 document 行 = 死指针，结构性拒绝。
+    // save：整类拒绝——doc_path 是任意调用方可捏造的字符串，「必带 doc_path」
+    // 挡不住绕过注册校验的直铸（CodeRabbit 复核 #882）。
     assert.throws(
       () => store.save({ type: "document", title: "X", content: "c" }),
+      /minted only via store\.saveDocument/
+    );
+    assert.throws(
+      () => store.save({ type: "document", title: "X", content: "c", doc_path: "X:\\x.md" }),
+      /minted only via store\.saveDocument/
+    );
+    // saveDocument：唯一铸造口，且保留指针行结构不变量。
+    assert.throws(
+      () => store.saveDocument({ type: "document", title: "X", content: "c" }),
       /doc_path is required/
     );
     const pref = store.save({ type: "preference", title: "P", content: "c" });
-    const doc = store.save({ type: "document", title: "D", content: "s", doc_path: "X:\\d.md" });
+    const doc = store.saveDocument({ type: "document", title: "D", content: "s", doc_path: "X:\\d.md" });
     // update / CAS：type 不许改入或改出 document（CAS 绕过 service 守卫，存储层兜底）。
     assert.throws(() => store.update(pref.id, { type: "document" }), /cannot be changed to or from/);
     assert.throws(() => store.update(doc.id, { type: "preference" }), /cannot be changed to or from/);
@@ -444,7 +455,7 @@ test("sleep cold-scan and the pattern pool exclude document rows at the query la
     const proj = store.save({ type: "project", title: "Proj", content: "c" });
     const hist = store.save({ type: "history", title: "Hist", content: "c" });
     // 最新行是 document——不带排除时它会占满 LIMIT 1 的扫描窗（饿池前置条件）。
-    store.save({ type: "document", title: "Doc", content: "s", source: "tool", doc_path: "X:\\d.md" });
+    store.saveDocument({ type: "document", title: "Doc", content: "s", source: "tool", doc_path: "X:\\d.md" });
     // 冷扫描（getUnrecalledSince，sleep phase 2 的归档降级候选）：document 豁免。
     const cold = store.getUnrecalledSince(0);
     assert.ok(cold.some((m) => m.id === proj.id) && cold.some((m) => m.id === hist.id));

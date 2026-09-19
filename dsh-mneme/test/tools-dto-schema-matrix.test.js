@@ -84,16 +84,17 @@ function assertMatches(byName, name, value, label) {
 // 都要真实落一行，否则 B 层会（正确地）报「声明了却从未产出」。
 function seedShapes(store) {
   const rows = [];
-  const push = (over) =>
-    rows.push(
-      store.save({
-        type: "project",
-        title: `shape-${rows.length}`,
-        content: `形态 ${rows.length} 的正文`,
-        source: "test",
-        ...over
-      })
-    );
+  const push = (over) => {
+    const memory = {
+      type: "project",
+      title: `shape-${rows.length}`,
+      content: `形态 ${rows.length} 的正文`,
+      source: "test",
+      ...over
+    };
+    // #230：document 走存储层唯一铸造口（通用 save 拒绝 document）。
+    rows.push(memory.type === "document" ? store.saveDocument(memory) : store.save(memory));
+  };
   push({}); // 极简形态：只有基础键
   push({ sensitivity: "personal" });
   push({ occurred_at: "2026-09-15T00:00:00Z" });

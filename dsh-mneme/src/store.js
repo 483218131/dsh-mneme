@@ -870,18 +870,31 @@ export function createStore(path) {
     return toRow(row);
   }
 
+  // #230 写入权分离（存储层唯一铸造口，CodeRabbit 复核最终形态）：document
+  // 行只能经 saveDocument 铸造，通用 save 整类拒绝。doc_path 是任意调用方
+  // 都能捏造的字符串——「必带 doc_path」挡不住绕过注册校验（flag 闸 / 文件
+  // 存在 / 路径归一化 / evidence 可见性 / scope 匹配 / supersede 探测）的直
+  // 铸，必须整类拒绝；受控通道是独立方法而不是隐藏旗标（旗标可被载荷携带，
+  // 方法名在 DI 合同里可审计）。
   function save(memory) {
+    if (memory?.type === "document") {
+      throw new Error("document rows are minted only via store.saveDocument (registerDocument)");
+    }
+    return insertMemoryRow(memory);
+  }
+
+  function saveDocument(memory) {
+    // 指针行结构不变量：doc_path 是 document 的存在依据（无指针 = 死行）。
+    if (!(typeof memory?.doc_path === "string" && memory.doc_path.trim())) {
+      throw new Error("document rows are pointer rows: doc_path is required");
+    }
+    return insertMemoryRow(memory);
+  }
+
+  function insertMemoryRow(memory) {
     const id = memory.id ?? randomUUID();
     const type = memory.type;
     if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
-    // #230 写入权分离（存储层不变量）：document 是指针行，doc_path 是它的
-    // 存在依据——没有指针的 document 行无法按需读全文，等于死行。通用写路径
-    // （saveWithDedupe / bootstrap / 直接 store 调用）从不携带 doc_path，在此
-    // 结构性拒绝；registerDocument 恒带归一化后的 doc_path，不受影响。
-    // service 层另有两条业务守卫（saveWithDedupe / updateMemory），这是底线。
-    if (type === "document" && !(typeof memory.doc_path === "string" && memory.doc_path.trim())) {
-      throw new Error("document rows are pointer rows: doc_path is required (minted only via registerDocument)");
-    }
     if (memory.tags !== undefined && !Array.isArray(memory.tags)) {
       throw new Error("tags must be an array");
     }
@@ -2412,6 +2425,9 @@ export function createStore(path) {
     count,
     getById,
     save,
+    // document 唯一铸造口（#230 写入权分离）：registerDocument 专用，通用
+    // save/update/CAS 均拒绝 document 创建或类型转换。
+    saveDocument,
     update,
     compareAndUpdate,
     remove,

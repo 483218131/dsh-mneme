@@ -7,8 +7,9 @@
 //
 // 独立成模块（AGENTS.md 尺寸约定，同 recallStats 先例）：service.js 已过
 // 2000 行参考线，这里只依赖注入 service 内部件，barrel 出口在 service.js，
-// 调用方零改动。防绕过由 service.js 的两条守卫补全（saveWithDedupe /
-// updateMemory 拒绝铸造 document 行）——注册是唯一铸造口。
+// 调用方零改动。防绕过三层兜底：service 两条业务守卫（saveWithDedupe /
+// updateMemory）+ 存储层唯一铸造口（store.saveDocument，通用 save/update/
+// CAS 整类拒绝 document）——注册是唯一铸造口。
 
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -171,7 +172,10 @@ export function createDocumentRegistrar({ store, config, embedQuery, pushContent
       .filter(Boolean);
     const tags = [...new Set([...userTags, ...(dropped.length ? ["evidence_degraded"] : [])])];
     const result = transaction(() => {
-      const created = store.save({
+      // saveDocument 是存储层唯一 document 铸造口（通用 save/update/CAS 拒绝
+      // document——CodeRabbit 复核 #8/#882）：registerDocument 传入的 doc_path
+      // 已过归一化与文件校验。
+      const created = store.saveDocument({
         type: "document",
         title,
         content: summary,
