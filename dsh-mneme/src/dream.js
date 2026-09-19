@@ -6,7 +6,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { STR, langOf } from "./lang.js";
 export { validateDecisions, applyDecisions, withEffortFallback, describeStreamFailure, resolveDreamEffort, resolveRoute };
 
-
 // Extract the first JSON array from LLM output, tolerating markdown fences,
 // leading/trailing prose, and common wrapper noise. Returns an array or null.
 function extractJsonArray(text) {
@@ -387,7 +386,7 @@ async function reEmbedMemory(semantic, memory, logger) {
  * 任何失败降级为 0 条，绝不反噬 dream 主流程。
  */
 async function generateNarratives({ ctx, service, config, route, language, effort, semantic, logger }) {
-  const inputs = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary");
+  const inputs = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary" && m.type !== "document");
   const clusters = clusterByTag(inputs, { minCluster: config.dreamNarrativeMinCluster ?? 3 });
   if (!clusters.length) return 0;
 
@@ -756,7 +755,7 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
   let lastRunAt = 0;
 
   function shouldTrigger(service) {
-    const memories = service.all().filter((m) => !m.archived && m.type !== "summary");
+    const memories = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
     const count = memories.length;
     const chars = totalChars(memories);
     const overBase = count >= baseline.count + thresholdCount || chars >= baseline.chars + thresholdChars;
@@ -819,7 +818,7 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
   async function runDream(ctx, service, config) {
     const language = langOf(config);
     const logger = ctx.logger;
-    let memories = service.all().filter((m) => !m.archived && m.type !== "summary");
+    let memories = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
     if (memories.length === 0) return { ok: true, applied: 0, skipped: true, summary: false };
     // v0.4.4 滑动窗口：只 consolidation 最近 dreamMaxSnapshotSize 条记忆，
     // 窗口外的旧记忆不进 snapshot（大记忆量下全量快照会撑爆 LLM 输入，配合
@@ -1244,7 +1243,8 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
     // 模型时 120k token 当场 CONTEXT_WINDOW_EXCEEDED（#258 实测），且随库增长
     // 渐进恶化。倒序排序与 consolidate 窗口同款（updated_at desc, id tiebreak），
     // 保留最新的；0 = 关闭上限（回归全库行为，调用方自担 ctx）。
-    const summaryAll = service.all().filter((m) => !m.archived && m.type !== "summary");
+    // #230：document 指针行不进总览（与 dream/sleep 五个候选池的同款排除）。
+    const summaryAll = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
     const summaryMaxInputs = Number.isInteger(config.dreamSummaryMaxInputs) ? config.dreamSummaryMaxInputs : 0;
     const summaryInputs = summaryMaxInputs > 0 && summaryAll.length > summaryMaxInputs
       ? [...summaryAll]
@@ -1257,6 +1257,7 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
         })
         .slice(0, summaryMaxInputs)
       : summaryAll;
+
     const summaryScope = STR.summaryScope[language](
       summaryInputs.length,
       runId.slice(0, 8),

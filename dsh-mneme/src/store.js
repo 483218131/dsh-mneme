@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS memories (
   last_accessed_at  TEXT,
   _full_content     TEXT,
   evidence    TEXT,
+  doc_path    TEXT,
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 );
@@ -268,7 +269,10 @@ CREATE TABLE IF NOT EXISTS mirror_state (
 // Exported for API-layer type validation (standalone API POST /memories and
 // the /status byType breakdown); the set itself stays the single source of
 // truth for what store.save accepts.
-export const TYPES = new Set(["preference", "project", "decision", "history", "summary", "pattern", "rejected_solution", "pitfall", "constraint"]);
+export const TYPES = new Set(["preference", "project", "decision", "history", "summary", "pattern", "rejected_solution", "pitfall", "constraint",
+  // #230：agent 产长文档的指针行（摘要 + doc_path + evidence）。铸造口唯一
+  // （registerDocument）——saveWithDedupe/updateMemory 另有守卫拒绝旁路铸造。
+  "document"]);
 
 // Epistemic status: what kind of evidence a memory rests on. Defaults to
 // 'subjective' so legacy rows (and rows without any signal) stay compatible.
@@ -400,6 +404,7 @@ function toRow(row) {
     source: row.source ?? undefined,
     content_history: parseJsonArray(row.content_history),
     evidence: parseJsonArray(row.evidence),
+    doc_path: row.doc_path ?? undefined,
     quality_score: row.quality_score !== null && row.quality_score !== undefined ? Number(row.quality_score) : undefined,
     epistemic_status: row.epistemic_status ?? "subjective",
     agent_scope: row.agent_scope ?? undefined,
@@ -674,6 +679,8 @@ export function createStore(path) {
   // 叙述条证据链（#164 对齐）：[{memory_id, op, at}] JSON 数组——叙述/模式类
   // 记忆回链其支撑原子记忆，写入前与候选集求交防模型捏造。
   addColumn("memories", "evidence", "ALTER TABLE memories ADD COLUMN evidence TEXT");
+  // #230：document 指针行的文件定位。只有 registerDocument 写它，普通行恒 NULL。
+  addColumn("memories", "doc_path", "ALTER TABLE memories ADD COLUMN doc_path TEXT");
   addColumn("memories", "epistemic_status", "ALTER TABLE memories ADD COLUMN epistemic_status TEXT NOT NULL DEFAULT 'subjective'");
   addColumn("memories", "content_history", "ALTER TABLE memories ADD COLUMN content_history TEXT");
   addColumn("memories", "quality_score", "ALTER TABLE memories ADD COLUMN quality_score REAL");
@@ -863,7 +870,28 @@ export function createStore(path) {
     return toRow(row);
   }
 
+  // #230 写入权分离（存储层唯一铸造口，CodeRabbit 复核最终形态）：document
+  // 行只能经 saveDocument 铸造，通用 save 整类拒绝。doc_path 是任意调用方
+  // 都能捏造的字符串——「必带 doc_path」挡不住绕过注册校验（flag 闸 / 文件
+  // 存在 / 路径归一化 / evidence 可见性 / scope 匹配 / supersede 探测）的直
+  // 铸，必须整类拒绝；受控通道是独立方法而不是隐藏旗标（旗标可被载荷携带，
+  // 方法名在 DI 合同里可审计）。
   function save(memory) {
+    if (memory?.type === "document") {
+      throw new Error("document rows are minted only via store.saveDocument (registerDocument)");
+    }
+    return insertMemoryRow(memory);
+  }
+
+  function saveDocument(memory) {
+    // 指针行结构不变量：doc_path 是 document 的存在依据（无指针 = 死行）。
+    if (!(typeof memory?.doc_path === "string" && memory.doc_path.trim())) {
+      throw new Error("document rows are pointer rows: doc_path is required");
+    }
+    return insertMemoryRow(memory);
+  }
+
+  function insertMemoryRow(memory) {
     const id = memory.id ?? randomUUID();
     const type = memory.type;
     if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
@@ -874,6 +902,7 @@ export function createStore(path) {
     const tags = JSON.stringify(memory.tags ?? []);
     const importance = Number.isInteger(memory.importance) ? memory.importance : 3;
     const evidence = Array.isArray(memory.evidence) ? JSON.stringify(memory.evidence) : null;
+    const docPath = typeof memory.doc_path === "string" && memory.doc_path.trim() ? memory.doc_path : null;
     const embedding = Array.isArray(memory.embedding) && memory.embedding.length
       ? JSON.stringify(memory.embedding)
       : null;
@@ -884,8 +913,8 @@ export function createStore(path) {
       : inferEpistemicStatus(memory);
     runAtomically(() => {
       db.prepare(
-        `INSERT INTO memories (id, type, title, content, tags, importance, forgotten, archived, source, content_history, quality_score, embedding, epistemic_status, agent_scope, workspace_scope, agent_scope_source, workspace_scope_source, scope_decided_at, sensitivity, occurred_at, evidence, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO memories (id, type, title, content, tags, importance, forgotten, archived, source, content_history, quality_score, embedding, epistemic_status, agent_scope, workspace_scope, agent_scope_source, workspace_scope_source, scope_decided_at, sensitivity, occurred_at, evidence, doc_path, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         id,
         type,
@@ -907,6 +936,7 @@ export function createStore(path) {
         normalizeScopeText(memory.sensitivity),
         normalizeOccurredAt(memory.occurred_at),
         evidence,
+        docPath,
         now,
         now
       );
@@ -924,6 +954,12 @@ export function createStore(path) {
     if (!existing) throw new Error(`memory not found: ${id}`);
     const type = patch.type ?? existing.type;
     if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
+    // #230：type 不许改入/改出 document——铸造与退役都只经 registerDocument
+    // （摘要修复走同 type 的 content/title 更新，doc_path 不在本 UPDATE 的
+    // SET 里，天然保持不变）。
+    if ((existing.type === "document") !== (type === "document")) {
+      throw new Error("memory type cannot be changed to or from 'document' (registerDocument is the only mint path)");
+    }
     if (patch.tags !== undefined && !Array.isArray(patch.tags)) {
       throw new Error("tags must be an array");
     }
@@ -1015,6 +1051,11 @@ export function createStore(path) {
     if (!existing) throw new Error(`memory not found: ${id}`);
     const type = patch.type ?? existing.type;
     if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
+    // 同 update：document 类型转换在这里同样封死（CAS 路径绕过 updateMemory
+    // 的 service 守卫，必须在存储层兜住）。
+    if ((existing.type === "document") !== (type === "document")) {
+      throw new Error("memory type cannot be changed to or from 'document' (registerDocument is the only mint path)");
+    }
     if (patch.tags !== undefined && !Array.isArray(patch.tags)) {
       throw new Error("tags must be an array");
     }
@@ -1135,11 +1176,15 @@ export function createStore(path) {
   // Live memories that have not been touched since `cutMs` (never-touched ones
   // fall back to created_at). Ordered by last access ascending — the coldest
   // first. Used by sleep phase 2 to pick archival-demotion candidates.
+  // #230: document pointer rows are excluded — they are heat-immune by design
+  // (λ=0) and their "unread" state is normal (full text lives outside the DB),
+  // so the cold scan must never demote/archive them for lacking access.
   function getUnrecalledSince(cutMs, { limit = 500 } = {}) {
     const cutIso = new Date(cutMs).toISOString();
     const rows = db.prepare(
       `SELECT * FROM memories
        WHERE forgotten = 0 AND archived = 0
+         AND type <> 'document'
          AND (last_accessed_at IS NULL OR last_accessed_at < ?)
        ORDER BY COALESCE(last_accessed_at, created_at) ASC, id
        LIMIT ?`
@@ -1147,12 +1192,19 @@ export function createStore(path) {
     return rows.map(toRow);
   }
 
-  function list({ type, limit = 50, offset = 0, order = "importance", includeForgotten = false, includeArchived = false, onlyArchived = false, depositedOnly = false, minImportance = null, source = null, updatedFrom = null, updatedTo = null, occurredFrom = null, occurredTo = null, visibility = null } = {}) {
+  function list({ type, excludeTypes = null, limit = 50, offset = 0, order = "importance", includeForgotten = false, includeArchived = false, onlyArchived = false, depositedOnly = false, minImportance = null, source = null, updatedFrom = null, updatedTo = null, occurredFrom = null, occurredTo = null, visibility = null } = {}) {
     const clauses = [];
     const params = [];
     if (type) {
       clauses.push("type = ?");
       params.push(type);
+    }
+    // #230：整类排除必须在 LIMIT 之前做——sleep 的模式扫描池（limit 200 +
+    // sleepPatternMinMemories 门槛）若先截断后过滤，document 行一多就会把
+    // 普通记忆挤出窗口，池子被饿空。
+    if (Array.isArray(excludeTypes) && excludeTypes.length) {
+      clauses.push(`type NOT IN (${excludeTypes.map(() => "?").join(", ")})`);
+      params.push(...excludeTypes);
     }
     // Optional server-side filters: importance floor and exact source match.
     // Both stay out of the query when unset so existing callers are unaffected.
@@ -1227,15 +1279,20 @@ export function createStore(path) {
         "(id IN (SELECT record_id FROM receipt_chain WHERE kind IN ('merge', 'update') AND verdict = 'live') OR source = 'dream')"
       );
     }
+    // limit == null = 无界（#230 注册器的精确 supersede 全量扫描用——同路径/
+    // 同标题判定不允许窗口截断）。其余调用传数字，走 sanitizePage 默认档。
+    const unbounded = limit == null;
     const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     // "chrono" is pure newest-first — the stable order paged browsing (month
     // tree, infinite scroll) needs; importance ordering would interleave
     // months across pages.
     const orderBy = order === "chrono" ? "updated_at DESC, id DESC" : "importance DESC, updated_at DESC, id";
-    const rows = db.prepare(
-      `SELECT * FROM memories ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
-    ).all(...params, lim, off);
+    const rows = unbounded
+      ? db.prepare(`SELECT * FROM memories ${where} ORDER BY ${orderBy}`).all(...params)
+      : db.prepare(
+          `SELECT * FROM memories ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
+        ).all(...params, lim, off);
     return rows.map(toRow);
   }
 
@@ -2368,6 +2425,9 @@ export function createStore(path) {
     count,
     getById,
     save,
+    // document 唯一铸造口（#230 写入权分离）：registerDocument 专用，通用
+    // save/update/CAS 均拒绝 document 创建或类型转换。
+    saveDocument,
     update,
     compareAndUpdate,
     remove,

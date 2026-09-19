@@ -145,6 +145,11 @@ const previewOf = (content) => {
 
 const MEMORY_TYPE_ENUM = ["preference", "project", "decision", "history", "rejected_solution", "pitfall", "constraint"];
 
+// #230：memory_list 的过滤枚举比 save/update 宽一档——document 指针行可被
+// 列出（agent 需要按类型找到注册过的外档），但不进 save/update（铸造口唯一
+// = registerDocument；MCP 暂不镜像该工具，接口面归 #231）。
+const MEMORY_TYPE_LIST_ENUM = [...MEMORY_TYPE_ENUM, "document"];
+
 const TOOL_SAVE_DESCRIPTION =
   "Persist one memory entry for future sessions (user preferences, project state, decisions). " +
   "Call this when the user states a durable preference, a project decision is made, or a lesson is learned. " +
@@ -240,7 +245,10 @@ async function runGet(config, args) {
   assertOk(res, [200]);
   const m = res.json;
   if (!m || !m.id) throw new Error("memory not found");
-  return `${m.title}\nID: ${m.id} | type: ${m.type} | importance: ${m.importance}${MEMORY_PROVENANCE(m)}\n\n${m.content}`;
+  // #230：document 指针行把文件路径亮在首行，与 src/tools.js 的 memory_get
+  // render 逐字对齐。
+  const doc = m.doc_path ? ` | doc: ${m.doc_path}` : "";
+  return `${m.title}\nID: ${m.id} | type: ${m.type} | importance: ${m.importance}${doc}${MEMORY_PROVENANCE(m)}\n\n${m.content}`;
 }
 
 async function runUpdate(config, args) {
@@ -320,7 +328,7 @@ export const MCP_TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        type: typeEnumSchema("Filter by type; omit for all"),
+        type: { type: "string", enum: MEMORY_TYPE_LIST_ENUM, description: "Filter by type; omit for all. 'document' (#230) = agent-registered document pointer rows" },
         limit: intSchema("Page size (default 50)"),
         offset: intSchema("Page offset (default 0)"),
         include_archived: boolSchema("Include archived (hidden) entries so they can be found and restored (default false)"),

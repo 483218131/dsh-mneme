@@ -106,7 +106,7 @@ async function phaseConflicts(ctx, service, config, logger, runId, semantic = nu
   }
   const strictness = config.sleepConflictStrictness ?? "normal";
   const threshold = CONFLICT_THRESHOLDS[strictness] ?? CONFLICT_THRESHOLDS.normal;
-  const memories = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary");
+  const memories = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary" && m.type !== "document");
   if (memories.length < 2) return { status: "skipped", reason: "too few memories" };
   if (signal?.aborted) return { status: "aborted", reason: "user activity" };
 
@@ -368,8 +368,10 @@ async function phasePatterns(ctx, service, config, logger, runId, signal = null)
   const route = resolveSleepRoute(ctx, config, logger);
   if (!route) return { status: "skipped", reason: "no llm route" };
   const limit = config.sleepPatternMinMemories ?? 100;
+  // #230：document 在查询层排除（excludeTypes）而不是截断后过滤——LIMIT 200
+  // 先生效的话，指针行一多就会把普通记忆挤出扫描窗，池子饿到门槛以下。
   const memories = service
-    .list({ limit: 200, includeForgotten: false })
+    .list({ limit: 200, includeForgotten: false, excludeTypes: ["document"] })
     .filter((m) => !m.archived && m.type !== "summary" && m.type !== "pattern")
     .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
     .slice(0, limit);

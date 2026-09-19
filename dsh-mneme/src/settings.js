@@ -52,6 +52,9 @@ const FEATURE_FLAG_BOOLEANS = [
   // Issue #164：叙述条——dream 期间按 tag 主题簇合成叙述落库（source=
   // narrative，evidence 回链簇内记忆；按需检索不常驻注入；默认关）。
   "dreamNarrativeEnabled",
+  // Issue #230：document 型记忆——agent 产长文档的指针行（注册校验/摘要+
+  // doc_path 落库/C2 去重/supersede 记账；全文归 agent；默认关，lightMode 强制关）。
+  "documentMemoryEnabled",
   "codingRetrospect",
   "autoDream",
   "sleepModeEnabled",
@@ -110,6 +113,8 @@ const FEATURE_FLAG_INT_RANGES = {
   injectContentMaxChars: [60, 4000],
   // Issue #164：叙述条成簇门槛（共享同一 tag 的记忆数下限）。
   dreamNarrativeMinCluster: [2, 20],
+  // Issue #230：document 摘要行的注入预算（次优先档内最多几条指针行）。
+  documentInjectBudget: [1, 5],
   // Issue #257：sleep 冲突/模式阶段的 LLM 输出预算（原硬编码 2048，实测不足）。
   sleepMaxTokens: [256, 131072],
   // Issue #258：总览（dream_summarize）输入条数硬上限（0 = 不设上限）。

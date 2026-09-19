@@ -292,6 +292,7 @@ window.__ModuleLoader__.load({
         "memory.tab.rejected_solution": "被否决方案",
         "memory.tab.pitfall": "踩坑记录",
         "memory.tab.constraint": "工程约束",
+        "memory.tab.document": "文档",
         "memory.features.title": "功能开关",
         "memory.features.desc": "按需启停后端能力，改动保存后重启 DSH 生效。",
         "memory.features.group.core": "核心",
@@ -324,6 +325,8 @@ window.__ModuleLoader__.load({
         "memory.features.rerankEnabled.hint": "本地重排模型对召回结果精排，更慢更准",
         "memory.features.heatEnabled": "热度衰减",
         "memory.features.heatEnabled.hint": "按遗忘曲线给记忆降温：久未访问热度越低，参与注入排序与睡眠降级判定",
+        "memory.features.documentMemoryEnabled": "document 型记忆",
+        "memory.features.documentMemoryEnabled.hint": "agent 产长文档入库为指针行：注册校验（文件存在 + evidence 求交）、摘要 + 路径落库、去重与 supersede 记账；全文归 agent 按需读，注入只带摘要行（默认关）",
         "memory.features.resilientModelDownload": "模型下载断点续传",
         "memory.features.resilientModelDownload.hint": "模型文件下载中断后从已下载部分续传并自动重试，失败会记录中断位置；关闭后回到一次性下载",
         "memory.features.searchSemanticDedup": "语义去重",
@@ -652,6 +655,7 @@ window.__ModuleLoader__.load({
         "memory.tab.rejected_solution": "Rejected solutions",
         "memory.tab.pitfall": "Pitfalls",
         "memory.tab.constraint": "Constraints",
+        "memory.tab.document": "Documents",
         "memory.features.title": "Features",
         "memory.features.desc": "Toggle backend capabilities. Changes take effect after restarting DSH.",
         "memory.features.group.core": "Core",
@@ -684,6 +688,8 @@ window.__ModuleLoader__.load({
         "memory.features.rerankEnabled.hint": "Rerank recalled results with a local model — slower, more precise",
         "memory.features.heatEnabled": "Heat decay",
         "memory.features.heatEnabled.hint": "Decay memory heat since last access; feeds injection ranking and sleep demotion",
+        "memory.features.documentMemoryEnabled": "Document memory",
+        "memory.features.documentMemoryEnabled.hint": "Register agent-authored documents as pointer rows: existence + evidence validation, summary + path stored, dedupe + supersede bookkeeping; the full text stays agent-owned and is read on demand; injection carries the summary row only (off by default)",
         "memory.features.resilientModelDownload": "Resumable model downloads",
         "memory.features.resilientModelDownload.hint": "Resume model file downloads from received bytes and retry on failure; failures log where they stopped",
         "memory.features.searchSemanticDedup": "Semantic dedup",
@@ -1769,7 +1775,7 @@ window.__ModuleLoader__.load({
     // 属调优噪音，按对齐结论留在配置文件，不上 UI。
     const FEATURE_GROUPS = [
       { key: "group.core", items: ["autoInject", "autoSummarize", "hotMemoryEnabled", "memoryQualityFilter.enabled", "llmAudit.enabled"] },
-      { key: "group.enhance", items: ["entityExtractionEnabled", "codingRetrospect", "rerankEnabled", "resilientModelDownload", "searchSemanticDedup", "bm25SearchEnabled", "heatEnabled"] },
+      { key: "group.enhance", items: ["entityExtractionEnabled", "codingRetrospect", "rerankEnabled", "resilientModelDownload", "searchSemanticDedup", "bm25SearchEnabled", "heatEnabled", "documentMemoryEnabled"] },
       { key: "group.dream", items: ["autoDream", "sleepModeEnabled"] },
       // v0.8.0 A4（issue #17）：作用域隔离组——标注总开关 + 严格硬过滤。
       { key: "group.scope", items: ["scopeEnabled", "strictScope"] }

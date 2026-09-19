@@ -7,10 +7,16 @@ import { computeHeat } from "./heat.js";
 import { recallStats } from "./recall-stats.js";
 import { evaluateMemoryQuality } from "./quality-filter.js";
 import { applyDecisions } from "./dream/decisions.js";
+import { createDocumentRegistrar } from "./document.js";
 import { createBM25Index } from "./search/bm25.js";
 import { adaptiveThreshold } from "./search/adaptive.js";
 
 const INJECT_TYPES = new Set(["preference", "project", "decision", "summary", "rejected_solution", "pitfall", "constraint"]);
+
+// document 摘要行（#230）：仅 documentMemoryEnabled 开启时进注入候选。独立
+// 集合而非常改共享 Set——INJECT_TYPES 本身是「类型可注入」的静态事实，flag
+// 是运行时状态，两者不能搅在一起。
+const INJECT_TYPES_WITH_DOCUMENT = new Set([...INJECT_TYPES, "document"]);
 
 // 编码记忆类型（codingRetrospect）：rejected_solution / pitfall / constraint
 // 只在编码任务时注入（防噪声污染其他业务），且编码场景下按 codingBoostFactor
@@ -39,8 +45,10 @@ const CONTENT_HISTORY_MAX = 20;
 
 // Issue #135 附属发现 2：质量过滤器写下的系统信号标签（「为什么被降权/归档」的
 // 唯一审计线索）。更新路径整组替换 tags 会把它们抹掉——更新时按此清单并集保留。
-// 清单必须与 quality-filter.js 的写入端对齐（6 个，含 type 自指的 self_referential）。
-const SIGNAL_TAGS = ["low_quality", "duplicate", "meta", "repetitive", "short_content", "self_referential"];
+// 清单必须与 quality-filter.js 的写入端对齐（6 个，含 type 自指的 self_referential）；
+// evidence_degraded 是 #230 注册端的求交标记（quality-filter 不写它，但同样
+// 不许被更新抹掉）。
+const SIGNAL_TAGS = ["low_quality", "duplicate", "meta", "repetitive", "short_content", "self_referential", "evidence_degraded"];
 
 // scopeKeyOf 已上提到 ./scope.js（v0.8.1，issue #170 第 2 步）：与 sleep 的跨
 // scope 配对共用同一把比较钥匙，避免两处定义漂移。
@@ -1110,6 +1118,13 @@ export function createService({ store, mirror, config, onWrite, logger }) {
    * @returns {{action: "created"|"merged", memory: object}}
    */
   function saveWithDedupe(memory) {
+    // #230 写入权分离：document 行只能经 registerDocument 铸造（注册校验 +
+    // doc_path + evidence 三样俱全）。通用保存路径（memory_save 工具 / MCP /
+    // standalone API / bootstrap）一律拒绝——防止绕过注册校验造出无指针无
+    // 回链的伪 document 行。与 updateMemory 的同款守卫构成双保险。
+    if (memory?.type === "document") {
+      throw new Error("type 'document' is minted only via registerDocument (summary + doc_path + evidence)");
+    }
     // Bug7: score quality once (after dedupe lookup, before write). Failures
     // inside the evaluator are impossible (pure function), but the write that
     // records the score must never fail the save — wrap defensively.
@@ -1321,11 +1336,19 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     const poolSize = rotateWindowN > 0
       ? Math.max(maxItems * 2, maxItems * (rotateWindowN + 1))
       : maxItems * 2;
+    // #230 拍板：注入档位合并设计（叙述条次优先档 + document 摘要行预算）。
+    // ①叙述条（source=narrative）从纯按需解禁进注入候选，落次优先档——但受
+    // 生成总闸 dreamNarrativeEnabled 约束（flag 关 = 该类行不再注入，存量行
+    // 仍可检索）；②document 摘要行同落次优先档，另有独立预算（见下方选取）。
+    const injectTypes = config?.documentMemoryEnabled === true ? INJECT_TYPES_WITH_DOCUMENT : INJECT_TYPES;
+    // #230 拍板：叙述条解禁进注入受生成总闸约束——门必须对全部候选路径一致
+    // （规则/向量/缓存/BM25），只锁规则路的话语义路仍会漏进 narrative 行。
+    const allowNarrative = config?.dreamNarrativeEnabled === true;
     const filtered = store.list({ limit: Math.max(200, poolSize), includeForgotten: false })
-      .filter((m) => !m.archived && INJECT_TYPES.has(m.type) && !m.forgotten &&
-        // 叙述条（#164 对齐）按需检索：source=narrative 的 per-topic 叙述不进
-        // 注入候选——常驻位只留给 dream 总览（source=dream）。
-        m.source !== "narrative" &&
+      .filter((m) => !m.archived && injectTypes.has(m.type) && !m.forgotten &&
+        // 叙述条：#228 落地为纯按需检索；#230 合并拍板解禁为次优先档注入
+        // （per-topic 叙述常驻位仍只留给 dream 总览 source=dream）。
+        (m.source !== "narrative" || allowNarrative) &&
         codingGate(m) &&
         (m.type === "summary" || m.type === "preference" || m.importance >= threshold));
     // #218 v1: heat 乘数——heatEnabled 时在优先级层内给 importance×quality 乘
@@ -1341,8 +1364,13 @@ export function createService({ store, mirror, config, onWrite, logger }) {
         // 编码记忆在编码任务时优先于普通 decision（与 preference 同级），
         // importance 乘 codingBoostFactor 加权（封顶 5，保持 importance 语义）。
         const priority = (m) => {
+          // #230：叙述条与 document 摘要行同为次优先档——蒸馏摘要（0）仍最
+          // 先，指针型聚合产物（1）先于普通 project/decision（2）。叙述条是
+          // type=summary，判 source 必须在判 type 之前。
+          if (m.source === "narrative") return 1;
           if (m.type === "summary") return 0;
           if (m.type === "preference") return 1;
+          if (m.type === "document") return 1;
           if (isCoding && CODING_MEMORY_TYPES.has(m.type)) return 1;
           return 2;
         };
@@ -1367,7 +1395,8 @@ export function createService({ store, mirror, config, onWrite, logger }) {
         try {
           const hits = vectorIndex.search(queryVector, { limit: poolSize, threshold: 0 });
           for (const m of hits) {
-            if (m && !m.archived && INJECT_TYPES.has(m.type) && !m.forgotten &&
+            if (m && !m.archived && injectTypes.has(m.type) && !m.forgotten &&
+              (m.source !== "narrative" || allowNarrative) &&
               codingGate(m) &&
               (m.type === "summary" || m.type === "preference" || m.importance >= threshold)) {
               semanticItems.push(m);
@@ -1377,7 +1406,8 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       }
       if (!semanticItems.length && lastSemanticRecall?.query === q && lastSemanticRecall.items?.length) {
         for (const m of lastSemanticRecall.items) {
-          if (m && !m.archived && INJECT_TYPES.has(m.type) && !m.forgotten && codingGate(m)) semanticItems.push(m);
+          if (m && !m.archived && injectTypes.has(m.type) && !m.forgotten &&
+            (m.source !== "narrative" || allowNarrative) && codingGate(m)) semanticItems.push(m);
         }
       }
       // Issue #198：首轮（无向量、无缓存召回）的同步兜底——BM25 词法召回领位。
@@ -1389,7 +1419,8 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       // 语义向量命中时本分支不参与，行为不变。
       if (!semanticItems.length) {
         for (const hit of bm25Recall(q, poolSize)) {
-          if (hit && !hit.archived && INJECT_TYPES.has(hit.type) && !hit.forgotten &&
+          if (hit && !hit.archived && injectTypes.has(hit.type) && !hit.forgotten &&
+            (hit.source !== "narrative" || allowNarrative) &&
             codingGate(hit) &&
             (hit.type === "summary" || hit.type === "preference" || hit.importance >= threshold)) {
             semanticItems.push(hit);
@@ -1442,7 +1473,21 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       const fresh = candidates.filter((m) => !rotate.has(m.id));
       if (fresh.length > 0) candidates = [...fresh, ...candidates.filter((m) => rotate.has(m.id))];
     }
-    const selected = candidates.slice(0, maxItems);
+    // #230 拍板：document 摘要行预算——次优先档内最多 documentInjectBudget
+    // 条，超预算的 document 行跳过、由后续候选补位（不占槽）。预算只约束
+    // 注入不约束检索：指针行价值在「按需读全文」，常驻注入若不设界就会把
+    // 注入块变成文档目录（#164 失败判据：批量把历史塞进上下文）。
+    const documentBudget = config?.documentInjectBudget ?? 2;
+    let documentSeen = 0;
+    const selected = [];
+    for (const m of candidates) {
+      if (selected.length >= maxItems) break;
+      if (m.type === "document") {
+        if (documentSeen >= documentBudget) continue;
+        documentSeen++;
+      }
+      selected.push(m);
+    }
     touchRecalled(selected);
     // #217 口径（2026-09-19 拍板）：注入是曝光型访问事件，与检索命中同表分账
     // （mode='inject'，candidates 存实际注入集）。跟随 recallRecordDefault——
@@ -1628,7 +1673,10 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       ...(m.workspace_scope_source !== undefined ? { workspace_scope_source: m.workspace_scope_source } : {}),
       ...(m.scope_decided_at !== undefined ? { scope_decided_at: m.scope_decided_at } : {}),
       ...(m.sensitivity !== undefined ? { sensitivity: m.sensitivity } : {}),
-      ...(m.occurred_at !== undefined ? { occurred_at: m.occurred_at } : {})
+      ...(m.occurred_at !== undefined ? { occurred_at: m.occurred_at } : {}),
+      // #230：document 指针行的文件定位随行透出——「全文按需读」的入口就是
+      // 这个路径；普通行恒不带键，DTO 与 #230 前逐字节同形。
+      ...(m.doc_path !== undefined && m.doc_path !== null ? { doc_path: m.doc_path } : {})
     }));
   }
 
@@ -1913,6 +1961,12 @@ export function createService({ store, mirror, config, onWrite, logger }) {
   // 处置）共用的写路径：mirror 同步、写通知、嵌入调度全部同源，不能各写一份。
   function updateMemory(id, p, ctx = {}) {
     const old = store.getById(id);
+    // #230 写入权分离（与 saveWithDedupe 同款守卫）：document 行只能经
+    // registerDocument 铸造。既有 document 行的摘要修复（memory_update 改
+    // content/title——设计定案的更新通道）照常放行，type 不许改入 document。
+    if (p?.type === "document" && old?.type !== "document") {
+      throw new Error("type 'document' is minted only via registerDocument (summary + doc_path + evidence)");
+    }
     // Issue #135 附属发现 2：质量过滤器把「为什么被降权/归档」写在系统信号标签
     // 上（SIGNAL_TAGS，applyQualityDisposition 以并集写入），而这里整组替换
     // tags——任何带 tags 的更新都会抹掉这条唯一的审计线索（报告实测 150 条低分
@@ -2002,8 +2056,24 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     return updated;
   }
 
+  // document 型记忆注册（#230）：内聚块在 src/document.js（AGENTS.md 尺寸
+  // 约定，同 recallStats 先例），这里只做依赖注入 + barrel 出口，调用方零改动。
+  // 写后语只做重嵌入：镜像同步与写通知由 transaction 的 commit 路径统一执行
+  // （notifyWrite 在 txDepth>0 时 deferred 到 finally），这里再调就是双份。
+  const registerDocument = createDocumentRegistrar({
+    store,
+    config,
+    embedQuery,
+    pushContentHistory,
+    transaction,
+    finalize: (rows) => {
+      for (const row of rows) scheduleEmbed(row);
+    }
+  });
+
   return {
     saveWithDedupe,
+    registerDocument,
     recoverMirror,
     getMirrorHealth,
     getMirrorState: () => store.getMirrorState(),
