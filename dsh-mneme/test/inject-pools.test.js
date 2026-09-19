@@ -106,6 +106,18 @@ test("#249: pinned content still honours the hard ceiling and says so", () => {
   assert.ok(body.includes("已截断"), "the cut is reported, never silent");
 });
 
+test("#249: pinned content does not eat the general block budget", () => {
+  // 一条 pin 就够击穿 MAX_BLOCK（PINNED_CONTENT_MAX 2000 > MAX_BLOCK 1500）：pin
+  // 若照旧扣共享预算，budget 变负后同一轮的所有普通候选都会被压成标题行。
+  const { service, text } = setup({ maxInjectedItems: 2, pinnedInjectBudget: 1 });
+  const longPinned = "约束原文".repeat(470); // 1880 字符，仍在 2000 硬顶内（不带截断）
+  service.saveWithDedupe({ type: "preference", title: "长约束", content: longPinned, importance: 5 });
+  service.saveWithDedupe({ type: "summary", title: "总览", content: "总览正文必须带出来", importance: 5 });
+  const body = text();
+  assert.ok(body.includes(longPinned), "pin 逐字保真");
+  assert.ok(body.includes("总览正文必须带出来"), "普通候选照旧拿完整正文：pin 不占共享预算");
+});
+
 test("#249: capability guide is off by default, registered once when on", () => {
   const off = setup({});
   assert.equal(off.sections.length, 0, "default off → no prompt section registered");
@@ -118,6 +130,12 @@ test("#249: capability guide is off by default, registered once when on", () => 
   // 不可逆工具（memory_delete）的克制指引必须在场：这是全 guide 里唯一有数据
   // 损失后果的一句，被误删掉的回归要能立刻转红。
   assert.ok(MEMORY_GUIDE_SECTION.includes("memory_delete"), "guide keeps the irreversible-tool warning");
+  // 优先序那条不得让模型拿 memory_search 去核对当前指令/仓库：它只搜记忆库，
+  // 搜不到「现在」——把它写成验证手段会换来一轮无效查询 + 继续采信陈旧记忆。
+  assert.ok(
+    MEMORY_GUIDE_SECTION.includes("memory_search searches stored memories only"),
+    "precedence rule points at the instruction/repository, not at memory_search"
+  );
   // 不逐轮复读：通则只出现在一次性段落，每轮内容块里不重复。
   on.service.saveWithDedupe({ type: "preference", title: "偏好A", content: "偏好内容", importance: 5 });
   assert.ok(!on.text().includes("[dsh-mneme memory]"), "guide text must not ride the per-turn block");

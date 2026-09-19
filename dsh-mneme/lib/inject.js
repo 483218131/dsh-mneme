@@ -218,7 +218,12 @@ export function createInjector(ctx, service, settings, config) {
       const title = STR.entryTitle[language](m.title, m.importance);
       const content = injectMemory(m, pinned ? PINNED_CONTENT_MAX : maxContent);
       const full = STR.entryLine[language](m.type, verified, title, content);
-      if (pinned || budget - full.length >= 0) {
+      if (pinned) {
+        // pin 不扣块预算（上面那条设计注释的落地）：pin 一条就够击穿 MAX_BLOCK
+        // （PINNED_CONTENT_MAX 2000 > MAX_BLOCK 1500），照扣会把 budget 压成负数，
+        // 同一轮随后的普通候选全部退化成标题行——正是本议题要修的结构缺陷。
+        lines.push(full);
+      } else if (budget - full.length >= 0) {
         lines.push(full);
         budget -= full.length;
       } else {

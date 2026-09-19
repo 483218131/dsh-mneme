@@ -17,7 +17,8 @@
 const SECTION_LINES = [
   "[dsh-mneme memory] Read once; it applies to every turn of this session.",
   "1. Precedence: the current instruction and the repository's actual state outrank any stored memory. " +
-    "When a memory contradicts either, call memory_search to verify before relying on it, and never treat an old memory as current fact.",
+    "When a memory contradicts either, check the instruction or the repository itself before relying on it — memory_search " +
+    "searches stored memories only, so it finds earlier context, never the present state. Never treat an old memory as current fact.",
   "2. Recall on demand: call memory_search when the task depends on earlier decisions, user preferences, or project history " +
     "that is not already in context. Do not search for facts you can read directly from the repository.",
   "3. Write back sparingly: use memory_save for durable, cross-session value — a preference, a decision with its rationale, " +
@@ -34,7 +35,7 @@ export const MEMORY_GUIDE_SECTION = SECTION_LINES.join("\n");
 export const TOOL_GUIDE = {
   memory_search:
     " Use this when the task depends on earlier decisions, preferences, or project history that is not already in context, " +
-    "and to verify a memory that contradicts the current instruction or the repository's actual state. " +
+    "or to look for a newer memory behind one that seems stale. " +
     "Skip it for facts you can read directly from the repository.",
   memory_save:
     " Save only durable, cross-session value (a preference, a decision with its rationale, an engineering constraint, " +
