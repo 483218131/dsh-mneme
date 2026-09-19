@@ -28,6 +28,10 @@
 - 测试 1160 项全绿（较 0.8.3 新增 81 项：MCP stdio 帧级 / 实体召回 / 冷启动 / 注入截断 / 增量蒸馏 / 叙述条 / 常驻状态条 / 复用统计 / heat 广义指数 / 极简模式注入状态）。
 - 致谢：heptaspirit（#213 路由旧值标记 + #216 reasoningEffort 透传）、z2Ace0107（#226 增量蒸馏 + #232 工具结果与子会话蒸馏）。
 
+## 🧪 工程
+
+- **全工具矩阵的「DTO 键集 ⊆ output schema」系统性断言（issue #195）**：#184（memory_get 内联 schema 漏声明 v0.8.1 的 scope 来源三键 → 任何被标注过的行都过不了 in-process 校验）此前只有单点回归护住 `memory_get` 一个工具，换一个工具、换一个键，同类事故可以原样重演。新增 `test/tools-dto-schema-matrix.test.js`，四层断言各管一段：① 9 个工具每个可安全触达分支的**真实 execute 返回值**过生产同款校验器 `validateJsonSchemaValue`（不写手抄期望值）；② DTO 唯一产地 `toApiList` 在全形态（极简 / 敏感度 / 事件时间 / 单维与全量 scope 标注）下的输出 ⊆ `MEMORY_ITEM_SCHEMA`，并**反向**要求声明里的每个键都被至少一种形态真实产出（死声明会在下次增键时暴露）；③ 全部工具 schema 的结构不变量（闭合、required ⊆ properties、每项带 type——否则前两层会因校验器形同虚设而静默失效）；④ 负例锁：注入未声明键**必须**报错。护栏自证：两次变异测试（删共享 schema 一个键 / 给 memory_get 塞手抄小副本）分别让 2 条与 3 条断言转红。`memory_runtime` 的 provision（联网下载）与 verify 命中载荷（真实加载模型）不在单测内驱动，由 ③ 兜底声明合规。
+
 ## [0.8.3] - 2026-09-17
 
 ## 🆕 新增
