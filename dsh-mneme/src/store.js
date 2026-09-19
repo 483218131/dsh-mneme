@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS memories (
   last_accessed_at  TEXT,
   _full_content     TEXT,
   evidence    TEXT,
+  doc_path    TEXT,
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 );
@@ -268,7 +269,10 @@ CREATE TABLE IF NOT EXISTS mirror_state (
 // Exported for API-layer type validation (standalone API POST /memories and
 // the /status byType breakdown); the set itself stays the single source of
 // truth for what store.save accepts.
-export const TYPES = new Set(["preference", "project", "decision", "history", "summary", "pattern", "rejected_solution", "pitfall", "constraint"]);
+export const TYPES = new Set(["preference", "project", "decision", "history", "summary", "pattern", "rejected_solution", "pitfall", "constraint",
+  // #230：agent 产长文档的指针行（摘要 + doc_path + evidence）。铸造口唯一
+  // （registerDocument）——saveWithDedupe/updateMemory 另有守卫拒绝旁路铸造。
+  "document"]);
 
 // Epistemic status: what kind of evidence a memory rests on. Defaults to
 // 'subjective' so legacy rows (and rows without any signal) stay compatible.
@@ -400,6 +404,7 @@ function toRow(row) {
     source: row.source ?? undefined,
     content_history: parseJsonArray(row.content_history),
     evidence: parseJsonArray(row.evidence),
+    doc_path: row.doc_path ?? undefined,
     quality_score: row.quality_score !== null && row.quality_score !== undefined ? Number(row.quality_score) : undefined,
     epistemic_status: row.epistemic_status ?? "subjective",
     agent_scope: row.agent_scope ?? undefined,
@@ -674,6 +679,8 @@ export function createStore(path) {
   // 叙述条证据链（#164 对齐）：[{memory_id, op, at}] JSON 数组——叙述/模式类
   // 记忆回链其支撑原子记忆，写入前与候选集求交防模型捏造。
   addColumn("memories", "evidence", "ALTER TABLE memories ADD COLUMN evidence TEXT");
+  // #230：document 指针行的文件定位。只有 registerDocument 写它，普通行恒 NULL。
+  addColumn("memories", "doc_path", "ALTER TABLE memories ADD COLUMN doc_path TEXT");
   addColumn("memories", "epistemic_status", "ALTER TABLE memories ADD COLUMN epistemic_status TEXT NOT NULL DEFAULT 'subjective'");
   addColumn("memories", "content_history", "ALTER TABLE memories ADD COLUMN content_history TEXT");
   addColumn("memories", "quality_score", "ALTER TABLE memories ADD COLUMN quality_score REAL");
@@ -874,6 +881,7 @@ export function createStore(path) {
     const tags = JSON.stringify(memory.tags ?? []);
     const importance = Number.isInteger(memory.importance) ? memory.importance : 3;
     const evidence = Array.isArray(memory.evidence) ? JSON.stringify(memory.evidence) : null;
+    const docPath = typeof memory.doc_path === "string" && memory.doc_path.trim() ? memory.doc_path : null;
     const embedding = Array.isArray(memory.embedding) && memory.embedding.length
       ? JSON.stringify(memory.embedding)
       : null;
@@ -884,8 +892,8 @@ export function createStore(path) {
       : inferEpistemicStatus(memory);
     runAtomically(() => {
       db.prepare(
-        `INSERT INTO memories (id, type, title, content, tags, importance, forgotten, archived, source, content_history, quality_score, embedding, epistemic_status, agent_scope, workspace_scope, agent_scope_source, workspace_scope_source, scope_decided_at, sensitivity, occurred_at, evidence, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO memories (id, type, title, content, tags, importance, forgotten, archived, source, content_history, quality_score, embedding, epistemic_status, agent_scope, workspace_scope, agent_scope_source, workspace_scope_source, scope_decided_at, sensitivity, occurred_at, evidence, doc_path, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         id,
         type,
@@ -907,6 +915,7 @@ export function createStore(path) {
         normalizeScopeText(memory.sensitivity),
         normalizeOccurredAt(memory.occurred_at),
         evidence,
+        docPath,
         now,
         now
       );

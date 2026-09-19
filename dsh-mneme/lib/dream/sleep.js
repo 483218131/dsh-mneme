@@ -106,7 +106,7 @@ async function phaseConflicts(ctx, service, config, logger, runId, semantic = nu
   }
   const strictness = config.sleepConflictStrictness ?? "normal";
   const threshold = CONFLICT_THRESHOLDS[strictness] ?? CONFLICT_THRESHOLDS.normal;
-  const memories = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary");
+  const memories = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary" && m.type !== "document");
   if (memories.length < 2) return { status: "skipped", reason: "too few memories" };
   if (signal?.aborted) return { status: "aborted", reason: "user activity" };
 
@@ -370,7 +370,7 @@ async function phasePatterns(ctx, service, config, logger, runId, signal = null)
   const limit = config.sleepPatternMinMemories ?? 100;
   const memories = service
     .list({ limit: 200, includeForgotten: false })
-    .filter((m) => !m.archived && m.type !== "summary" && m.type !== "pattern")
+    .filter((m) => !m.archived && m.type !== "summary" && m.type !== "pattern" && m.type !== "document")
     .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
     .slice(0, limit);
   if (memories.length === 0) return { status: "skipped", reason: "no memories to scan" };

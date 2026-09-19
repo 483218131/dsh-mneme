@@ -4,6 +4,8 @@
 
 ## 🆕 新增
 
+- **document 型记忆——agent 产长文档入库为指针行（issue #230）**：写入权分离——全文归 agent（管线零读零写零改），库里只存摘要 + doc_path + evidence 三样；新工具 `memory_register_document({path,title,summary,tags,importance,evidence})` 作唯一铸造口（内聚块 `src/document.js`，service barrel 出口）：注册校验（~ 展开后绝对路径、存在 + 非空常规文件、evidence 与库求交——合法子集落库 + `evidence_degraded` 系统标记、全捏造整单拒绝）；C2 vector 档比对（minSim 0.92 复用 #127 档语义；同 doc_path/同标题 = 出新版显式 supersede——旧行归档 + `[superseded by <id>]` 指针注记 + content_history 存旧摘要，旧文件不删；仅向量近重复而路径标题都不同 = 拒绝并指路，不越 C1 矛盾检测替 agent 裁决）；store 新增 doc_path 列（幂等迁移），toApiList 条件透出 doc_path（普通行 DTO 逐字节同形），memory_get 渲染亮出文件路径；`documentMemoryEnabled`（默认关，白名单 + lightMode 强制关，面板「记忆增强」组第三处落位）+ `documentInjectBudget`（1–5 默认 2）；注入档位合并拍板（#164 评审线，#230 内一次落地）：叙述条（source=narrative）从纯按需解禁进注入落次优先档（受 dreamNarrativeEnabled 约束，语义/检索路径不变），document 摘要行同档 + 独立预算封顶（超预算跳过由后续候选补位），dream/sleep 五个候选池排除 document（互不代管），heat 免疫（λ=0，指针行不衰减）；写入权分离守卫双保险（saveWithDedupe / updateMemory 拒绝铸造或改入 document，standalone API 数据面给 400 `document-requires-register`），MCP 六件套 memory_list 枚举平价同步 +document（注册工具不进 MCP，接口面归 #231）。
+
 - **注入命中留痕与注入命中率（issue #217 增量，2026-09-19 口径确认）**：注入终选集落一行 `mode='inject'` 审计（candidates 存实际注入条目，跟随 `recallRecordDefault` 不设新配置键；`heatEnabled=false` 时照写——留痕与消费解耦）；recall-stats 新增注入口径（轮数 / 注入条数 / 槽位填充率 `slotFillRate`，注入候选计入 Top-N 与僵尸零曝光判定）；面板「记忆复用」卡追加注入段（窗口内无注入行时省略）。
 
 ## 🐛 修复

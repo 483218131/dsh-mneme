@@ -387,7 +387,7 @@ async function reEmbedMemory(semantic, memory, logger) {
  * 任何失败降级为 0 条，绝不反噬 dream 主流程。
  */
 async function generateNarratives({ ctx, service, config, route, language, effort, semantic, logger }) {
-  const inputs = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary");
+  const inputs = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary" && m.type !== "document");
   const clusters = clusterByTag(inputs, { minCluster: config.dreamNarrativeMinCluster ?? 3 });
   if (!clusters.length) return 0;
 
@@ -756,7 +756,7 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
   let lastRunAt = 0;
 
   function shouldTrigger(service) {
-    const memories = service.all().filter((m) => !m.archived && m.type !== "summary");
+    const memories = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
     const count = memories.length;
     const chars = totalChars(memories);
     const overBase = count >= baseline.count + thresholdCount || chars >= baseline.chars + thresholdChars;
@@ -819,7 +819,7 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
   async function runDream(ctx, service, config) {
     const language = langOf(config);
     const logger = ctx.logger;
-    let memories = service.all().filter((m) => !m.archived && m.type !== "summary");
+    let memories = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
     if (memories.length === 0) return { ok: true, applied: 0, skipped: true, summary: false };
     // v0.4.4 滑动窗口：只 consolidation 最近 dreamMaxSnapshotSize 条记忆，
     // 窗口外的旧记忆不进 snapshot（大记忆量下全量快照会撑爆 LLM 输入，配合
@@ -1234,7 +1234,7 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
     // v1, content_history traceable). Its 口径 (what snapshot produced it) is
     // stamped into the content so the standing answer is always auditable; the
     // formal evidence column lands with the narrative-bars batch.
-    const summaryInputs = service.all().filter((m) => !m.archived && m.type !== "summary");
+    const summaryInputs = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
     const summaryScope = STR.summaryScope[language](
       summaryInputs.length,
       runId.slice(0, 8),

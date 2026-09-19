@@ -145,6 +145,14 @@ export const Config = z.object({
   dreamNarrativeEnabled: z.boolean().default(false),
   // 成簇门槛：共享同一 tag 的记忆 ≥ 此值才合成叙述条。
   dreamNarrativeMinCluster: z.natural().min(2).max(20).default(3),
+  // document 型记忆（#164/#230，opt-in）：agent 产长文档的指针行——注册校验
+  // （文件存在 + 路径合法 + evidence 求交）、摘要 + doc_path 落库、C2 比对
+  // 去重、supersede 记账。全文归 agent，管线零触碰；默认关=行为与此前一致；
+  // lightMode 强制关闭。
+  documentMemoryEnabled: z.boolean().default(false),
+  // document 摘要行的注入预算（#230 拍板）：次优先档内最多注入的 document
+  // 行数，超预算跳过由后续候选补位。只约束注入，不约束检索。
+  documentInjectBudget: z.natural().min(1).max(5).default(2),
   // 隐式 keep（v0.4.4）：LLM 未提及的 snapshot 记忆自动补 {action:"keep"}，
   // 避免"未覆盖即全拒"白白浪费整轮 run。设为 false 时保留旧的严格校验
   // （未覆盖即拒绝整单）。
@@ -515,6 +523,8 @@ const LIGHT_MODE_OFF = [
   "entityRecallEnabled",
   // 轻量模式不开叙述条（额外 LLM 调用；#164 对齐，opt-in）。
   "dreamNarrativeEnabled",
+  // 轻量模式不开 document 指针行（#230，opt-in：注册/注入/检索增强全随闸）。
+  "documentMemoryEnabled",
   // 轻量模式不开热计算（heat 属于重型增强；关掉后 sleep 降级也退回纯时间分层）。
   "heatEnabled"
 ];

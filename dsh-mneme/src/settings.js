@@ -50,6 +50,9 @@ const FEATURE_FLAG_BOOLEANS = [
   // Issue #164：叙述条——dream 期间按 tag 主题簇合成叙述落库（source=
   // narrative，evidence 回链簇内记忆；按需检索不常驻注入；默认关）。
   "dreamNarrativeEnabled",
+  // Issue #230：document 型记忆——agent 产长文档的指针行（注册校验/摘要+
+  // doc_path 落库/C2 去重/supersede 记账；全文归 agent；默认关，lightMode 强制关）。
+  "documentMemoryEnabled",
   "codingRetrospect",
   "autoDream",
   "sleepModeEnabled",
@@ -102,7 +105,9 @@ const FEATURE_FLAG_INT_RANGES = {
   // Issue #164①：注入单条正文截断上限（默认 300 = 既有行为）。
   injectContentMaxChars: [60, 4000],
   // Issue #164：叙述条成簇门槛（共享同一 tag 的记忆数下限）。
-  dreamNarrativeMinCluster: [2, 20]
+  dreamNarrativeMinCluster: [2, 20],
+  // Issue #230：document 摘要行的注入预算（次优先档内最多几条指针行）。
+  documentInjectBudget: [1, 5]
 };
 // 浮点开关的闭区间（与 config.js 的 z.number().min().max() 对齐）。与整数开关
 // 分开：面板的整数控件要求 Number.isInteger，而余弦相似度阈值必须允许小数。

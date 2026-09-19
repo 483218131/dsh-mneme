@@ -166,6 +166,11 @@ async function handlePutBody(res, service, logger, id, text) {
     sendJson(res, 404, { error: "not-found" });
     return;
   }
+  if (patch.type === "document" && existing.type !== "document") {
+    // #230 写入权分离：type 不许改入 document（铸造口唯一），干净 400。
+    sendJson(res, 400, { error: "document-requires-register" });
+    return;
+  }
   // 内容被改写时旧版本先入档（human_override），与内部面板写路径一致。
   if (patch.content !== undefined && patch.content !== existing.content) {
     const history = Array.isArray(existing.content_history) ? existing.content_history : [];
@@ -351,6 +356,12 @@ export function createStandaloneApi({ service, store, config = {}, logger, setti
           // clean 400 instead of a leaked SQLite error.
           if (!TYPES.has(body.type)) {
             sendJson(res, 400, { error: "invalid-type" });
+            return;
+          }
+          if (body.type === "document") {
+            // #230 写入权分离：document 行铸造口唯一（registerDocument）。
+            // 这里给干净 400，不让它落进 saveWithDedupe 的守卫变 500。
+            sendJson(res, 400, { error: "document-requires-register" });
             return;
           }
           if (typeof body.title !== "string" || !body.title.trim()) {
