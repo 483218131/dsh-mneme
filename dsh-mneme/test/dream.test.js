@@ -1255,3 +1255,54 @@ test("issue#126: a differentiate decision on the dream path produces one receipt
   assert.ok(receipts.every((r) => r.count_before === 1 && r.count_after === 1), "no count change for differentiate");
   store.close();
 });
+
+// --- Issue #258: dream_summarize 独立路由 + 输入硬上限 ------------------------
+
+test("issue#258: summarize uses dreamSummaryProvider/dreamSummaryModel when configured, falls back to dream route otherwise", async () => {
+  const { store, service } = dreamSetup();
+  service.saveWithDedupe({ type: "project", title: "a", content: "x" });
+  const seen = [];
+  const ctx = mockCtx({});
+  const origStream = ctx.llm.stream.bind(ctx.llm);
+  ctx.llm.stream = async function* (options) {
+    seen.push(`${options.provider}:${options.model}`);
+    yield* origStream(options);
+  };
+  const dream = createDreamScheduler({ thresholdCount: 1, thresholdChars: 0, delayMs: 0 });
+  await dream.runDream(ctx, service, { dreamProvider: "mock", dreamModel: "mock-model", dreamSummaryProvider: "openai", dreamSummaryModel: "big-ctx" });
+  assert.ok(seen.includes("mock:mock-model"), "consolidation keeps the dream route");
+  assert.ok(seen.includes("openai:big-ctx"), "summary takes the dedicated route");
+  const summarize = store.listLlmAudits().find((r) => r.operation_type === "dream_summarize");
+  assert.equal(summarize.model_id, "openai:big-ctx", "audit trail names the dedicated route");
+  store.close();
+});
+
+test("issue#258: dreamSummaryMaxInputs caps summary inputs to the newest N (0 = whole library)", async () => {
+  const { store, service } = dreamSetup();
+  const titles = ["旧一", "旧二", "旧三", "新四", "新五"];
+  const ids = titles.map((t, i) => service.saveWithDedupe({ type: "project", title: t, content: `内容${i}` }).memory.id);
+  // 同毫秒保存会让 updated_at 并列、排序退化到 id（UUID 随机）——回填保证严格递增。
+  ids.forEach((id, i) => {
+    const at = `2026-01-01T0${i + 1}:00:00.000Z`;
+    store.db.prepare("UPDATE memories SET updated_at = ? WHERE id = ?").run(at, id);
+  });
+  const seenUserText = [];
+  const ctx = mockCtx({});
+  const origStream = ctx.llm.stream.bind(ctx.llm);
+  ctx.llm.stream = async function* (options) {
+    const userText = options.messages.find((m) => m.role === "user")?.content?.[0]?.text ?? "";
+    if (!userText.startsWith("id=")) seenUserText.push(userText);
+    yield* origStream(options);
+  };
+  const dream = createDreamScheduler({ thresholdCount: 1, thresholdChars: 0, delayMs: 0 });
+  await dream.runDream(ctx, service, { dreamProvider: "mock", dreamModel: "mock-model", dreamSummaryMaxInputs: 3 });
+  const summaryText = seenUserText.at(-1);
+  assert.ok(summaryText.includes("新四") && summaryText.includes("新五") && summaryText.includes("旧三"), "newest three survive the cap");
+  assert.ok(!summaryText.includes("旧一") && !summaryText.includes("旧二"), "oldest two are cut");
+  const overview = () => service.all().find((m) => m.type === "summary");
+  assert.match(overview().content, /整理后 3 条/, "口径 footer counts the capped snapshot");
+  // 未配置 = 0 = 全库，历史行为不变
+  await dream.runDream(ctx, service, { dreamProvider: "mock", dreamModel: "mock-model" });
+  assert.match(overview().content, /整理后 5 条/, "uncapped run covers the whole library");
+  store.close();
+});
