@@ -475,7 +475,7 @@ window.__ModuleLoader__.load({
         "memory.status.injectPreview.query": "查询「{query}…」",
         "memory.status.injectPreview.hot": "hot memory",
         "memory.status.injectPreview.adaptiveOn": "自适应条数",
-        "memory.status.injectPreview.rotated": "轮换抑制 ",
+        "memory.status.injectPreview.rotated": "轮换抑制",
         "memory.status.injectPreview.empty": "本次组装未注入任何跨会话记忆（阈值或轮换过滤）",
         "memory.status.conflictQueue.reason": "原因",
         "memory.status.conflictQueue.sideA": "A 方",
@@ -851,7 +851,7 @@ window.__ModuleLoader__.load({
         "memory.status.injectPreview.query": "query \"{query}…\"",
         "memory.status.injectPreview.hot": "hot memory",
         "memory.status.injectPreview.adaptiveOn": "adaptive budget",
-        "memory.status.injectPreview.rotated": "rotation-suppressed ",
+        "memory.status.injectPreview.rotated": "rotation-suppressed",
         "memory.status.injectPreview.empty": "No cross-session memories injected this assembly (threshold or rotation filter)",
         "memory.status.conflictQueue.reason": "Reason",
         "memory.status.conflictQueue.sideA": "Side A",
@@ -3172,8 +3172,8 @@ window.__ModuleLoader__.load({
         `maxItems=${snap.maxItems}`,
         `threshold=${snap.threshold}`,
         snap.adaptive ? t("memory.status.injectPreview.adaptiveOn") : null,
-        snap.scoped ? `scope=${snap.scoped}` : null,
-        snap.rotated > 0 ? `${t("memory.status.injectPreview.rotated")}${snap.rotated}` : null
+        snap.scoped ? `scope=${snap.scoped.agent_scope || snap.scoped.workspace_scope}` : null,
+        snap.rotated > 0 ? `${t("memory.status.injectPreview.rotated")} ${snap.rotated}` : null
       ].filter(Boolean).join(" · ");
       return h("div", { className: "mneme-statuscard", style: { gridColumn: "1 / -1" } },
         h("h3", { className: "mneme-xcolhead" }, t("memory.status.injectPreview")),

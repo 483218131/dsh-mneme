@@ -1622,7 +1622,7 @@ test("GET /api/dsh-mneme/inject-preview: returns last assembly snapshot (issue #
   const promptCtx = {
     systemPrompt: { context(def) { contexts.push(def); return () => {}; } }
   };
-  createInjector(promptCtx, service, settings, Config({ maxInjectedItems: 3, importanceThreshold: 3 }));
+  const injector = createInjector(promptCtx, service, settings, Config({ maxInjectedItems: 3, importanceThreshold: 3 }));
   contexts[0].text({});
   res = new FakeRes();
   await route.handler(req("/api/dsh-mneme/inject-preview"), res);
@@ -1635,4 +1635,5 @@ test("GET /api/dsh-mneme/inject-preview: returns last assembly snapshot (issue #
   res = new FakeRes();
   await route.handler(req("/api/dsh-mneme/inject-preview", "POST"), res);
   assert.equal(res.statusCode, 404);
+  injector(); // 快照是模块全局：用完即清，不污染后续用例
 });
