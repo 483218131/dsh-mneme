@@ -35,6 +35,20 @@ export const Config = z.object({
   // 额度浪费在零成本窗口上。计数是进程内 per-session（与最小间隔闸门同生命
   // 周期），宿主重启即清零，与 #229 的游标持久化是两件事。
   summarizeMaxRunsPerSession: z.natural().min(0).max(1000).default(0),
+  // Issue #239（第 4 项，错峰队列）：高峰期蒸馏顺延。空串 = 关闭，行为与现状逐
+  // 字节一致。取值是本地时间的时段列表（逗号分隔，支持跨零点），可带**星期前缀**
+  // （可省；ISO 1=周一…7=周日，也认 mon..sun；省略 = 每天）：
+  //   "09:00-18:00"                      每天 09:00-18:00
+  //   "mon-fri 08:00-12:00,14:00-18:00"  工作日两段（按高峰计费的供应商即此形态）
+  //   "sat,sun 23:00-06:00"              周末跨零点段
+  // 命中高峰时：不调 LLM、不消费游标（窗口继续累积，留到非高峰一次性蒸馏——批量
+  // 比逐轮碎蒸更省），登记一行 status='skipped' / error_message='peak-hours' 审计，
+  // 并按下面的上限择时补跑。任一写法非法则整串按「未配置」处理：排程是省钱
+  // 手段，绝不该因为写错格式把蒸馏停掉。
+  summarizePeakHours: z.string().default(""),
+  // 高峰顺延上限（分钟，0 = 不设上限）：到点仍处高峰就照常跑，避免整天高峰把蒸馏
+  // 饿死。默认 120 分钟。仅在上面的时段串非空时生效。
+  summarizePeakMaxDeferMinutes: z.natural().min(0).max(1440).default(120),
   // 落库前去重档位：off（默认，等同现状）/ title（零成本，仅拦完全同名）/
   // vector（复用已有 embedding 列做同会话语义近邻，无 LLM 调用）。
   summarizeDedupeMode: z.union([z.const("off"), z.const("title"), z.const("vector")]).default("off"),

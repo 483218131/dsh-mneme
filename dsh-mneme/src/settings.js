@@ -102,6 +102,8 @@ const FEATURE_FLAG_INT_RANGES = {
   // Issue #239：蒸馏零 LLM 预判（窗口最小字符数）与每会话 run 预算（0 = 零行为变化）。
   summarizeMinWindowChars: [0, 100000],
   summarizeMaxRunsPerSession: [0, 1000],
+  // Issue #239 第 4 项：高峰顺延上限（分钟，0 = 不设上限）。
+  summarizePeakMaxDeferMinutes: [0, 1440],
   // Issue #125：hybrid 候选量上限（0 = 复用 dreamMaxSnapshotSize）。
   dreamCandidateMax: [0, 5000],
   // Issue #164①：注入单条正文截断上限（默认 300 = 既有行为）。
@@ -138,7 +140,9 @@ const FEATURE_FLAG_STRINGS = [
   "dreamSummaryProvider",
   "dreamSummaryModel",
   "localEmbedModel",
-  "ollamaModel"
+  "ollamaModel",
+  // Issue #239 第 4 项：高峰时段串（"09:00-18:00"，空串 = 关闭）。
+  "summarizePeakHours"
 ];
 // URL 字符串开关：trim 后必须为空或合法 http/https URL（new URL() 校验协议，
 // 拒绝其余协议——这是 SSRF 防线的一部分）。
