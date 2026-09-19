@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createSleepScheduler, runSleep } from "../src/dream/sleep.js";
+import { Config } from "../src/config.js";
 import { createStore } from "../src/store.js";
 import { createService } from "../src/service.js";
 import { createVectorIndex } from "../src/vector-index.js";
@@ -370,4 +371,40 @@ test("sleep: runSleep is abortable via signal between phases", async () => {
   const result = await runSleep(ctx, service, baseConfig(), ctx.logger, null, ctrl.signal);
   assert.equal(result.phases.conflicts, undefined, "aborted before any phase ran");
   store.close();
+});
+
+// Issue #257：冲突/模式两阶段的输出预算原硬编码 2048——sleepActionSet=full
+// 实测 24 对需约 6967 token，截断即 invalid decisions json 整轮失败。两阶段
+// 必须读取 sleepMaxTokens 配置并透传到 ctx.llm.stream 的 options。
+test("issue#257 conflict and pattern phases forward configured sleepMaxTokens", async () => {
+  const { service, store, vectorIndex } = setup();
+  const { a, b } = seedConflictPair(service, vectorIndex, 1.0);
+  const seen = [];
+  const ctx = mockCtx((userText) =>
+    JSON.stringify([{ action: "conflict", winner: a.id, loser: b.id, reason: "重复覆盖" }])
+  );
+  const origStream = ctx.llm.stream.bind(ctx.llm);
+  ctx.llm.stream = async function* (options) {
+    if (options?.purpose === "sleep-conflict" || options?.purpose === "sleep-pattern") {
+      seen.push({ purpose: options.purpose, maxTokens: options.maxTokens });
+    }
+    if (options?.purpose === "sleep-pattern") {
+      // pattern 阶段喂确定性空结果（no patterns found → skipped），
+      // 不复用 conflict 决策（宽松模式下会被当 Fabricated 静默跳过）。
+      yield { type: "text-delta", index: 0, text: "[]" };
+      yield { type: "finish", reason: { kind: "stop" } };
+      return;
+    }
+    yield* origStream(options);
+  };
+  const result = await runSleep(ctx, service, baseConfig({ sleepMaxTokens: 6967 }), ctx.logger, { embedder, vectorIndex }, null);
+  assert.equal(result.status, "ok", "run completes with the configured budget");
+  assert.ok(seen.some((s) => s.purpose === "sleep-conflict" && s.maxTokens === 6967), "conflict phase reads sleepMaxTokens");
+  assert.ok(seen.some((s) => s.purpose === "sleep-pattern" && s.maxTokens === 6967), "pattern phase reads sleepMaxTokens");
+  store.close();
+});
+
+test("issue#257 schema default for sleepMaxTokens is 8192 (was hardcoded 2048)", () => {
+  const cfg = Config({});
+  assert.equal(cfg.sleepMaxTokens, 8192, "schema default covers the measured full-set peak (6967)");
 });

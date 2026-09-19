@@ -236,7 +236,7 @@ async function phaseConflicts(ctx, service, config, logger, runId, semantic = nu
     provider: route.provider,
     model: route.model,
     purpose: "sleep-conflict",
-    maxTokens: 2048,
+    maxTokens: config.sleepMaxTokens ?? 2048,
     ...(withEffort && sleepEffort ? { reasoningEffort: sleepEffort } : {}),
     messages: [
       { role: "system", content: [{ type: "text", text: conflictPrompt }], source: { kind: "plugin", plugin: "dsh-mneme" } },
@@ -387,7 +387,7 @@ async function phasePatterns(ctx, service, config, logger, runId, signal = null)
     provider: route.provider,
     model: route.model,
     purpose: "sleep-pattern",
-    maxTokens: 2048,
+    maxTokens: config.sleepMaxTokens ?? 2048,
     ...(withEffort && sleepEffort ? { reasoningEffort: sleepEffort } : {}),
     messages: [
       { role: "system", content: [{ type: "text", text: STR.prompts.pattern[language].replace("N", String(maxPatterns)) }], source: { kind: "plugin", plugin: "dsh-mneme" } },

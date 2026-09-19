@@ -399,6 +399,12 @@ export const Config = z.object({
     z.const("high"),
     z.const("none")
   ]).description("同 dreamReasoningEffort：sleep 各阶段 LLM 的推理档位，未配置 = 自动取模型支持的最低档；显式 'none' = 不发送字段、用服务商自带默认。"),
+  // Issue #257：sleep 冲突/模式两阶段的输出预算（原硬编码 2048）。实测默认档
+  // 每对裁决约 90 token、24 对 2097——2048 恰好压在边界（53 次运行 48 败）；
+  // full 档六分支实测约 290 token/对、24 对 6967，2048 必然截断。默认 8192
+  // 覆盖实测峰值（候选对按「每记忆至多一对」去重，饱和在 ~25 对、不随库无限
+  // 增长）；流式计费按实际用量，不按上限。
+  sleepMaxTokens: z.natural().min(256).max(131072).default(8192).description("sleep 冲突消解与模式发现阶段的 LLM 输出预算上限（token）。原为硬编码 2048，sleepActionSet=full 实测需约 7000 导致裁决被截断而整轮失败；流式计费按实际用量，调大不增加成本。"),
 
   // --- epistemic trust: memory source credibility (v0.4.5) -----------------
   // Distinguish memories by source: observation (measured / witnessed),
