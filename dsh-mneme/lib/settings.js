@@ -105,7 +105,11 @@ const FEATURE_FLAG_INT_RANGES = {
   // Issue #164①：注入单条正文截断上限（默认 300 = 既有行为）。
   injectContentMaxChars: [60, 4000],
   // Issue #164：叙述条成簇门槛（共享同一 tag 的记忆数下限）。
-  dreamNarrativeMinCluster: [2, 20]
+  dreamNarrativeMinCluster: [2, 20],
+  // Issue #257：sleep 冲突/模式阶段的 LLM 输出预算（原硬编码 2048，实测不足）。
+  sleepMaxTokens: [256, 131072],
+  // Issue #258：总览（dream_summarize）输入条数硬上限（0 = 不设上限）。
+  dreamSummaryMaxInputs: [0, 100000]
 };
 // 浮点开关的闭区间（与 config.js 的 z.number().min().max() 对齐）。与整数开关
 // 分开：面板的整数控件要求 Number.isInteger，而余弦相似度阈值必须允许小数。
@@ -128,6 +132,9 @@ const FEATURE_FLAG_STRINGS = [
   // 留空 = 用当前默认模型。
   "entityExtractionProvider",
   "entityExtractionModel",
+  // Issue #258：总览（dream_summarize）专用路由，留空 = 用巩固模型。
+  "dreamSummaryProvider",
+  "dreamSummaryModel",
   "localEmbedModel",
   "ollamaModel"
 ];

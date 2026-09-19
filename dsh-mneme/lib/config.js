@@ -146,6 +146,17 @@ export const Config = z.object({
   ]).default("window"),
   // hybrid 的候选总量上限；0 = 复用 dreamMaxSnapshotSize（不迁移，需要时显式覆盖）。
   dreamCandidateMax: z.natural().min(0).max(5000).default(0),
+  // Issue #258：总览（dream_summarize）独立路由。consolidate 有 dreamMaxSnapshotSize
+  // 窗口、总览原为全库无界——两者对 ctx 的需求差 4 倍以上却强制共用 dream 路由，
+  // dreamProvider 指向小 ctx 模型时总览当场 CONTEXT_WINDOW_EXCEEDED（实测 120,969
+  // tokens > 32,768），指向大 ctx 模型则 consolidate 的卸载收益归零。未配置 = 回落
+  // dream 路由，行为逐字节不变。
+  dreamSummaryProvider: z.string().default("").description("记忆总览（dream_summarize）专用模型服务商，留空用巩固模型。总览输入为全库（或 dreamSummaryMaxInputs 上限），ctx 需求远大于 consolidation，建议大 ctx 模型（issue #258）。"),
+  dreamSummaryModel: z.string().default("").description("记忆总览（dream_summarize）专用模型，留空用巩固模型；总览输入随库增长，建议大 ctx 非思考模型（issue #258）。"),
+  // Issue #258：总览输入条数硬上限。0 = 不设上限（历史行为，库增长可能撑爆小
+  // ctx 模型）；>0 时按 updated_at 倒序保留最新的 N 条（与 consolidate 窗口同一
+  // 排序口径）。总览是常驻叙述而非逐条巩固，限输入只影响口径脚注里的条数。
+  dreamSummaryMaxInputs: z.natural().min(0).max(100000).default(0),
   // hybrid 判"高相似"的阈值；0.85 与 sleep normal 档对齐——两个模块对"高相似"
   // 保持同一个定义。
   dreamCandidateMinSim: z.number().min(0.5).max(0.99).default(0.85),
@@ -399,6 +410,12 @@ export const Config = z.object({
     z.const("high"),
     z.const("none")
   ]).description("同 dreamReasoningEffort：sleep 各阶段 LLM 的推理档位，未配置 = 自动取模型支持的最低档；显式 'none' = 不发送字段、用服务商自带默认。"),
+  // Issue #257：sleep 冲突/模式两阶段的输出预算（原硬编码 2048）。实测默认档
+  // 每对裁决约 90 token、24 对 2097——2048 恰好压在边界（53 次运行 48 败）；
+  // full 档六分支实测约 290 token/对、24 对 6967，2048 必然截断。默认 8192
+  // 覆盖实测峰值（候选对按「每记忆至多一对」去重，饱和在 ~25 对、不随库无限
+  // 增长）；流式计费按实际用量，不按上限。
+  sleepMaxTokens: z.natural().min(256).max(131072).default(8192).description("sleep 冲突消解与模式发现阶段的 LLM 输出预算上限（token）。原为硬编码 2048，sleepActionSet=full 实测需约 7000 导致裁决被截断而整轮失败；流式计费按实际用量，调大不增加成本。"),
 
   // --- epistemic trust: memory source credibility (v0.4.5) -----------------
   // Distinguish memories by source: observation (measured / witnessed),
