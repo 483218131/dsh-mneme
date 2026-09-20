@@ -160,6 +160,36 @@ export function readJsonSafe(file) {
 }
 
 /**
+ * 归一清单里记下的完整性结论。
+ *
+ * 为什么要有这一处：这个字段有两种形态 —— 下载通道写的是 `{status, checked, detail}` 对象，
+ * 而收编来的历史清单根本没有它。判据（verify）与投影（loader）各自猜形状就出过真事故
+ * （issue #268：判据只认 `"sha512-matched"`，下载档写的 `"verified"` 进去恒判失败，
+ * 而 loader 又把那个对象直接当字符串外发）。形状归一收在这里，两边都只调它。
+ *
+ * 它只回答「清单里声称什么」，不重新验算 —— 原始 tarball 落盘后就没了，重算无从谈起。
+ *
+ * 形状非法（`false` / `0` / `[]` / `{}` / `{status: 5}` 这类）给 `"malformed"`：判据不认
+ * 它，于是 fail-closed。这类值既不能证明一致、也不是「没记录过」，按 ok:true 放行等于把
+ * 形状错误读成「已经验过了」（#269 评审）。
+ *
+ * @param {unknown} recorded - 清单里的 integrity 字段。
+ * @returns {{status: string, detail: string|null}} 状态词；缺失（null/undefined）为 "unverified"。
+ */
+export function recordedIntegrity(recorded) {
+  const asStatus = (value) => (typeof value === "string" && value.trim() !== "" ? value.trim() : null);
+  if (recorded === undefined || recorded === null) return { status: "unverified", detail: null };
+  if (typeof recorded === "string") return { status: asStatus(recorded) ?? "unverified", detail: null };
+  if (typeof recorded !== "object" || Array.isArray(recorded)) {
+    const shape = Array.isArray(recorded) ? "array" : typeof recorded;
+    return { status: "malformed", detail: `integrity 字段形状非法（${shape}），无法据此判定` };
+  }
+  const status = asStatus(recorded.status);
+  if (!status) return { status: "malformed", detail: "integrity 对象里没有可用的 status" };
+  return { status, detail: typeof recorded.detail === "string" ? recorded.detail : null };
+}
+
+/**
  * 列出运行时根目录下所有 payload 目录（名称排序）。目录不存在返回空数组。
  * 加载器用它挑候选，再逐个 describePayload 判断可用性。
  * @param {string} runtimeDir - 运行时根目录。
