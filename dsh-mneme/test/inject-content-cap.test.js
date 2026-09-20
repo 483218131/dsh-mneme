@@ -67,7 +67,7 @@ test("block budget scales with the cap (raised cap is not defeated by the 1500 g
   assert.ok(text.includes("乙"), "second entry still rendered");
 });
 
-test("_full_content (sleep-compressed) path stays verbatim without a hint", () => {
+test("_full_content (sleep-compressed) path obeys the cap and says so (#266 评审)", () => {
   const { store, contexts, service } = setup();
   const mem = service.saveWithDedupe({ type: "preference", title: "压缩记忆", content: "占位", importance: 5 }).memory;
   // 模拟 sleep 降级：content=压缩摘要（400 字符 > 默认 300 上限），原文入库 _full_content
@@ -75,8 +75,10 @@ test("_full_content (sleep-compressed) path stays verbatim without a hint", () =
   store.db.prepare("UPDATE memories SET content=?, _full_content=? WHERE id=?")
     .run(summary, "原始长文".repeat(100), mem.id);
   const text = contexts[0].text({});
-  assert.ok(text.includes(summary), "summary injected verbatim beyond the cap");
-  assert.ok(!text.includes("已截断"), "no truncation hint on the compressed path");
+  // 「降级过」不等于「天然够短」：原先这条早返回的唯一效果就是绕过上限，现在统一截断。
+  assert.ok(!text.includes(summary), "oversized summary is not injected whole");
+  assert.ok(text.includes("压缩摘要。".repeat(60)), "the part inside the cap is still there (300 chars)");
+  assert.ok(text.includes("已截断"), "the cut is reported, never silent");
 });
 
 test("default cap stays 300 (ellipsis regression of Bug6)", () => {
