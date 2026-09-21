@@ -24,8 +24,9 @@ const SECTION_LINES = [
   "3. Write back sparingly: use memory_save for durable, cross-session value — a preference, a decision with its rationale, " +
     "an engineering constraint, a pitfall with its root cause. Trivial single-turn work is not worth a memory.",
   "4. When unsure, do nothing. Not acting is a valid outcome: a useless memory is paid for by every future session.",
-  "5. Prefer the reversible tools. memory_archive hides an entry and memory_forget only stops it being injected — both are " +
-    "recoverable. memory_delete is permanent, so reach for it only when an entry is wrong or unwanted, not merely stale."
+  "5. Prefer the reversible tools. memory_archive hides an entry from lists, search, injection and consolidation, and " +
+    "memory_forget suppresses it from injection, search results and lists — both are recoverable. memory_delete is permanent, " +
+    "so reach for it only when an entry is wrong or unwanted, not merely stale."
 ];
 
 /** 系统提示段（order 150）的总则文本。常量：同会话内稳定是硬约束。 */
@@ -39,5 +40,5 @@ export const TOOL_GUIDE = {
     "Skip it for facts you can read directly from the repository.",
   memory_save:
     " Save only durable, cross-session value (a preference, a decision with its rationale, an engineering constraint, " +
-    "a pitfall with its root cause). Trivial single-turn work does not belong here, and when unsure it is correct to save nothing."
+    "a pitfall with its root cause). Trivial single-turn work does not belong here, and when unsure, do not save."
 };
