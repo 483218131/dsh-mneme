@@ -134,6 +134,12 @@ test("#249: capability guide is off by default, registered once when on", () => 
   // 不可逆工具（memory_delete）的克制指引必须在场：这是全 guide 里唯一有数据
   // 损失后果的一句，被误删掉的回归要能立刻转红。
   assert.ok(MEMORY_GUIDE_SECTION.includes("memory_delete"), "guide keeps the irreversible-tool warning");
+  // memory_forget 的副作用面同样不能被写窄：工具描述是「挡注入 + 从检索与列表里
+  // 消失」，只写「只挡注入」会让模型低估它（#249 文案定稿时专门改过这一句）。
+  assert.ok(
+    MEMORY_GUIDE_SECTION.includes("memory_forget suppresses it from injection, search results and lists"),
+    "reversible-tools rule states memory_forget's full reach"
+  );
   // 优先序那条不得让模型拿 memory_search 去核对当前指令/仓库：它只搜记忆库，
   // 搜不到「现在」——把它写成验证手段会换来一轮无效查询 + 继续采信陈旧记忆。
   assert.ok(
