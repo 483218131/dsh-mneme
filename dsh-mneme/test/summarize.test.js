@@ -794,6 +794,30 @@ test("rolls back memory writes when persisting the cursor fails", async () => {
   assert.equal(store.getDistillCursor(session.id).last_seq, 2);
 });
 
+test("falls back to the in-memory cursor when service lacks setDistillCursor", async () => {
+  // 旧版 service（#274 之前）没有持久化游标：缺方法必须降级为内存游标照常蒸馏，
+  // 而不是抛错打断每轮蒸馏。方法存在但抛错走的是上一条回滚用例，两者不可混淆。
+  const { events, store, service, calls } = setup(
+    { distillRateLimitIntervalMs: 0 },
+    { stream: streamOf([{ type: "history", title: "降级游标", content: "缺方法也能蒸馏", importance: 3 }]) }
+  );
+  delete service.setDistillCursor; // 模拟旧版 service：实例属性，直接删掉
+  const handler = events.find((e) => e.name === "session/event").fn;
+  const session = {
+    id: "s-no-cursor-api",
+    requestHeader: () => ({ config: { provider: "deepseek", model: "deepseek-chat" } }),
+    events: [userMessage("旧宿主没有游标接口", 1), { seq: 2, type: "turn/end" }]
+  };
+
+  await handler(session, { seq: 2, type: "turn/end" });
+  assert.equal(calls.length, 1, "distillation must still run without a persisted cursor");
+  assert.equal(store.count(), 1, "the memory itself must be saved");
+  assert.equal(store.getDistillCursor(session.id), undefined, "nothing may be persisted without the API");
+
+  await handler(session, { seq: 2, type: "turn/end" });
+  assert.equal(calls.length, 1, "the in-memory cursor must prevent re-distillation in this process");
+});
+
 test("uses summarizeProvider/summarizeModel config override when set", async () => {
   const { events, calls } = setup({
     summarizeProvider: "aliyun",
