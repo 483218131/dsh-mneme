@@ -550,6 +550,17 @@ export const Config = z.object({
   // recall_runs 滚动清理保留天数。
   recallRetentionDays: z.natural().min(1).max(3650).default(90),
 
+  // --- tool exposure: 慢模型/轻量模型的工具往返节流（v0.8.6）----------------
+  // 跨会话记忆已由 inject.js 每轮自动注入系统提示词，memory_search 只用于
+  // 「注入里没有、需要深挖」的补充检索；memory_archive 是隐藏/恢复条目的整理
+  // 操作，正常会话里很少需要。轻量模型对「何时该用工具」判断弱，容易每轮
+  // 顺手调一遍——每次工具调用都是一次串行往返（生成参数→执行→回填→再生成），
+  // 在慢模型上会被放大成明显卡顿。这两个开关允许直接隐藏对应工具（默认全
+  // 开=行为不变），隐藏后模型根本看不到它，也就不会调。也走 feature_flags
+  // 白名单，面板可启停=线上回滚开关。
+  disableMemorySearch: z.boolean().default(false),
+  disableMemoryArchive: z.boolean().default(false),
+
   // --- scope: v0.8.0 A1 存储层（issue #17）--------------------------------
   // 总开关默认关：关闭时写入不标注 scope、去重维持 (type, title) 现状，行为
   // 逐字节不变。开启后 memory_save 写入 agent_scope（session header 的

@@ -181,7 +181,7 @@ export function createTools(ctx, service, config, embedder) {
       name: "memory_search",
       description: withToolGuide(
         "memory_search",
-        "Search the cross-session memory store. Use when you need past context: how a problem was solved, user preferences, project decisions. Substring-matches title/content/tags, and augments results with semantic (vector) recall + optional rerank when an embeddings provider is configured. Returns matching entries with source and timestamps."
+        "Search the cross-session memory store for past context (solved problems, user preferences, project decisions). IMPORTANT: relevant cross-session memories are already injected into your context every turn — only call this when the injected memory block does NOT contain what you need, or you need to look something specific up. Substring-matches title/content/tags, and augments results with semantic (vector) recall + optional rerank when an embeddings provider is configured. Returns matching entries with source and timestamps."
       ),
       // A2 检索接线：occurred 时间窗 + 会话 scope 加成（见 execute）。
       parameters: {
@@ -435,7 +435,8 @@ export function createTools(ctx, service, config, embedder) {
       description:
         "Archive a memory (hide it from active lists, search, injection and dream consolidation) or restore it. " +
         "Archived entries stay in storage and are recoverable: pass archived=false to restore, and use memory_list with " +
-        "include_archived=true to find archived entries.",
+        "include_archived=true to find archived entries. " +
+        "Only archive when the user asks, or an entry is clearly stale/no longer relevant — do not archive proactively mid-session to tidy up.",
       parameters: {
         id: { type: "string", required: true, description: "Memory id" },
         archived: { type: "boolean", description: "Archive (true, default) or restore (false) the entry" }
@@ -676,8 +677,20 @@ export function createTools(ctx, service, config, embedder) {
     })
   ];
 
+  // Tool-exposure gate (v0.8.6): 跨会话记忆已自动注入，memory_search /
+  // memory_archive 在慢/轻量模型上是多余往返，面板开关可直接隐藏工具——
+  // 模型看不到就不会调，比在描述里劝它少调用更可靠。注意：live patch reload
+  // 下已注册的工具不会被宿主反注册，排除只对全新会话生效。
+  const hiddenTools = new Set();
+  if (config?.disableMemorySearch === true) hiddenTools.add("memory_search");
+  if (config?.disableMemoryArchive === true) hiddenTools.add("memory_archive");
+
   for (const tool of tools) {
-          if (registeredTools.has(tool.name)) {
+    if (hiddenTools.has(tool.name)) {
+      ctx.logger?.info?.(`[dsh-mneme] tool "${tool.name}" hidden by config (disableMemorySearch/disableMemoryArchive)`);
+      continue;
+    }
+    if (registeredTools.has(tool.name)) {
         ctx.logger?.warn?.(`[dsh-mneme] tool "${tool.name}" already registered, skipping duplicate`);
         continue;
       }

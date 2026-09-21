@@ -155,7 +155,7 @@ const TOOL_SAVE_DESCRIPTION =
   "Call this when the user states a durable preference, a project decision is made, or a lesson is learned. " +
   "Merges into an existing entry of the same type when the title matches.";
 const TOOL_SEARCH_DESCRIPTION =
-  "Search the cross-session memory store. Use when you need past context: how a problem was solved, user preferences, project decisions. Substring-matches title/content/tags, and augments results with semantic (vector) recall + optional rerank when an embeddings provider is configured. Returns matching entries with source and timestamps.";
+  "Search the cross-session memory store for past context (solved problems, user preferences, project decisions). IMPORTANT: relevant cross-session memories are already injected into your context every turn — only call this when the injected memory block does NOT contain what you need, or you need to look something specific up. Substring-matches title/content/tags, and augments results with semantic (vector) recall + optional rerank when an embeddings provider is configured. Returns matching entries with source and timestamps.";
 const TOOL_LIST_DESCRIPTION =
   "List memory entries by type, high-importance first, then newest, paginated. Set include_archived=true to also list archived (hidden) entries so they can be located and restored.";
 const TOOL_GET_DESCRIPTION =
