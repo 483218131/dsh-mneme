@@ -408,7 +408,12 @@ export function createSummarizer(ctx, service, config, deps = {}) {
   function persistCursor(sessionId, nextSeq) {
     if (!Number.isFinite(nextSeq)) return;
     if (typeof service.setDistillCursor !== "function") {
-      throw new Error("dsh-mneme: persistent summarization cursors are unavailable");
+      // 第三方宿主拿旧版 service 构造时没有持久化游标能力：降级为内存游标
+      // （#274 之前的行为），本进程内不重复蒸馏，重启后窗口重放由
+      // saveWithDedupe 三元组兜底。方法存在但抛错仍向上传播——那是
+      // 「写失败须回滚」的恰一次语义，不能吞（见 summarize.test.js 回滚用例）。
+      ctx.logger?.warn?.("dsh-mneme: service.setDistillCursor unavailable, distill cursor falls back to in-memory");
+      return;
     }
     service.setDistillCursor(sessionId, nextSeq);
   }
