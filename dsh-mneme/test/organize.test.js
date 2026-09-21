@@ -320,7 +320,7 @@ test("#231: apply refuses an apply receipt as its dryRun reference", async () =>
 });
 
 test("#231: a throwing embedder fails the dryRun, audits it and rethrows", async () => {
-  const { store, service, organize } = makeOrganizer(async () => {
+  const { store, service } = makeOrganizer(async () => {
     throw new Error("embedder offline");
   });
   const seeded = service.saveWithDedupe({ type: "preference", title: "已有向量", content: "内容" }).memory;

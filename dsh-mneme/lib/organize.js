@@ -254,7 +254,7 @@ export function createOrganizer({ store, embedQuery, saveWithDedupe, transaction
       throw new Error("organize.apply: run_id is required (apply must reference a dryRun report)");
     }
     const report = store.getDreamRun(dryRunId);
-    if (!report || report.run_type !== "organize") {
+    if (report?.run_type !== "organize") {
       throw new Error(`organize.apply: unknown organize run "${dryRunId}"`);
     }
     // apply 回执与 dryRun 报告共用 run_type='organize'：只有 outcome.dry_run_id 能
