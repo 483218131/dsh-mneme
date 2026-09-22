@@ -408,3 +408,120 @@ test("issue#257 schema default for sleepMaxTokens is 8192 (was hardcoded 2048)",
   const cfg = Config({});
   assert.equal(cfg.sleepMaxTokens, 8192, "schema default covers the measured full-set peak (6967)");
 });
+
+// ------------------------------------------- sleep LLM accounting (issue #250)
+// Bug8 给 dream 与 summarize 接记账时漏了 sleep：src/dream/sleep.js 有一份自己的
+// streamText，签名里没有 onUsage，两条 LLM 链路（conflict 裁决 / pattern 挖掘）的
+// token 与状态从未进 llm_audit_logs——面板因此只看到两条链路，回答不了「sleep 花了
+// 多少」。下面两条用例锁定「审计行落库 + token 数值来自 usage chunk」。
+// 两条链路共用同一处 streamText 改动，故放在同一轮 red-green 里。
+
+/** 在 base ctx 的流里、finish 之前插入一个 usage chunk（形态同 llm-audit.test.js）。 */
+function withUsageChunk(base, usageChunk) {
+  return {
+    ...base,
+    llm: {
+      async *stream(options) {
+        for await (const chunk of base.llm.stream(options)) {
+          if (chunk.type === "finish") yield usageChunk;
+          yield chunk;
+        }
+      }
+    }
+  };
+}
+
+test("issue#250 sleep conflict phase writes an llm_audit row with the streamed tokens", async () => {
+  const { service, store, vectorIndex } = setup();
+  const { a, b } = seedConflictPair(service, vectorIndex, 1.0);
+  const ctx = withUsageChunk(
+    mockCtx(() => JSON.stringify([{ action: "conflict", winner: a.id, loser: b.id, reason: "重复覆盖" }])),
+    { type: "usage", usage: { inputTokens: 1200, outputTokens: 300, totalTokens: 1500 } }
+  );
+  const result = await runSleep(ctx, service, baseConfig(), ctx.logger, { embedder, vectorIndex }, null);
+  assert.equal(result.phases.conflicts.status, "ok", "conflict resolved");
+
+  const conflict = service.listLlmAudits({ source: "sleep" }).find((r) => r.operation_type === "sleep_conflict");
+  assert.ok(conflict, "sleep_conflict audit row present");
+  assert.equal(conflict.trigger_source, "sleep");
+  assert.equal(conflict.status, "success");
+  assert.equal(conflict.model_id, "mock:sleep-model", "route actually used is recorded");
+  assert.equal(conflict.input_tokens, 1200, "input tokens come from chunk.usage");
+  assert.equal(conflict.output_tokens, 300, "output tokens come from chunk.usage");
+  assert.equal(conflict.total_tokens, 1500);
+  assert.ok(typeof conflict.duration_ms === "number" && conflict.duration_ms >= 0);
+  store.close();
+});
+
+test("issue#250 sleep pattern phase writes an llm_audit row with the streamed tokens", async () => {
+  const { service, store } = setup();
+  const a = makeMemory(service, "模式A", "反复出现的模式A", "project");
+  const b = makeMemory(service, "模式B", "反复出现的模式B", "project");
+  const ctx = withUsageChunk(
+    mockCtx(() => JSON.stringify([
+      { action: "create", type: "pattern", title: "真模式", content: "从 a 和 b 提取", importance: 3, evidence: [a.id, b.id] }
+    ])),
+    { type: "usage", usage: { inputTokens: 900, outputTokens: 250, totalTokens: 1150 } }
+  );
+  const result = await runSleep(ctx, service, baseConfig({ sleepPatternMinMemories: 10 }), ctx.logger, null, null);
+  assert.ok(result.phases.patterns, "pattern phase ran");
+
+  const pattern = service.listLlmAudits({ source: "sleep" }).find((r) => r.operation_type === "sleep_pattern");
+  assert.ok(pattern, "sleep_pattern audit row present");
+  assert.equal(pattern.trigger_source, "sleep");
+  assert.equal(pattern.status, "success");
+  assert.equal(pattern.input_tokens, 900, "input tokens come from chunk.usage");
+  assert.equal(pattern.output_tokens, 250, "output tokens come from chunk.usage");
+  assert.equal(pattern.total_tokens, 1150);
+  store.close();
+});
+
+// 审计诚实性（issue #250）：流式成功但输出里没有 JSON 数组时，phase 报 failed，
+// 审计行也必须记 error——不能一个调用在两表里自相矛盾。
+test("issue#250 sleep conflict parse failure is audited as status=error, not fake success", async () => {
+  const { service, store, vectorIndex } = setup();
+  const { a, b } = seedConflictPair(service, vectorIndex, 1.0);
+  const ctx = mockCtx(() => "抱歉，我无法把裁决整理成 JSON。");
+  const result = await runSleep(ctx, service, baseConfig(), ctx.logger, { embedder, vectorIndex }, null);
+  assert.equal(result.phases.conflicts.status, "failed", "the phase reports the failure");
+
+  const row = service.listLlmAudits({ source: "sleep" }).find((r) => r.operation_type === "sleep_conflict");
+  assert.ok(row, "the failed call is still audited");
+  assert.equal(row.status, "error", "a stream that returned unusable output is not a success");
+  assert.match(row.error_message, /no json array in llm output/);
+  store.close();
+});
+
+test("issue#250 sleep pattern parse failure is audited as status=error, not fake success", async () => {
+  const { service, store } = setup();
+  makeMemory(service, "模式A", "反复出现的模式A", "project");
+  makeMemory(service, "模式B", "反复出现的模式B", "project");
+  const ctx = mockCtx(() => "这不是 JSON 数组");
+  const result = await runSleep(ctx, service, baseConfig({ sleepPatternMinMemories: 10 }), ctx.logger, null, null);
+  // pattern 阶段对不可解析输出的既定语义是 skipped（"no patterns found"）——那是
+  // 「有没有铸造出模式」的结论，不是「这次调用成没成功」的结论，此处不改上游语义。
+  assert.equal(result.phases.patterns.status, "skipped", "the phase keeps its existing semantics");
+
+  const row = service.listLlmAudits({ source: "sleep" }).find((r) => r.operation_type === "sleep_pattern");
+  assert.ok(row, "the call still consumed tokens and is still audited");
+  assert.equal(row.status, "error", "the audit records the call's truth, not the phase's conclusion");
+  assert.match(row.error_message, /no json array in llm output/);
+  store.close();
+});
+
+// 回归护栏：llmAudit.enabled === false 时 auditedSleepLlm 整段早退，auditError 钩子
+// 不会被调用。所以两个 phase 的控制流必须各自解析输出、不能依赖那个钩子的副作用
+// ——dream 的 runAuditedLlm 正是那样踩了（关掉审计 flag 会让 autoDream 直接失效）。
+test("issue#250 sleep still adjudicates normally when llmAudit.enabled === false", async () => {
+  const { service, store, vectorIndex } = setup();
+  const { a, b } = seedConflictPair(service, vectorIndex, 1.0);
+  const ctx = mockCtx(() =>
+    JSON.stringify([{ action: "conflict", winner: a.id, loser: b.id, reason: "重复覆盖" }])
+  );
+  const config = baseConfig({ llmAudit: { enabled: false } });
+  const result = await runSleep(ctx, service, config, ctx.logger, { embedder, vectorIndex }, null);
+  assert.equal(result.phases.conflicts.status, "ok", "turning the audit off must not break sleep");
+  assert.equal(service.getById(b.id).archived, true, "the arbitration still applied");
+  assert.equal(service.listLlmAudits().length, 0, "no audit rows when disabled");
+  store.close();
+});

@@ -189,10 +189,36 @@ v0.3.0 起新增**记忆基因**层：从记忆里抽取**命名实体**、**带
 
 ### LLM 消耗审计 📊（v0.4.6，默认开）
 
-每次**后台 LLM 调用**（autoDream 整理 + 摘要、autoSummarize 压缩）都会写入 `llm_audit_logs` 表：`tokens` / `duration` / `status` / `source`（由哪个触发产生）。失败调用记为 `status=error`，绝不阻塞功能本体；`retentionDays`（默认 90）在启动时清理超期行。新增两个只读 API：
+每次**后台 LLM 调用**都会写入 `llm_audit_logs` 表：`tokens` / `duration` / `status` / `source`（由哪个触发产生）。失败调用记为 `status=error`，绝不阻塞功能本体；`retentionDays`（默认 90）在启动时清理超期行。
+
+覆盖的后台调用（`source` 即触发源，`operation_type` 区分同一源下的不同调用）：
+
+| `source` | `operation_type` | 说明 |
+|---|---|---|
+| `autoDream` | `dream_consolidate` / `dream_summarize` | 巩固的整理裁决与总览摘要，各一行 |
+| `autoDream` | `dream_narrative` | 叙述条合成，需 `dreamNarrativeEnabled`（默认关）才跑 |
+| `autoSummarize` | `summarize_compress` | 空闲蒸馏的压缩 |
+| `sleep` | `sleep_conflict` / `sleep_pattern` | Sleep Mode 的冲突裁决与模式挖掘，两阶段各一行 |
+| `entityExtract` | `entity_extract` | 实体抽取，**每次写入记忆都会跑** |
+
+> 后两条链路见 #250——它们是结构上漏接的后台路径（sleep 的 `streamText` 副本没有 `onUsage`、实体抽取适配器拿不到 `service`），不是刻意收窄口径。
+
+新增两个只读 API：
 
 - `GET /api/dsh-mneme/semantic/llm-audit?page=&pageSize=&source=` — 分页查询 + 按 source 过滤
 - `GET /api/dsh-mneme/semantic/llm-audit/stats?days=` — 近 N 天按 source 汇总预算（tokens / 次数 / 失败数）
+
+`/llm-audit/stats` 的 `by_source` 是服务端 `GROUP BY trigger_source`，不做任何白名单过滤，因此新链路自动进入汇总。
+
+面板侧现状（#250 之后，未改面板）：
+
+- 「LLM 消耗」卡读 `/llm-audit/stats`，但只渲染 `total_calls` / `total_tokens` 两个总数。新链路的 token 与次数**已经计入这两个总数**，所以「mneme 总共花了多少」现在是对的；
+- 按链路的拆分（`by_source`）目前只能从 API 读，面板不展示——「哪条链路最费」在面板上还答不了；
+- 状态页活动流仍只显示 `autoDream` / `autoSummarize` 两个硬编码来源（`lib/client.js`），新链路不会出现在活动流里。
+
+这三处要动面板（活动流还有一处来源白名单加一处二元标签兜底，且 `pageSize=12` 会被每次写入都跑的实体抽取占满），留到面板批次，不在 #250 内。
+
+> 实体抽取是**每次写入记忆都会跑**的链路，计入审计后 `llm_audit_logs` 的行数会随写入量线性增长（`retentionDays` 只约束上界、不约束增速）。若实测增速过快，再考虑按 `operation_type` 采样或单独保留期。
 
 > 只读端点，与 list/search/semantic 一样在设置 `apiToken` 后仍保持开放。
 

@@ -500,11 +500,18 @@ export const Config = z.object({
   }).default({}),
 
   // --- LLM audit trail (Bug8) ------------------------------------------------
-  // Records every background LLM call (autoDream consolidation + summary,
-  // autoSummarize compression) into llm_audit_logs: tokens, duration, status
-  // and which trigger produced it. Failures are recorded as status=error and
-  // never block the feature. retentionDays bounds the table: older rows are
-  // purged on boot.
+  // Records every background LLM call into llm_audit_logs: tokens, duration,
+  // status and which trigger produced it. Failures are recorded as
+  // status='error' and never block the feature. retentionDays bounds the table:
+  // older rows are purged on boot.
+  //
+  // Covered trigger_source values: autoDream (consolidation + summary),
+  // autoSummarize (compression), sleep (conflict + pattern) and entityExtract
+  // (issue #250 — the last two were structurally missing the hook, not a
+  // deliberate narrowing). entityExtract runs on every memory write, so row
+  // growth scales with write volume; retentionDays caps the ceiling but not the
+  // rate. If that turns out too fast, sample by operation_type or give it a
+  // separate retention — do not add a second gate: this flag is the single one.
   llmAudit: z.object({
     enabled: z.boolean().default(true),
     retentionDays: z.natural().min(1).max(3650).default(90)
