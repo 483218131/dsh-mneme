@@ -172,8 +172,10 @@ const FEATURE_FLAG_ENUMS = {
   summarizeDedupeMode: ["off", "title", "vector"],
   // Issue #126：sleep 冲突阶段的动作集（conflict 默认 = 现状；full = 六分支）。
   sleepActionSet: ["conflict", "full"],
-  // Issue #125：dream 候选集构造方式（window 默认 = 现状；hybrid 并入向量组）。
-  dreamCandidateMode: ["window", "hybrid"]
+    // Issue #125：dream 候选集构造方式（window 默认 = 现状；hybrid 并入向量组）。
+    dreamCandidateMode: ["window", "hybrid"],
+    // 本地嵌入池化：auto = 按模型族判定（BGE → cls），可显式覆盖为 cls / mean。
+    localEmbedPooling: ["auto", "cls", "mean"]
 };
 const FEATURE_FLAG_STRING_MAX = 200;
 

@@ -22,6 +22,32 @@ function modelHash(model) {
 }
 
 /**
+ * Model families whose embedding is the CLS token rather than a mean over tokens.
+ *
+ * BGE (BAAI/bge-*) is trained that way: the model's own `1_Pooling/config.json`
+ * declares `pooling_mode_cls_token: true` / `pooling_mode_mean_tokens: false`, and
+ * the official README says "select the last hidden state of the first token" plus
+ * L2 normalization. transformers.js's `feature-extraction` defaults to `mean`, so
+ * feeding it a BGE model silently produces slightly-off vectors — no error, just a
+ * worse ranking. This table is the extension point: a family goes in only once its
+ * pooling is confirmed against the model's own `1_Pooling` (or equivalent) config.
+ */
+const CLS_POOLED_MODEL_PATTERNS = [/bge/i];
+
+/**
+ * Resolve the pooling to embed with.
+ *
+ * `auto` (default) picks by model family — BGE → `cls`, everything else → `mean`,
+ * so models that were never affected keep their exact previous behavior. An
+ * explicit `cls` / `mean` wins over the family table.
+ */
+export function resolvePooling(pooling, model) {
+  const mode = String(pooling ?? "auto").trim().toLowerCase();
+  if (mode === "cls" || mode === "mean") return mode;
+  return CLS_POOLED_MODEL_PATTERNS.some((re) => re.test(String(model ?? ""))) ? "cls" : "mean";
+}
+
+/**
  * Lazy default loader: dynamic import keeps module load cheap.
  *
  * 经 runtime/loader.js 的三层解析取运行时（自管 payload 优先，其次宿主裸 specifier）：
@@ -71,8 +97,9 @@ function tensorToRows(tensor) {
 
 /**
  * ONNX text embedder backed by transformers.js (onnxruntime-node underneath).
- * Runs fully offline with mean pooling + L2 normalization for BERT-style
- * models like bge-small-zh. `engineFactory` is injectable for tests.
+ * Runs fully offline; pooling is resolved per model family (BGE → CLS, else mean —
+ * see resolvePooling) and vectors are L2-normalized. `engineFactory` is injectable
+ * for tests.
  */
 export class LocalEmbedder {
   constructor(opts = {}) {
@@ -87,6 +114,10 @@ export class LocalEmbedder {
     // （含测试）保持裸 fetch 的现状，配置默认值由 index.js 传进来。
     this.resilientModelDownload = opts.resilientModelDownload === true;
     this.useDtype = opts.useDtype || "q8";
+    // 池化：配置值（auto/cls/mean）→ 生效值（cls/mean）。解析结果既进 embed()，
+    // 也进 modelHash —— 换池化就是换向量空间，旧索引必须被判失配后重建。
+    this.poolingMode = String(opts.pooling ?? "auto").trim().toLowerCase();
+    this.pooling = resolvePooling(this.poolingMode, this.model);
     // 模型镜像下载源（embedModelMirror，#188 补充）：空 = transformers 默认。
     this.remoteHost = String(opts.remoteHost ?? "").trim();
     this.logger = opts.logger ?? null;
@@ -114,19 +145,19 @@ export class LocalEmbedder {
     this.extractor = await this.engineFactory("feature-extraction", this.model, options);
     this.ready = true; // service reads this to flush queued re-embeds
     this.logger?.info?.(
-      `[dsh-mneme] local embedder ready: ${this.model} (dim=${this._dimension}, device=${this.device})`
+      `[dsh-mneme] local embedder ready: ${this.model} (dim=${this._dimension}, device=${this.device}, pooling=${this.pooling})`
     );
     return this;
   }
 
-  /** Embed many texts with mean pooling; chunks at batchSize. */
+  /** Embed many texts with the model's pooling; chunks at batchSize. */
   async embed(texts) {
     if (!Array.isArray(texts)) throw new TypeError("embed expects an array of strings");
     if (!this.extractor) throw new Error("LocalEmbedder not initialized");
     const out = [];
     for (let i = 0; i < texts.length; i += this.batchSize) {
       const chunk = texts.slice(i, i + this.batchSize);
-      const tensor = await this.extractor(chunk, { pooling: "mean", normalize: true });
+      const tensor = await this.extractor(chunk, { pooling: this.pooling, normalize: true });
       out.push(...tensorToRows(tensor));
     }
     return out;
@@ -142,7 +173,14 @@ export class LocalEmbedder {
   }
 
   get modelHash() {
-    return modelHash(this.model);
+    // Pooling is part of the vector space: a CLS index cannot be queried with mean
+    // vectors (or vice versa). Keep the historical `model#hash` shape for `mean` so
+    // indexes that were never affected are not invalidated needlessly; every other
+    // pooling gets a fingerprint of its own, which makes the index-consistency gate
+    // flag the stale mean-space index and rebuild it.
+    return this.pooling === "mean"
+      ? modelHash(this.model)
+      : modelHash(`${this.model}@${this.pooling}`);
   }
 
   dispose() {

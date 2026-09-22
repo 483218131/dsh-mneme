@@ -273,6 +273,9 @@ export const apply = (ctx, config) => {
         dimension: cfg.localEmbedDimension,
         device: cfg.localEmbedDevice,
         batchSize: cfg.localEmbedBatchSize,
+        // 池化方式必须与模型的训练口径一致（BGE 系 = CLS）。它既进 embed() 的调用，
+        // 也进 modelHash —— 池化改了就是换向量空间，既有索引会被判失配并重建。
+        pooling: cfg.localEmbedPooling,
         cacheDir: cfg.embedModelCacheDir,
         runtimeDir: cfg.runtimeDir,
         // #188：embedModelMirror 接成 transformers 的下载镜像（此前死配置）。
