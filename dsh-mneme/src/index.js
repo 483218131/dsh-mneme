@@ -43,7 +43,15 @@ export { Config };
 // unit-testable; the extractor only ever sees a callLLM(messages, options)
 // => Promise<string>. The route always carries a real provider/model (dsh-llm
 // GenerateOptions requires both) — never a bare stream.
-export function createEntityStreamAdapter({ llm, agentDefaultModel, logger }) {
+//
+// Issue #250: it also accounts for itself. Entity extraction is the background
+// LLM path that runs on every memory write, yet it never reached
+// llm_audit_logs — the adapter only ever held an llm handle, so it had no way
+// to call service.saveLlmAudit. It now takes service (+ config for the shared
+// llmAudit.enabled gate) and writes one row per stream attempt, matching the
+// contract of runAuditedLlm in dream.js: a rejected effort attempt records its
+// own error row and the retry records its own success row.
+export function createEntityStreamAdapter({ llm, agentDefaultModel, logger, service, config }) {
   return async function streamEntityText(messages, options = {}) {
     let route = {};
     if (options.provider) route.provider = options.provider;
@@ -58,8 +66,38 @@ export function createEntityStreamAdapter({ llm, agentDefaultModel, logger }) {
       } catch { /* fall through to whatever route we already have */ }
     }
     const effort = options.reasoningEffort;
+    // 没有解析出 provider/model 就没有可归属的模型——与 dream 的 resolveRoute
+    // 无路由早退同口径，那种情况不写审计行。
+    const modelId = route.provider && route.model ? `${route.provider}:${route.model}` : "";
     const tryStream = (withEffort) => {
       let text = "";
+      let inputTokens = 0;
+      let outputTokens = 0;
+      const startedAt = Date.now();
+      const timestamp = new Date(startedAt).toISOString();
+      // 记账是 best-effort：写审计行失败只 warn，绝不反噬抽取本身（CONTRIBUTING
+      // 的 fail-safe 硬约定）。
+      const writeAudit = (status, errorMessage) => {
+        if (config?.llmAudit?.enabled === false || !modelId || typeof service?.saveLlmAudit !== "function") return;
+        try {
+          service.saveLlmAudit({
+            timestamp,
+            trigger_source: "entityExtract",
+            operation_type: "entity_extract",
+            model_id: modelId,
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            total_tokens: inputTokens + outputTokens,
+            cost_usd: 0,
+            duration_ms: Date.now() - startedAt,
+            status,
+            error_message: errorMessage,
+            related_memory_ids: []
+          });
+        } catch (auditError) {
+          logger?.warn?.(`dsh-mneme: entity extraction llm audit write failed: ${String(auditError)}`);
+        }
+      };
       return (async () => {
         for await (const chunk of llm.stream({
           ...route,
@@ -68,11 +106,26 @@ export function createEntityStreamAdapter({ llm, agentDefaultModel, logger }) {
           messages
         })) {
           if (chunk.type === "text-delta" && typeof chunk.text === "string") text += chunk.text;
-          if (chunk.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) return undefined;
+          // DSH 的 StreamChunk 契约把用量嵌在 chunk.usage（TokenUsage）；兼容直接
+          // 平铺在 chunk 上的旧形态。归一放在这里，下面只需认平铺形状——与
+          // dream.js 的 streamText 同一处理。
+          if (chunk.type === "usage") {
+            const u = chunk.usage ?? chunk;
+            const i = u.input_tokens ?? u.inputTokens ?? u.prompt_tokens ?? u.promptTokens;
+            const o = u.output_tokens ?? u.outputTokens ?? u.completion_tokens ?? u.completionTokens;
+            if (Number.isFinite(i)) inputTokens = i;
+            if (Number.isFinite(o)) outputTokens = o;
+          }
+          if (chunk.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) {
+            writeAudit("error", "llm stream aborted or errored");
+            return undefined;
+          }
         }
+        writeAudit("success", null);
         return text;
       })().catch((err) => {
         logger?.warn?.(`[dsh-mneme] entity extraction llm stream failed: ${String(err)}`);
+        writeAudit("error", String(err?.message ?? err));
         return undefined;
       });
     };
@@ -445,7 +498,11 @@ export const apply = (ctx, config) => {
       const streamEntityText = createEntityStreamAdapter({
         llm: ctx.llm,
         agentDefaultModel: ctx.agentDefaultModel,
-        logger: ctx.logger
+        logger: ctx.logger,
+        // Issue #250: the adapter needs service to write its llm_audit_logs row
+        // (it never had it) and config for the shared llmAudit.enabled gate.
+        service,
+        config: cfg
       });
       service.setEntityExtractor((memory) =>
         extractEntities(memory, { store, config: cfg, callLLM: streamEntityText, logger: ctx.logger })
