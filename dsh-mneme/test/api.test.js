@@ -1010,6 +1010,18 @@ test("GET /api/dsh-mneme/export markdown feeds straight back through import", as
   const md = res.body;
   assert.ok(md.includes("- **ID**: `" + a.memory.id + "`"), "anchor line present (readHumanEdits-compatible)");
 
+  // 导出是一个文档（#278 审查 F1/F3）：frontmatter 只能有一份并在最前，分节不带
+  // 各自的文件头；而且它的覆盖声明必须与正文条目数一致——「说一套写一套」比没有
+  // 这个字段更糟，外部工具会照着它聚合。
+  assert.equal([...md.matchAll(/^type: /gm)].length, 1, "只有一个 frontmatter 的 type 键");
+  assert.match(md, /^type: memory-export$/m);
+  assert.match(md, /^coverage: all$/m, "导出含归档/已遗忘行，声明要说实话");
+  assert.equal(
+    Number(md.match(/^covered: (\d+)$/m)[1]),
+    (md.match(/^- \*\*ID\*\*: /gm) ?? []).length,
+    "covered 必须等于实际导出的条目数"
+  );
+
   // 黄金用例：导出文本原样导入 → 解析出全部条目，且字段无漂移
   const back = new FakeRes();
   await importRoute.handler(req("/api/dsh-mneme/import", "POST", { type: "preference", markdown: md }), back);

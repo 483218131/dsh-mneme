@@ -2,14 +2,27 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { STR, langOf } from "./lang.js";
+import { PACKAGE_VERSION } from "./version-check.js";
 
 export const TYPE_FILE = {
   preference: "preferences.md",
   project: "projects.md",
   decision: "decisions.md",
   history: "history.md",
-  summary: "summary.md"
+  summary: "summary.md",
+  pitfall: "pitfalls.md",
+  constraint: "constraints.md",
+  rejected_solution: "rejected-solutions.md",
+  pattern: "patterns.md"
 };
+
+// 不落镜像的 type（#278 第一批）：document 行（#230）是指针行——记忆内容是摘要，
+// 真正的文档在 agent 侧那个文件里（库里多存 doc_path + evidence），而镜像块渲染的
+// 字段里没有 doc_path，落一个 documents.md 会得到「看着完整、其实找不到文件」的视图。
+// 它的落点属于 #230 那条线自己的决定，不在本批范围。这个排除由
+// test/mirror-types.test.js 钉死（TYPES \ TYPE_FILE 必须恰好等于本集合），将来新增
+// type 时必须显式决定它落不落镜像——静默漏掉才是 #278 要修的那种盲区。
+export const MIRROR_EXCLUDED_TYPES = new Set(["document"]);
 
 const ESCAPE = /([\\`*_[\]{}()#+.!|>~-])/g;
 const UNESCAPE = new RegExp("\\\\" + ESCAPE.source, "g");
@@ -21,6 +34,36 @@ function esc(text) {
 function unescape(text) {
   return String(text).replace(UNESCAPE, "$1");
 }
+
+// 元数据标签的唯一来源是 STR.mirrorLabel（lang.js）：渲染按实例语言取，解析两套
+// 都认。下面的正则从那张表现算——旧实现把手写正则与 lang.js 的两处文案分开维护，
+// 加一个字段要改三处，漏改一处那一行就会随 /import 写进 entry 的 content。
+const META_LABELS = [];
+for (const language of Object.keys(STR.mirrorLabel)) META_LABELS.push(...Object.values(STR.mirrorLabel[language]));
+
+function reEsc(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// 元数据行的值必须单行：值里带换行会多出一行，轻则破坏「整段元数据行」的解析契约，
+// 重则伪造出一个条目头（sensitivity 是调用方传入的任意字符串，属信任边界）。
+function oneLine(text) {
+  return String(text).replace(/\s+/g, " ").trim();
+}
+
+// 结构头锚：ID 行紧跟类型行才算条目头（正文里机器格式的 ID 行不会切开块）。
+const ANCHOR_RE = new RegExp(
+  "^- \\*\\*ID\\*\\*: `([^`]+)`\\n- \\*\\*(?:" +
+    [STR.mirrorLabel.zh.type, STR.mirrorLabel.en.type].map(reEsc).join("|") +
+    ")\\*\\*:", "gm"
+);
+// 渲染出的整段元数据行（加字段只需改 lang.js 的 mirrorLabel）。
+const META_RUN_RE = new RegExp(`^(- \\*\\*(?:${META_LABELS.map(reEsc).join("|")})\\*\\*:.*\\n?)+`);
+// 三方合并用的版本令牌（service.syncMirror 比对并发写）。
+const UPDATED_RE = new RegExp(
+  "- \\*\\*(?:" + [STR.mirrorLabel.zh.updated, STR.mirrorLabel.en.updated].map(reEsc).join("|") +
+    ")\\*\\*: ([^\\n]+)"
+);
 
 function renderMemory(m, language = "zh") {
   // last-rendered digest baseline: sha256(title \x00 content). service.js
@@ -40,6 +83,12 @@ function renderMemory(m, language = "zh") {
   lines.push(`- **${ML.tags}**: ${m.tags.map((t) => `\`${esc(t)}\``).join(" ")}`);
   lines.push(`- **${ML.updated}**: ${m.updated_at}`);
   if (m.source) lines.push(`- **${ML.source}**: ${esc(m.source)}`);
+  // scope / sensitivity 是只读展示字段（#278：sensitivity 的过滤语义另有归属，见
+  // 那条讨论；这里只把值摆出来）。只在真有值时渲染——本机 2843 条里只有 37 条带
+  // scope 标签，无条件渲染会给每条目多添两行空字段。
+  const scopeText = [m.agent_scope, m.workspace_scope].filter(Boolean).map(oneLine).join(" / ");
+  if (scopeText) lines.push(`- **${ML.scope}**: ${scopeText}`);
+  if (m.sensitivity) lines.push(`- **${ML.sensitivity}**: ${oneLine(m.sensitivity)}`);
   lines.push("");
   lines.push(`<!-- mirror-digest: ${digest} -->`);
   lines.push(m.content);
@@ -50,13 +99,47 @@ function renderMemory(m, language = "zh") {
 }
 
 /**
+ * 文件头 frontmatter（#278 第一批）。按 type 分文件时一个文件装 N 条，所以
+ * frontmatter 只能落在文件级；条目级元数据仍是块内的 `- **字段**:` 行（见
+ * renderMemory）。
+ *
+ * `covered` / `coverage` 是覆盖范围的自述，必须与这份文本**实际包含的行集**一致：
+ * 磁盘镜像写活跃集（active-only），/export 的文档写全表（all）。说一套写一套比
+ * 没有这个字段更糟——外部工具会照着它聚合条数与标签。
+ *
+ * 键名对齐 OKF v0.2：`type` 是 §4.1 唯一必填键，`tags` 是 §4.1 的推荐键，
+ * `generated.by` / `generated.at` 是 §5.2 的 trust 族。`generated.by` 按 §7 的
+ * actor 约定写 `<producer>/<version>`（所以带版本号）；`generated.at` 按 §5.2 的
+ * 语义只记「内容上次真正变化」，sync 因此只在正文变化时才落盘。v0.2 已用
+ * `generated.at` 取代 v0.1 的 `timestamp`，没有 `updated` 这个顶层键。
+ * `covered` / `coverage` 是 §4.1 允许的 producer 自定义扩展。
+ */
+export function renderFileHeader(type, items, coverage = "active-only") {
+  const tags = [...new Set(items.flatMap((m) => (m.tags ?? []).map(String)))].sort();
+  return [
+    "---",
+    `type: ${type}`,
+    `generated.by: dsh-mneme/${PACKAGE_VERSION}`,
+    `generated.at: ${new Date().toISOString()}`,
+    `covered: ${items.length}`,
+    `coverage: ${coverage}`,
+    `tags: [${tags.map((t) => JSON.stringify(t)).join(", ")}]`,
+    "---",
+    ""
+  ].join("\n");
+}
+
+/**
  * Render one type's memories into exactly the mirror-file text (header +
  * per-memory blocks, updated_at DESC like sync). sync() writes this to disk;
- * the /export endpoint returns the same text, so an exported markdown is
- * byte-compatible with a mirror file and can be fed straight back through
- * parseHumanEdits → mergeHumanEdits. Unknown type → undefined.
+ * the /export endpoint reuses the same entry blocks for its per-type sections,
+ * so an exported markdown round-trips back through parseHumanEdits →
+ * mergeHumanEdits. Unknown type → undefined.
+ *
+ * `fileHeader: false` 供 /export 用：一个文档只能有一个 frontmatter 块（在文档
+ * 最前，见 api.js 的 /export），所以分节不再各自带文件头。
  */
-export function renderMirrorText(type, memories, language = "zh") {
+export function renderMirrorText(type, memories, language = "zh", { fileHeader = true } = {}) {
   const name = TYPE_FILE[type];
   if (!name) return undefined;
   const items = (memories ?? [])
@@ -64,7 +147,7 @@ export function renderMirrorText(type, memories, language = "zh") {
     .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
   const header = STR.mirrorHeader[language](name);
   const body = items.map((m) => renderMemory(m, language)).join("\n");
-  return header + body;
+  return (fileHeader ? renderFileHeader(type, items) : "") + header + body;
 }
 
 /**
@@ -91,7 +174,7 @@ export function parseHumanEdits(text) {
   // A body line like "- **ID**: `x`" is not, so it never splits the block
   // or produces a ghost entry.
   // 解析同时接受两种语言的标签：切换语言前渲染的镜像文件仍能合并。
-  const anchors = [...normalized.matchAll(/^- \*\*ID\*\*: `([^`]+)`\n- \*\*(?:类型|Type)\*\*:/gm)];
+  const anchors = [...normalized.matchAll(ANCHOR_RE)];
   let prevEnd = 0;
   for (let i = 0; i < anchors.length; i++) {
     const anchor = anchors[i];
@@ -109,7 +192,7 @@ export function parseHumanEdits(text) {
     let body = normalized
       .slice(blockStart, blockEnd)
       .replace(/^- \*\*ID\*\*: `[^`]+`\n?/, "")
-      .replace(/^(- \*\*(?:类型|重要性|标签|更新时间|来源|Type|Importance|Tags|Updated|Source)\*\*:.*\n?)+/, "")
+      .replace(META_RUN_RE, "")
       .replace(/^<!-- mirror-digest: [a-f0-9]+ -->\n?/m, "");
     const separators = [...body.matchAll(/^---\s*$/gm)];
     const lastSep = separators[separators.length - 1];
@@ -120,7 +203,7 @@ export function parseHumanEdits(text) {
     // render time — the version token for detecting a concurrent store write
     // during a three-way merge of human edits (see service.syncMirror).
     const block = normalized.slice(blockStart, blockEnd);
-    const updatedMatch = block.match(/- \*\*(?:更新时间|Updated)\*\*: ([^\n]+)/);
+    const updatedMatch = block.match(UPDATED_RE);
     const digestMatch = block.match(/<!-- mirror-digest: ([a-f0-9]+) -->/);
     edits.push({
       id: anchor[1],
@@ -134,6 +217,15 @@ export function parseHumanEdits(text) {
     prevEnd = lineEnd === -1 ? normalized.length : lineEnd + 1;
   }
   return edits;
+}
+
+/**
+ * 判断「这份文本的内容有没有变」时忽略 generated.at：它每次渲染都是新时间戳，
+ * 带上它就永远判为变化。其余字节必须逐字相同才算没变——镜像的幂等性（同样的库
+ * 渲染两次得到同样的文件）才是可断言的。
+ */
+function stripGeneratedAt(text) {
+  return String(text).replace(/^generated\.at: .*$/m, "");
 }
 
 export function createMirror(dir, language = "zh") {
@@ -182,9 +274,19 @@ export function createMirror(dir, language = "zh") {
           // memories do not "resurrect" via readHumanEdits
           rmSync(file, { force: true });
         } else {
-          // 渲染走 renderMirrorText（与 /export 共用同一条渲染路径），磁盘镜像
-          // 与导出文本永远同构。
-          writeFileSync(file, renderMirrorText(type, items, language), "utf8");
+          // 渲染走 renderMirrorText（与 /export 共用同一条渲染路径）。
+          const text = renderMirrorText(type, items, language);
+          // 内容没变就不落盘。generated.at 每次渲染都新，无脑写会让编辑器、同步盘
+          // 与 git 在每次业务写后看到全部镜像文件「被外部修改」，而内容其实一字未
+          // 变；按 OKF 的语义它只该记内容变化，未变就保留旧值。这也是同步读 9 个
+          // 小文件的代价，比无谓写 9 次盘便宜。
+          let prev = null;
+          try {
+            prev = readFileSync(file, "utf8");
+          } catch { /* 首次写：读不到就是没有旧文件 */ }
+          if (prev === null || stripGeneratedAt(prev) !== stripGeneratedAt(text)) {
+            writeFileSync(file, text, "utf8");
+          }
         }
         results[type] = { ok: true };
       } catch (error) {

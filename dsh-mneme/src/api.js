@@ -1,7 +1,7 @@
 import { URL } from "node:url";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import { FEATURE_FLAG_SPEC } from "./settings.js";
-import { TYPE_FILE, renderMirrorText, parseHumanEdits } from "./mirror.js";
+import { TYPE_FILE, renderMirrorText, renderFileHeader, parseHumanEdits } from "./mirror.js";
 import { langOf } from "./lang.js";
 import { computeHeat } from "./heat.js";
 import { describeStreamFailure, resolveRoute } from "./dream.js";
@@ -973,9 +973,15 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
   });
 
   // --- 导出（面板备份/迁移）---------------------------------------------------
-  // 只读。json：全字段行（含 archived/forgotten，布尔化），updated_at DESC；
-  // markdown：按类型分节，块格式与磁盘镜像完全同构（renderMirrorText 与
-  // mirror.sync 共用同一条渲染路径），因此导出文本可以被 /import 原样吃回。
+  // 只读。json：全字段行（含 archived/forgotten，布尔化），updated_at DESC。
+  // markdown：一个文档 = 文档级 frontmatter + 按类型分节。frontmatter 只放文档
+  // 最前一份（分节不再各自带文件头，否则 9 个 `---` 块串在一个 .md 里，外部
+  // frontmatter 解析器只认第一段、其余降级成正文），它的 coverage: all 就是一句
+  // 看得见的声明：这份导出含 archived/forgotten（document 指针行除外——它两个
+  // 落点都不进，见 mirror.js 的 MIRROR_EXCLUDED_TYPES）。条目块与磁盘镜像同构（共用
+  // renderMirrorText 的条目渲染），所以导出文本能被 /import 原样吃回；「同构」
+  // 止于条目——磁盘镜像只写活跃集，导出的行集更宽，两者的覆盖声明因此不同
+  // （active-only vs all）。
   // 全量一次性取回（store.all 按 updated_at DESC）——导出是一次性备份动作，
   // 不需要流式。
   register({
@@ -1002,13 +1008,20 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
         }
         const byType = {};
         for (const row of rows) {
+          // 没有 TYPE_FILE 条目的 type 不进 markdown 导出——与磁盘镜像共用同一套
+          // 排除（见 mirror.js 的 MIRROR_EXCLUDED_TYPES：document 指针行）。json
+          // 分支是全字段导出，不受影响。
           if (TYPE_FILE[row.type]) (byType[row.type] ??= []).push(row);
         }
         const sections = [];
         for (const type of Object.keys(TYPE_FILE)) {
-          if (byType[type]?.length) sections.push(renderMirrorText(type, byType[type], langOf(config)));
+          if (byType[type]?.length) {
+            sections.push(renderMirrorText(type, byType[type], langOf(config), { fileHeader: false }));
+          }
         }
-        sendAttachment(res, 200, "text/markdown; charset=utf-8", `dsh-mneme-export-${stamp}.md`, sections.join("\n"));
+        const included = Object.values(byType).flat();
+        const docHeader = renderFileHeader("memory-export", included, "all");
+        sendAttachment(res, 200, "text/markdown; charset=utf-8", `dsh-mneme-export-${stamp}.md`, docHeader + sections.join("\n"));
       } catch {
         sendJson(res, 500, { error: "internal" });
       }
@@ -1016,9 +1029,8 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
   });
 
   // --- 导入（Markdown 镜像回填）----------------------------------------------
-  // 写路径（requireAuth）。body {type, markdown}：type 是镜像 TYPE_FILE 键
-  // （preference/project/decision/history/summary），markdown 是与镜像文件同构
-  // 的文本。解析复用 readHumanEdits 的纯函数核心 parseHumanEdits（同一实现，
+  // 写路径（requireAuth）。body {type, markdown}：type 是镜像 TYPE_FILE 键，
+  // markdown 是与镜像文件同构的文本。解析复用 readHumanEdits 的纯函数核心 parseHumanEdits（同一实现，
   // 行为一致是硬约束），合并走 mergeHumanEdits（只吃 title/content；digest 命
   // 中或无差异的条目在 service 侧自动跳过）。解析出 0 条不算错误。
   register({
