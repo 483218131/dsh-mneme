@@ -79,7 +79,7 @@ test("LocalEmbedder init threads resilientModelDownload and logger to engineFact
   assert.equal(seen.resilientModelDownload, false, "直连构造不显式给 true = 保持现状");
 });
 
-test("LocalEmbedder embed returns [n, dim] with mean pooling and chunking", async () => {
+test("LocalEmbedder embed returns [n, dim] with the model's pooling and chunking", async () => {
   const calls = [];
   const e = new LocalEmbedder({
     model: "Xenova/bge-small-zh-v1.5",
@@ -95,6 +95,18 @@ test("LocalEmbedder embed returns [n, dim] with mean pooling and chunking", asyn
   }
   // 3 texts at batchSize 2 -> two extractor calls.
   assert.deepEqual(calls.map((c) => c.count), [2, 1]);
+  // BGE 系按 CLS 训练（模型自带 1_Pooling/config.json: pooling_mode_cls_token=true）
+  assert.deepEqual(calls[0].opts, { pooling: "cls", normalize: true });
+});
+
+test("LocalEmbedder keeps mean pooling for models outside the CLS families", async () => {
+  const calls = [];
+  const e = new LocalEmbedder({
+    model: "sentence-transformers/all-MiniLM-L6-v2",
+    engineFactory: async () => makeFakeExtractor(384, calls)
+  });
+  await e.init();
+  await e.embed(["x"]);
   assert.deepEqual(calls[0].opts, { pooling: "mean", normalize: true });
 });
 
@@ -105,14 +117,45 @@ test("LocalEmbedder embedSingle returns a single vector", async () => {
   assert.equal(v.length, 384);
 });
 
+test("LocalEmbedder resolves pooling by model family, explicit value wins", async () => {
+  const cases = [
+    [{ model: "Xenova/bge-small-zh-v1.5" }, "cls", "BGE 默认 cls"],
+    [{ model: "BAAI/bge-m3" }, "cls", "BGE 大小写无关"],
+    [{ model: "sentence-transformers/all-MiniLM-L6-v2" }, "mean", "非 BGE 族保持 mean"],
+    [{ model: "Xenova/bge-small-zh-v1.5", pooling: "mean" }, "mean", "显式覆盖 auto"],
+    [{ model: "sentence-transformers/all-MiniLM-L6-v2", pooling: "cls" }, "cls", "显式覆盖非 BGE"],
+    [{ model: "Xenova/bge-small-zh-v1.5", pooling: "AUTO" }, "cls", "大小写/空白容错"],
+    [{ model: "Xenova/bge-small-zh-v1.5", pooling: " bogus " }, "cls", "未知值退回 auto"]
+  ];
+  for (const [opts, expected, why] of cases) {
+    const calls = [];
+    const e = new LocalEmbedder({ ...opts, engineFactory: async () => makeFakeExtractor(512, calls) });
+    assert.equal(e.pooling, expected, why);
+    await e.init();
+    await e.embed(["x"]);
+    assert.equal(calls[0].opts.pooling, expected, `${why}: 必须真的传进 extractor`);
+  }
+});
+
 test("LocalEmbedder dimension and modelHash are stable", () => {
   const a = new LocalEmbedder({ model: "Xenova/bge-small-zh-v1.5" });
   const b = new LocalEmbedder({ model: "Xenova/bge-small-zh-v1.5" });
   assert.equal(a.dimension, 512);
   assert.equal(a.modelHash, b.modelHash);
-  assert.match(a.modelHash, /^Xenova\/bge-small-zh-v1\.5#[0-9a-f]+$/);
+  // BGE 解析为 cls，且池化进指纹（否则旧索引不会被判失配、不会重建）
+  assert.match(a.modelHash, /^Xenova\/bge-small-zh-v1\.5@cls#[0-9a-f]+$/);
   // Different model -> different hash.
   assert.notEqual(a.modelHash, new LocalEmbedder({ model: "other/model" }).modelHash);
+  // 显式 mean 保持历史指纹形状，不给未受影响的索引制造无谓重建
+  assert.match(
+    new LocalEmbedder({ model: "Xenova/bge-small-zh-v1.5", pooling: "mean" }).modelHash,
+    /^Xenova\/bge-small-zh-v1\.5#[0-9a-f]+$/
+  );
+  // 两种池化是不同向量空间，绝不能共用一个指纹
+  assert.notEqual(
+    a.modelHash,
+    new LocalEmbedder({ model: "Xenova/bge-small-zh-v1.5", pooling: "mean" }).modelHash
+  );
 });
 
 test("LocalEmbedder throws before init and after dispose", async () => {

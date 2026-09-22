@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+## 🐛 修复
+
+- **本地嵌入对 BGE 系用错池化（静默偏差，不报错）**：`LocalEmbedder.embed()` 对所有本地模型硬编码
+  `pooling: "mean"`，但 BGE 系（含默认的 `Xenova/bge-small-zh-v1.5`）是按 **CLS** 训练的——模型自带的
+  `1_Pooling/config.json` 明确写着 `pooling_mode_cls_token: true` / `pooling_mode_mean_tokens: false`，
+  官方 README 亦为「select the last hidden state of the first token」+ L2 normalize。此前每次嵌入都用了
+  非训练口径的池化，向量系统性偏移、检索排序受损，且因为不抛错而完全不可观测。
+  新增 `localEmbedPooling`（`auto` 默认 = 按模型族判定，BGE → `cls`，其余 → `mean` 保持既有行为；
+  也可显式钉 `cls` / `mean`）。池化同时进 `modelHash`：默认 `mean` 保持历史指纹形状（未受影响的索引
+  无需重建），`cls` 独立成指纹 ⇒ 既有 mean 空间的索引会被索引一致性闸门判失配并自动重建。
+  测试 1275 → **1277**。
+
 ## [0.8.5] - 2026-09-21
 
 ## 🆕 新增

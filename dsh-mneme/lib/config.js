@@ -248,6 +248,18 @@ export const Config = z.object({
   localEmbedDimension: z.natural().default(512),
   localEmbedDevice: z.union([z.const("cpu"), z.const("gpu")]).default("cpu"),
   localEmbedBatchSize: z.natural().min(1).max(64).default(8),
+  // 本地嵌入的池化方式（**bug 修复，不是新能力**）：BGE 系是按 CLS 池化训练的——
+  // 模型自带的 `1_Pooling/config.json` 明确写着 `pooling_mode_cls_token: true` /
+  // `pooling_mode_mean_tokens: false`，官方 README 也是「select the last hidden state of
+  // the first token」+ L2 normalize；而 transformers.js 的 `feature-extraction` 默认 mean。
+  // ⇒ 此前本地嵌入对 BGE 系一直用错池化：**不报错、只是向量系统性偏差**，检索质量静默受损。
+  // 'auto' = 按模型族判定（BGE → cls，其余 → mean，未受影响的模型行为不变）；也可显式钉住。
+  // ⚠️ 池化决定向量空间，改它会改变 modelHash（见 local-embedder.js），既有索引会被判失配并重建。
+  localEmbedPooling: z.union([
+    z.const("auto"),
+    z.const("cls"),
+    z.const("mean")
+  ]).default("auto"),
 
   // Ollama embedder.
   ollamaBaseUrl: z.string().default("http://localhost:11434"),
