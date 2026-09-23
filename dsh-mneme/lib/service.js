@@ -1812,8 +1812,16 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     // 合法的空 Set 可迭代，保证 syncMirror 自身绝不抛（fail-safe）。
     const coveredTypes = new Set();
     try {
-      // 预先获取本次要覆盖的 type 集合（只调一次 store.list）
-      const list = store.list({ limit: 500, includeForgotten: false });
+      // 预先取本次要覆盖的全部活跃行（只读一次）。这里曾经是
+      // store.list({ limit: 500 })——活跃集超过 500 时镜像会静默少掉尾部记忆，
+      // 而文件本身没有任何提示（#278 第一批）。store.list 的 limit 默认值只有
+      // 50，比原来显式传的 500 更小，所以改用 all() 并在这里做同一套过滤
+      // （forgotten/archived 都不进镜像，与 includeForgotten:false + 默认
+      // includeArchived:false 等价）。
+      // 代价是全表读，且落在每次业务写后的最热路径上（#202 自记 all() 5k 行
+      // 231ms → ~135ms）。要压这一层得换按 type 分页取，属另一批的事；
+      // 在这里退回任何截断都不行——「宣称覆盖活跃集」与静默截断不能共存。
+      const list = store.all().filter((m) => !m.forgotten && !m.archived);
       for (const memory of list) {
         if (memory?.type && TYPE_FILE[memory.type]) {
           coveredTypes.add(memory.type);

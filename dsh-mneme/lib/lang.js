@@ -196,12 +196,12 @@ export const STR = {
 
   // --- mirror.js：镜像文件标签（渲染随实例语言；解析两种语言都认） ----------------
   mirrorLabel: {
-    zh: { type: "类型", importance: "重要性", tags: "标签", updated: "更新时间", source: "来源" },
-    en: { type: "Type", importance: "Importance", tags: "Tags", updated: "Updated", source: "Source" }
+    zh: { type: "类型", importance: "重要性", tags: "标签", updated: "更新时间", source: "来源", scope: "作用域", sensitivity: "敏感度" },
+    en: { type: "Type", importance: "Importance", tags: "Tags", updated: "Updated", source: "Source", scope: "Scope", sensitivity: "Sensitivity" }
   },
   mirrorHeader: {
-    zh: (name) => `# ${name} — dsh-mneme 镜像\n\n<!-- 手工编辑此文件会被合并回记忆库（人工优先）。 -->\n\n`,
-    en: (name) => `# ${name} — dsh-mneme mirror\n\n<!-- Manual edits to this file are merged back into the memory store (human edits win). -->\n\n`
+    zh: (name) => `# ${name} — dsh-mneme 镜像\n\n<!-- 条目标题与正文可编辑，会被合并回记忆库（人工优先）；文件头与条目元数据行由机器维护，改动会在下次同步时被覆盖。 -->\n\n`,
+    en: (name) => `# ${name} — dsh-mneme mirror\n\n<!-- Entry titles and bodies are editable and merged back into the memory store (human edits win); the file header and entry metadata lines are machine-owned and get overwritten on the next sync. -->\n\n`
   },
 
   prompts: PROMPTS

@@ -61,7 +61,7 @@
 
 ### 1.2 Markdown 镜像
 
-- 五个 `.md` 镜像文件（`preferences.md` / `projects.md` / `decisions.md` / `history.md` / `summary.md`）格式不变，双向同步、人工优先的规则不变
+- 镜像文件由五个增至九个（新增 `patterns.md` / `pitfalls.md` / `constraints.md` / `rejected-solutions.md`），每个文件开头新增 YAML frontmatter（`type` / `generated.by` / `generated.at` / `covered` / `coverage` / `tags`）；双向同步、人工优先的规则不变
 - 升级后首次启动仍执行"读取人工编辑 → 合并回库"，无竞态（先全量读取再统一合并）
 
 ### 1.3 dream_runs 审计表

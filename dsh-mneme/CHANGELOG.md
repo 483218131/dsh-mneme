@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+## 🆕 新增
+
+- **镜像与导出补齐落盘盲区、文件头 frontmatter、去掉 500 条静默截断（issue #278 第一批）**：
+  镜像与 markdown 导出的落点原先只有 5 个 type——`pitfall` / `constraint` / `rejected_solution` /
+  `pattern` 从不落盘，对近一半活跃记忆是盲的，且没有任何提示；同时 `syncMirror` 用
+  `store.list({ limit: 500 })` 取活跃行，活跃集超过 500 条时文件静默少掉尾部记忆，文件本身
+  也没有任何提示。① `TYPE_FILE` 补 `pitfalls.md` / `constraints.md` / `rejected-solutions.md` /
+  `patterns.md`（旧 5 个文件名不动），两处过滤（`syncMirror` 的 coveredTypes、`/export` 的
+  byType）随这张表扩自动收敛，不需要各自改一遍；`MIRROR_EXCLUDED_TYPES` 显式排除 `document`
+  指针行（镜像块渲染的字段里没有 `doc_path`，落盘会得到「看着完整、其实找不到文件」的视图），
+  `TYPES \ TYPE_FILE` 必须恰好等于该集合、测试双向钉住（漏的与重叠的都红），将来新增 type 必须
+  显式决定落不落镜像。② 文件头写 frontmatter（`type` / `generated.by` / `generated.at` /
+  `covered` / `coverage: active-only` / `tags` 并集），键名对齐 OKF v0.2 §4.1 与 §5.2，
+  `generated.by` 按 §7 的 actor 约定带版本号；条目级补 `作用域`（agent / workspace）与
+  `敏感度`，有值才渲染，值压成单行（值里的换行会伪造出条目头，属信任边界）；解析侧白名单正则
+  改由 `lang.js` 的 `mirrorLabel` 现算，渲染与解析单点定义。③ `syncMirror` 改 `store.all()` +
+  同一套 forgotten / archived 过滤（`store.list` 的 `limit` 默认值只有 50，不能只去掉 limit）；
+  代价是全表读落在每次业务写后的最热路径上（`all()` 5k 行 231ms → ~135ms，见 #202），不因此
+  退回任何截断——「宣称覆盖活跃集」与静默截断不能共存。④ 渲染先比对再写盘（比对时忽略
+  `generated.at`）：正文没变就不碰文件，否则每次业务写都让全部镜像文件的字节变化，编辑器与
+  文件监听器会看到「被外部修改」并提示重载（进行中的手工编辑有被冲掉的风险），同步盘与 git
+  每次写都产生无意义 diff；这同时正是 OKF 对 `generated.at` 的语义（只记内容上次真正变化）。
+  ⑤ `/export?format=markdown` 由「按类型分节、每节各带文件头」改成「一份文档级 frontmatter
+  （`type: memory-export` / `coverage: all`）+ 各类型分节」——9 段 frontmatter 串进同一个
+  `.md` 时只有第一段有效，其余 `---` 退化成分隔线、`tags:` 变成正文段落，正好顶掉「tag 落文件头
+  以便直接聚合」这个目的；条目块与镜像同构，导出文本仍能被 `/import` 原样吃回。`README.md` 与
+  `docs/MIGRATION.md` 里「五个 .md 镜像文件」的描述同步改为九个。测试 1294 → **1302**。
+
 ## [0.8.6] - 2026-09-23
 
 ## 🆕 新增

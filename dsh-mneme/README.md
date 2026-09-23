@@ -41,7 +41,7 @@ dsh web
 ### 记忆存储（SQLite + Markdown 镜像）
 
 - **SQLite 主存储**：`~/.dsh/memory/memory.db`，`node:sqlite` 内置，零原生依赖
-- **Markdown 镜像**：`preferences.md` / `projects.md` / `decisions.md` / `history.md` / `summary.md`，人类可读、可手工编辑（**人工修改优先**合并回库）
+- **Markdown 镜像**：按类型分文件（`preferences.md` / `projects.md` / `decisions.md` / `history.md` / `summary.md` / `patterns.md` / `pitfalls.md` / `constraints.md` / `rejected-solutions.md`），文件头是 YAML frontmatter（`type` / `generated.by` / `generated.at` / `covered` / `coverage` / `tags`）。人类可读，条目标题与正文可手工编辑（**人工修改优先**合并回库）；文件头与条目元数据行由机器维护
 - **9 种记忆类型**：`preference` 偏好 / `project` 项目 / `decision` 决策 / `history` 历史 / `summary` 会话总览 / `pattern` 模式 + 编码记忆三型 `rejected_solution` 被否方案 / `pitfall` 踩坑 / `constraint` 约束（v0.7.13 起，`codingRetrospect` 默认关；v0.7.11 近重写已收窄删除 user/fact 两型）
 - **镜像同步状态机（v0.3.6+）**：mirror 与主库强一致，用 `generation`（期望轮次）/ `applied_generation`（已应用轮次）建模同步债务
   - 业务写操作在**自身事务内原子递增** desired generation——崩溃在 COMMIT 后、渲染前，重启也能凭 durable 债务恢复，绝不静默跳过（v0.3.8）
