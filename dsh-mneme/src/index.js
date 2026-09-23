@@ -197,15 +197,6 @@ export const apply = (ctx, config) => {
   try {
     store.deleteOldFailures(new Date(Date.now() - 90 * 86400000).toISOString());
   } catch { /* non-fatal */ }
-  // Bug8: enforce llm_audit_logs retention on boot (config.llmAudit.retentionDays,
-  // default 90). Best-effort like the failure prune — the audit trail is
-  // bookkeeping and a failed purge must never block plugin boot.
-  try {
-    if (rawCfg.llmAudit?.enabled !== false) {
-      const retentionMs = Number.isInteger(rawCfg.llmAudit?.retentionDays) ? rawCfg.llmAudit.retentionDays : 90;
-      store.deleteOldLlmAudits(new Date(Date.now() - retentionMs * 86400000).toISOString());
-    }
-  } catch { /* non-fatal */ }
 
   // User-configurable settings (profile, rules, panel mode, standalone API
   // token) share the same SQLite file in dedicated tables, isolated from
@@ -243,6 +234,18 @@ export const apply = (ctx, config) => {
   for (const [objKey, sub] of Object.entries(nestedFlags)) {
     cfg[objKey] = { ...(cfg[objKey] ?? {}), ...sub };
   }
+
+  // Bug8 的启动期清理放在装配之后：面板把 llmAudit.* 写进 kv、经 nestedFlags 合进
+  // cfg，而写入侧（dream / summarize / 写入准入）读的都是装配后的 cfg——清理若读
+  // rawCfg，面板改了保留期它不认，更糟的是「开不开审计」与写入侧可能取到不同的值
+  // （raw 说关 → 不清理，cfg 说开 → 照写，审计表就无保留期地长）。保留期默认 90 天、
+  // 失败只 warn，与失败表清理同款：账本清理绝不许挡住插件启动。
+  try {
+    if (cfg.llmAudit?.enabled !== false) {
+      const retentionMs = Number.isInteger(cfg.llmAudit?.retentionDays) ? cfg.llmAudit.retentionDays : 90;
+      store.deleteOldLlmAudits(new Date(Date.now() - retentionMs * 86400000).toISOString());
+    }
+  } catch { /* non-fatal */ }
 
   // 记忆语言（memory.language）：本实例逐层传入 inject / summarize / dream /
   // sleep / mirror，多实例（如 agent preset 内挂载）互不影响。
