@@ -13,7 +13,7 @@
 
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, resolve, sep } from "node:path";
 import { scopeKeyOf } from "./scope.js";
 import { cosineSimilarity } from "./dream/clustering.js";
 
@@ -23,6 +23,37 @@ import { cosineSimilarity } from "./dream/clustering.js";
 // 新版判成「无近重复」，留下两行活跃摘要漂移——supersede 探测必须全时段。
 const DOCUMENT_MIN_SIM = 0.92;
 const CANDIDATE_LIMIT = 200;
+const DOCUMENT_DIR_NAME = "documents";
+
+/**
+ * 解析 managed 文档目录（#296 第二批）。`configured` 为空 = 跟随 memoryDir 的
+ * `<memoryDir>/documents/`；`~` / `~/` / `~\` 展开到用户 home；相对路径落在
+ * memoryDir 下（本键自己的规则：memoryDir 的相对路径原样留着走 cwd 语义）；
+ * 绝对路径归一化后原样用。纯函数，路径解析集中在 index.js 调用一次。
+ */
+export function resolveDocumentDir(memoryDir, configured = "") {
+  const raw = String(configured ?? "").trim();
+  if (!raw) return resolve(memoryDir, DOCUMENT_DIR_NAME);
+  if (raw === "~" || raw.startsWith("~/") || raw.startsWith("~\\")) {
+    return resolve(homedir(), raw.slice(2));
+  }
+  return isAbsolute(raw) ? resolve(raw) : resolve(memoryDir, raw);
+}
+
+/**
+ * 这个路径是不是落在 managed 目录里（`documentDir` 内 = mneme 管的树，`index.md`
+ * 与镜像 md 同权；之外 = 只登记指针行、正文一个字节都不碰）。比较前两边都归一化，
+ * Windows 上大小写不敏感（文件系统就是），否则 `C:\a\documents\x.md` 与
+ * `c:\A\Documents\x.md` 会被判成两类。
+ */
+export function isManagedDocumentPath(dir, path) {
+  if (!dir || !path) return false;
+  const norm = (p) => (process.platform === "win32" ? String(p).toLowerCase() : String(p));
+  const base = norm(resolve(dir));
+  const target = norm(resolve(path));
+  const prefix = base.endsWith(sep) ? base : base + sep;
+  return target === base || target.startsWith(prefix);
+}
 
 // 追加到被取代行正文的指针注记。刻意不带语言分支：id 是跨语言稳定键（用户
 // 对 tag/章节名建议用英文同理——指针性内容不翻译）；可追溯链 = 注记里的新行

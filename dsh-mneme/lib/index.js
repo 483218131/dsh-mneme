@@ -1,5 +1,7 @@
 import { createStore } from "./store.js";
 import { createMirror, TYPE_FILE } from "./mirror.js";
+import { createDocumentIndex } from "./document-index.js";
+import { resolveDocumentDir } from "./document.js";
 import { createService } from "./service.js";
 import { createTools } from "./tools.js";
 import { createInjector } from "./inject.js";
@@ -243,7 +245,26 @@ export const apply = (ctx, config) => {
   // 记忆语言（memory.language）：本实例逐层传入 inject / summarize / dream /
   // sleep / mirror，多实例（如 agent preset 内挂载）互不影响。
   const mirror = createMirror(memoryDir, langOf(cfg));
-  const service = createService({ store, mirror, config: cfg, logger: ctx.logger });
+
+  // #296 第二批：managed 文档目录。解析与 memoryDir 同一套（空 = 跟随 memoryDir 的
+  // <memoryDir>/documents/，~ 展开，相对路径落在 memoryDir 下）。索引对象总是建：
+  // 闸关时它只承担「清掉陈旧 index.md」这一件事，与 documents.md 在闸关时被镜像删
+  // 掉同一口径。建目录与写索引失败都只 warn，不阻断插件加载（它们是机器产物）。
+  const documentDir = resolveDocumentDir(memoryDir, cfg.documentDir);
+  const documentIndex = createDocumentIndex(documentDir, langOf(cfg));
+  if (cfg.documentMemoryEnabled === true) {
+    const ensured = documentIndex.ensure();
+    if (!ensured.ok) {
+      ctx.logger?.warn?.(`[dsh-mneme] documentDir is not writable: ${documentDir}: ${ensured.error}`);
+    }
+    // 启动即渲染一次：索引不该等到第一次业务写才存在（删掉它之后重启也能自愈）。
+    const synced = documentIndex.sync(store.list({ type: "document", limit: null }));
+    if (!synced.ok) ctx.logger?.warn?.(`[dsh-mneme] document index sync failed: ${synced.error}`);
+  } else {
+    documentIndex.remove();
+  }
+
+  const service = createService({ store, mirror, config: cfg, logger: ctx.logger, documentIndex });
 
   // F-NEW-03: if the mirror sync failed last run (persisted dirty state), retry
   // a safe re-render at boot so a stale mirror converges without needing a
