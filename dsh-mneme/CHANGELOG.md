@@ -17,6 +17,16 @@
 
 ## 🆕 新增
 
+- **存储无损回收维护入口（issue #275 第一批）**：新增 `src/maintenance.js` 与 `dsh-mneme reclaim`
+  子命令（standalone 数据面 `POST /maintenance/reclaim`）。两项零价值判断、零条数变化的回收：
+  `dream_runs.input` 按保留窗口（默认 7 天）置空，run 的骨架、LLM 决策原文与 receipt 一律留住、
+  永不删行（拍板 3：裁列同意、删行不同意）；归档行向量置空，检索 SQL 恒带 `archived = 0`、按定义
+  不可达。刻意不挂启动路径、不接定时器、不开 `auto_vacuum`：这是不可逆的内容丢弃，只由人显式触发
+  （默认 dry-run，带 `--apply` 才执行，`--vacuum` 单独指定）。报告口径按 VACUUM 前后体积量，列文本
+  大小只作上界；执行留一行 receipt（`llm_audit_logs`，`operation_type='storage_reclaim'`）。取消归档
+  时服务端重新排队嵌入，回收不是单程票。实测（活库副本上跑：177 个 run 的输入快照 + 295 行
+  归档向量，磁盘足迹 69.5 MiB 到 50.8 MiB，VACUUM 含 checkpoint 1.2 s）与代价见
+  [`docs/STORAGE.md`](docs/STORAGE.md)。
 - **MCP server 拆出独立包 `mneme-memory`（讨论 #300 双包方案第一批）**：根目录新增
   `mcp/` 包目录（bin 名 `mneme-mcp`），零依赖单文件从 `dsh-mneme/bin/` 迁出——工具面、
   渲染与 standalone API 数据面完全不变，插件包内旧 bin `dsh-mneme-mcp` 原样保留

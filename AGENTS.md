@@ -32,6 +32,7 @@ dsh-mneme 是 DSH 宿主的记忆插件（蒸馏 / 注入 / 检索 / 巩固 / sc
 |---|---|---|
 | 宿主挂载入口 | `src/index.js` | ctx 接线、memoryDir 解析、各管线启动、实体抽取触发点 |
 | 存储 | `src/store.js` | SQLite schema（memories / 实体三表 / dream_runs / recall_runs / 审计表）、幂等迁移 |
+| 存储生命周期 | `src/maintenance.js` | 无损回收维护入口（#275 第一批；`dsh-mneme reclaim`，默认 dry-run，VACUUM 单独指定） |
 | 服务层 | `src/service.js` | saveWithDedupe（去重键 type+title+scope 三元组）、fuseRecall 检索融合（keyword/vector/bm25/entity）、注入候选、镜像同步、冲突队列 |
 | 注入 | `src/inject.js` | 注入位构造、内容截断、跨轮轮换 |
 | 蒸馏 | `src/summarize.js` + `src/quality-filter.js` | 会话 → 记忆；质量打分与处置（归档/降权） |

@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS memories (
@@ -1858,6 +1859,106 @@ export function createStore(path) {
     return db.prepare("DELETE FROM llm_audit_logs WHERE timestamp < ?").run(before).changes;
   }
 
+  // --- 存储生命周期：无损回收（#275 第一批）--------------------------------
+  //
+  // 两项都零价值判断、零条数变化：行数不变，只把不可重建/不可达的内容丢掉。
+  // 删行不在本模块里（维护者拍板 3：裁列同意、删行不同意）——dream_runs 的骨架、
+  // LLM 决策原文与 receipt 永不删。
+
+  /**
+   * 历史 run 的输入快照统计（#275 A 项，dry-run 用）。
+   *
+   * `input` 这一列的含义**按 run_type 分叉**：auto / sleep 的 run 存的是当时的记忆库
+   * 快照（可由记忆库重建），organize 的 run 存的是 apply 的重放载荷——`organize.js`
+   * 的 apply 直接读它（`snapshot = Array.isArray(report.input) ? report.input : []`），
+   * 置空会让 apply 找不到候选、静默什么都不做却照写回执并盖上 applied_at，那份报告
+   * 从此永远重放不了。所以 organize 行不在可清范围里（同一列，两种语义，只能按 type 分）。
+   *
+   * `bytes` 是列文本大小，只作上界（真实释放看 VACUUM 前后）。
+   * @returns {{runs: number, bytes: number}}
+   */
+  function dreamRunInputStats(before) {
+    const row = db.prepare(
+      `SELECT count(*) AS c, COALESCE(SUM(LENGTH(input)), 0) AS b
+         FROM dream_runs
+        WHERE input IS NOT NULL AND created_at < ? AND run_type != 'organize'`
+    ).get(before);
+    return { runs: row.c, bytes: row.b };
+  }
+
+  /** 置空历史 run 的输入快照（organize 的重放载荷除外）。返回实际改动的行数。 */
+  function clearDreamRunInputs(before) {
+    return db.prepare(
+      `UPDATE dream_runs SET input = NULL
+        WHERE input IS NOT NULL AND created_at < ? AND run_type != 'organize'`
+    ).run(before).changes;
+  }
+
+  /**
+   * 归档行仍带的向量统计（#275 B 项）。检索 SQL 恒带 `archived = 0`，所以这部分
+   * 向量按定义不可达，清掉不改变任何检索结果。
+   * @returns {{rows: number, bytes: number}}
+   */
+  function archivedEmbeddingStats() {
+    const row = db.prepare(
+      `SELECT count(*) AS c, COALESCE(SUM(LENGTH(embedding)), 0) AS b
+         FROM memories WHERE archived = 1 AND embedding IS NOT NULL`
+    ).get();
+    return { rows: row.c, bytes: row.b };
+  }
+
+  /** 清掉归档行的向量。返回实际改动行数。 */
+  function clearArchivedEmbeddings() {
+    const changed = db.prepare(
+      "UPDATE memories SET embedding = NULL WHERE archived = 1 AND embedding IS NOT NULL"
+    ).run().changes;
+    // Issue #202 的单条失效点在 setEmbedding 里，批量清走不到它——整表清缓存最省事，
+    // 代价只是活跃行下次检索多解析一次（FIFO 上限 4000，自愈）。
+    if (changed > 0) embeddingCache.clear();
+    return changed;
+  }
+
+  /**
+   * 库文件与页统计（#275 报告口径）：回收收益按 VACUUM 前后体积量，不按列字节估——
+   * 实际释放来自溢出页与索引页的回收，列文本大小只是上界。
+   *
+   * 体积是**磁盘足迹**：WAL 模式下主文件之外还有 `-wal` / `-shm`，只量主文件会把
+   * 「刚清完还没落盘」的那部分算漏（实测过：VACUUM 后主文件可能一动不动，要等一次
+   * checkpoint）。所以三份一起量；`:memory:` 库没有文件。
+   */
+  function storageStats() {
+    const pageSize = db.prepare("PRAGMA page_size").get().page_size;
+    const pageCount = db.prepare("PRAGMA page_count").get().page_count;
+    const freelistCount = db.prepare("PRAGMA freelist_count").get().freelist_count;
+    const sizeOf = (p) => {
+      try {
+        return statSync(p).size;
+      } catch {
+        return 0;
+      }
+    };
+    let fileBytes = null;
+    if (typeof path === "string" && path !== ":memory:") {
+      fileBytes = sizeOf(path) + sizeOf(`${path}-wal`) + sizeOf(`${path}-shm`);
+    }
+    return { path: typeof path === "string" ? path : null, pageSize, pageCount, freelistCount, fileBytes };
+  }
+
+  /**
+   * 整库 VACUUM（#275 的手动步骤）：代价 O(库大小) 且需要排他写锁，所以只在显式
+   * 入口里跑，绝不挂启动路径、也不开 auto_vacuum。
+   *
+   * 收尾补一次 `wal_checkpoint(TRUNCATE)`：WAL 模式下 VACUUM 重排的是主文件里的页，
+   * 已回收的空间可能还挂在 WAL 里，不 checkpoint 就量不到体积下降——报告口径要的是
+   * 真实释放量，量不到等于没做（评审实测：VACUUM 后主文件长度不变，checkpoint 后才降）。
+   */
+  function vacuum() {
+    const started = Date.now();
+    db.exec("VACUUM");
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    return { duration_ms: Date.now() - started };
+  }
+
   // --- failure memories ----------------------------------------------------
 
   /**
@@ -2523,6 +2624,13 @@ export function createStore(path) {
     countLlmAudits,
     getLlmAuditStats,
     deleteOldLlmAudits,
+    // 存储生命周期（#275 第一批）：无损回收的统计、清理与体积口径。
+    dreamRunInputStats,
+    clearDreamRunInputs,
+    archivedEmbeddingStats,
+    clearArchivedEmbeddings,
+    storageStats,
+    vacuum,
     saveFailure,
     listFailures,
     getFailureStats,

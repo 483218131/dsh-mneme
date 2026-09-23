@@ -64,6 +64,13 @@ const USAGE = `${CLI_NAME} —— DSH 记忆插件（@modusensus/dsh-mneme）外
       [--importance n] [--tags a,b] [--source s] [--json]
                                新增记忆（type: preference | project | decision | summary | history）
   delete <id>                  删除记忆
+  reclaim [--older-than n] [--apply] [--vacuum] [--json]
+                               存储无损回收（默认只报数字，不动数据）
+                               --older-than n  输入快照保留窗口（天，默认 7；0 = 全部）
+                               --apply         真的执行（不带就是 dry-run）
+                               --vacuum        执行后整库 VACUUM（需配 --apply）
+                               只清「可由记忆库重建的输入快照」与「归档行的向量」，
+                               一条记忆都不删；收益按 VACUUM 前后体积量
 
 选项：
   --url <url>                  覆盖服务地址
@@ -83,7 +90,9 @@ const USAGE = `${CLI_NAME} —— DSH 记忆插件（@modusensus/dsh-mneme）外
   ${CLI_NAME} search "部署流程" --mode vector --topk 5
   ${CLI_NAME} add --type decision --title "采用 SQLite" --content "存储层使用 node:sqlite" --importance 4 --tags 存储,决策
   ${CLI_NAME} get 42
-  ${CLI_NAME} delete 42`;
+  ${CLI_NAME} delete 42
+  ${CLI_NAME} reclaim                       （先看：会清几行、库多大）
+  ${CLI_NAME} reclaim --apply --vacuum      （确认后执行，并把空间真的收回来）`;
 
 /* ---------------------------------- 参数解析 ---------------------------------- */
 
@@ -556,8 +565,83 @@ async function cmdDelete(cfg, rest) {
   }
 }
 
-/* ---------------------------------- 入口 ---------------------------------- */
+function formatBytes(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes)) return '?';
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1) return `${mb.toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
 
+function printReclaim(report, { applied }) {
+  const planned = report?.planned ?? {};
+  const cleared = report?.cleared ?? {};
+  const columnBytes = report?.column_bytes ?? {};
+  const size = report?.size ?? {};
+  console.log(`存储无损回收（${applied ? '已执行' : 'dry-run，未改动任何数据'}）`);
+  console.log(`  输入快照保留窗口: ${report?.olderThanDays ?? '?'} 天（cutoff ${report?.cutoff ?? '?'}）`);
+  const rows = (o) => `dream_runs.input ${o.dream_run_inputs ?? 0} 行 / 归档行向量 ${o.archived_embeddings ?? 0} 行`;
+  console.log(`  ${applied ? '已清理' : '将清理'}: ${rows(applied ? cleared : planned)}`);
+  console.log(
+    `  列文本大小（上界，非回收量）: ${formatBytes(columnBytes.dream_run_inputs)} / ${formatBytes(columnBytes.archived_embeddings)}`
+  );
+  if (!applied) {
+    console.log(
+      `  库文件: ${formatBytes(size.before_bytes)}（空闲页 ${size.freelist_pages ?? '?'} 页，可立刻回收约 ${formatBytes(size.freelist_bytes)}）`
+    );
+    console.log('');
+    console.log('  上面是 dry-run 的数字。确认后执行：');
+    console.log(`    ${CLI_NAME} reclaim --apply --vacuum`);
+    return;
+  }
+  const freed =
+    typeof size.before_bytes === 'number' && typeof size.after_bytes === 'number'
+      ? size.before_bytes - size.after_bytes
+      : null;
+  if (report?.vacuum?.error) {
+    console.log(`  VACUUM: 失败（${String(report.vacuum.error).slice(0, 120)}）`);
+    console.log('    清理已经完成且不可逆，文件暂时不会变小；库多半被别的进程占着锁，');
+    console.log('    稍后重跑一次 `reclaim --apply --vacuum` 即可（清理是幂等的）。');
+  } else {
+    console.log(
+      `  VACUUM: ${report?.vacuum?.ran ? `已跑（${report.vacuum.duration_ms ?? '?'} ms）` : '未跑（未带 --vacuum，文件不会变小）'}`
+    );
+  }
+  console.log(
+    `  库文件: ${formatBytes(size.before_bytes)} → ${formatBytes(size.after_bytes)}` +
+      (freed !== null && freed > 0 ? `（释放 ${formatBytes(freed)}）` : '')
+  );
+  console.log(`  耗时: ${report?.duration_ms ?? '?'} ms`);
+  if (report?.receipt) console.log(`  回执: llm_audit_logs #${report.receipt}`);
+}
+
+async function cmdReclaim(cfg, flags) {
+  requireToken(cfg);
+  const applied = flagBool(flags, 'apply');
+  const vacuum = flagBool(flags, 'vacuum');
+  if (vacuum && !applied) {
+    fail(
+      cfg,
+      `--vacuum 需要配 --apply：dry-run 不改数据，也就没有可回收的页。\n` +
+        `先看数字，再执行：${CLI_NAME} reclaim --apply --vacuum`
+    );
+  }
+  const olderThanDays = parseIntArg(cfg, flagValue(flags, 'older-than', 'olderThanDays'), '--older-than');
+  const body = { dryRun: !applied };
+  if (applied) {
+    // 服务端要求显式确认：这两步不可逆，缺 confirm 只会拿回一份 dry-run 报告。
+    body.confirm = true;
+  }
+  if (olderThanDays !== undefined) body.olderThanDays = olderThanDays;
+  if (vacuum) body.vacuum = true;
+  const data = await apiRequest(cfg, 'POST', '/maintenance/reclaim', { body });
+  if (cfg.jsonMode) {
+    console.log(stringify(data));
+  } else {
+    printReclaim(data, { applied });
+  }
+}
+
+/* ---------------------------------- 入口 ---------------------------------- */
 async function main(argv) {
   const { positionals, flags } = parseArgv(argv);
   const cmd = positionals[0];
@@ -592,6 +676,8 @@ async function main(argv) {
     case 'delete':
     case 'rm':
       return cmdDelete(cfg, rest);
+    case 'reclaim':
+      return cmdReclaim(cfg, flags);
     default:
       fail(cfg, `未知命令: ${cmd}\n运行 \`${CLI_NAME} --help\` 查看帮助。`);
   }
