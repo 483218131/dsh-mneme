@@ -1532,6 +1532,22 @@ export function createStore(path) {
     return rows.map(toDreamRun);
   }
 
+  // Issue #89：上次实际开跑时刻（epoch ms），从审计表恢复——调度器的 lastRunAt
+  // 只活在内存里，进程重启即归零，闸门对新实例放行 → 重启后立刻连发。审计表
+  // 本来就逐 run 落库（failed/degraded 也算 run），直接读它就是事实源，零迁移。
+  function lastDreamRunAt(runType = null) {
+    const row = runType
+      ? db.prepare(
+          "SELECT created_at FROM dream_runs WHERE run_type = ? ORDER BY created_at DESC, id LIMIT 1"
+        ).get(runType)
+      : db.prepare(
+          "SELECT created_at FROM dream_runs ORDER BY created_at DESC, id LIMIT 1"
+        ).get();
+    if (!row?.created_at) return 0;
+    const ms = Date.parse(row.created_at);
+    return Number.isFinite(ms) ? ms : 0;
+  }
+
   /**
    * Latest ruling-rule version seen on the audit trail. policy_epoch is a config
    * value stamped onto each run by the caller; reading the newest row's epoch
@@ -2486,6 +2502,7 @@ export function createStore(path) {
     needsEmbedding,
     searchVector,
     saveDreamRun,
+    lastDreamRunAt,
     getDreamRun,
     listDreamRuns,
     getLatestPolicyEpoch,

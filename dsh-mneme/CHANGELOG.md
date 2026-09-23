@@ -4,6 +4,14 @@
 
 ## 🐛 修复
 
+- **autoDream / sleep 的节流与冷却时刻跨重启持久化（issue #89 连发根因）**：两个调度器的
+  `lastRunAt` 只活在内存里，进程重启即归零——最小间隔 / 冷却闸对新实例放行，重启后立刻连发
+  （#89 Sample A/C 实测：横跨重启边界的 8.7 / 23.1 分钟间隔连发）。修复走审计表：`dream_runs`
+  本来就逐 run 落库（failed/degraded 也算 run），新增 `store.lastDreamRunAt(runType)` 读回最近
+  一次开跑时刻，构造 dream 调度器（全类型）与 sleep 调度器（`run_type='sleep'`）时注入种子——
+  零 schema 迁移、零新配置键。回归测试 +3（审计读回与 run_type 过滤、dream 重启闸、sleep 冷却
+  重启后按剩余窗口重排）。
+
 - **本地嵌入对 BGE 系用错池化（静默偏差，不报错）**：`LocalEmbedder.embed()` 对所有本地模型硬编码
   `pooling: "mean"`，但 BGE 系（含默认的 `Xenova/bge-small-zh-v1.5`）是按 **CLS** 训练的——模型自带的
   `1_Pooling/config.json` 明确写着 `pooling_mode_cls_token: true` / `pooling_mode_mean_tokens: false`，

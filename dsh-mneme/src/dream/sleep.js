@@ -686,10 +686,14 @@ export function createSleepScheduler({
   onRun = null,
   now = () => Date.now(),
   setTimeoutFn = setTimeout,
-  clearTimeoutFn = clearTimeout
+  clearTimeoutFn = clearTimeout,
+  // Issue #89 同族：冷却时刻由调用方从 dream_runs 审计表恢复（run_type='sleep'）——
+  // 内存变量进程重启即归零，冷却闸对新实例放行 → 重启后立即进入 sleep 冷却盲区。
+  // 测试注入 0（默认）即保持旧行为。
+  lastRunAtSeed = 0
 }) {
   let lastWriteAt = now();
-  let lastRunAt = 0;
+  let lastRunAt = lastRunAtSeed;
   let running = false;
   let disposed = false;
   let idleTimer = null;

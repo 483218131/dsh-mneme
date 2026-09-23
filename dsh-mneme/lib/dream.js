@@ -744,7 +744,7 @@ export async function maintainIndexAfterDream(decisions, service, semantic) {
   if (embedder.modelHash) vectorIndex.markModel?.(embedder.modelHash, embedder.dimension);
 }
 
-export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChars = 5000, delayMs = 2000, minIntervalMs = 0, logger, semantic = null }) {
+export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChars = 5000, delayMs = 2000, minIntervalMs = 0, logger, semantic = null, lastRunAtSeed = 0 }) {
   let pendingTimer = null;
   let running = false;
   let disposed = false;
@@ -752,7 +752,9 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
   let inFlight = null;
   // Issue #89（请求 2）：上一次实际开跑时刻。失败/degraded 的 run 也占用
   // 最小间隔——节流的目的正是防止失败调用连发；间隔内的触发静默跳过。
-  let lastRunAt = 0;
+  // lastRunAtSeed：调用方从 dream_runs 审计表读出的上次开跑时刻——
+  // 内存变量进程重启即归零，闸门对新实例放行 → 重启后立刻连发（#89 根因）。
+  let lastRunAt = lastRunAtSeed;
 
   function shouldTrigger(service) {
     const memories = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
