@@ -12,7 +12,9 @@ import { MEMORY_GUIDE_SECTION } from "../src/guide.js";
 //   总则段（常驻段必须同会话稳定，不逐轮复读）；
 // ②B1 pin 池（pinnedInjectBudget）：约束/偏好不进相关性竞争与跨轮轮换、逐字
 //   保真、排在块内排序之前，且有独立小预算（不占 maxInjectedItems 名额）。
-// 两个键都默认关/零，默认档下注入块与改动前逐字节一致（本文件第一例锁这条）。
+// 本文件给的是裸 config，两个键缺省时都按关/零算：能力说明的解析默认值由 config.js
+// 的 schema 给出（#249 第二批起为开，另见 test/inject-parent-gate.test.js），pin 池
+// 的默认值是 0。
 
 const userMsg = (text) => ({
   type: "user/message",
@@ -122,9 +124,12 @@ test("#249: pinned content does not eat the general block budget", () => {
   assert.ok(body.includes("总览正文必须带出来"), "普通候选照旧拿完整正文：pin 不占共享预算");
 });
 
-test("#249: capability guide is off by default, registered once when on", () => {
+test("#249: capability guide registers exactly once, and stays off when the key is absent", () => {
+  // 这里给的是裸 config（不经 schema 解析），所以「缺键 = 不生效」；生产默认值
+  // 由 config.js 的 schema 给出（#249 第二批起为 true），那条锁在
+  // test/inject-parent-gate.test.js。
   const off = setup({});
-  assert.equal(off.sections.length, 0, "default off → no prompt section registered");
+  assert.equal(off.sections.length, 0, "缺键 → 不注册提示段");
 
   const on = setup({ injectGuidanceEnabled: true });
   assert.equal(on.sections.length, 1, "exactly one guide section");

@@ -45,7 +45,8 @@ const FEATURE_FLAG_BOOLEANS = [
   "hotMemoryEnabled",
   // Issue #239 第 5 项：注入条数的查询自适应（确定性强则收缩注入条数，默认关）。
   "injectUncertaintyAdaptive",
-  // Issue #249 第一批：能力说明（工具描述判断指引 + order 150 总则段，默认关）。
+  // Issue #249：能力说明（工具描述判断指引 + order 150 总则段）。第二批起它是
+  // 注入父开关 autoInject 的子项、默认开（父关时不生效，闸门见 config.js）。
   "injectGuidanceEnabled",
   "entityExtractionEnabled",
   // Issue #219：图召回轴——查询命中实体名时把挂联记忆并入检索融合池

@@ -369,6 +369,7 @@ window.__ModuleLoader__.load({
         "memory.features.autoInject.hint": "每轮对话自动携带相关记忆",
         "memory.features.injectGuidanceEnabled": "能力说明",
         "memory.features.injectGuidanceEnabled.hint": "在工具描述与一次性提示段里说明怎么用记忆（何时查、何时写、拿不准就不做）",
+        "memory.features.parentOff": "父开关关闭时不生效",
         "memory.features.autoSummarize": "自动总结",
         "memory.features.autoSummarize.hint": "对话结束自动提炼记忆条目",
         "memory.features.hotMemoryEnabled": "热记忆",
@@ -755,6 +756,7 @@ window.__ModuleLoader__.load({
         "memory.features.autoInject.hint": "Carry relevant memories into every turn",
         "memory.features.injectGuidanceEnabled": "Capability guide",
         "memory.features.injectGuidanceEnabled.hint": "Explain how to use memory (when to search, when to save, when to do nothing) in tool descriptions plus a one-time prompt section",
+        "memory.features.parentOff": "Inactive while auto injection is off",
         "memory.features.autoSummarize": "Auto summarization",
         "memory.features.autoSummarize.hint": "Distill memory entries when a conversation ends",
         "memory.features.hotMemoryEnabled": "Hot memory",
@@ -1910,8 +1912,14 @@ window.__ModuleLoader__.load({
     // 分组排版：核心/增强/巩固常驻，注入策略等收进「高级」折叠，普通用户
     // 不被专业项淹没。429 调速器参数、distillMaxChars、codingBoostFactor
     // 属调优噪音，按对齐结论留在配置文件，不上 UI。
+    // #249 第二批：注入形态的父／子开关（父 = autoInject）。子项紧跟父行、缩进
+    // 显示；父关时子项加一句「不生效」，但开关仍可点——父关是「不生效」而不是
+    // 「重置用户配置」，子项自己勾着的值要留着，也应该能提前设好。同一份关系在
+    // 后端 src/config.js 的 INJECT_CHILD_FLAGS（运行时闸门），两侧漂移由
+    // test/inject-parent-gate.test.js 钉住。
+    const FEATURE_CHILDREN = { autoInject: ["injectGuidanceEnabled"] };
     const FEATURE_GROUPS = [
-      { key: "group.core", items: ["autoInject", "injectGuidanceEnabled", "autoSummarize", "hotMemoryEnabled", "memoryQualityFilter.enabled", "llmAudit.enabled"] },
+      { key: "group.core", items: ["autoInject", "autoSummarize", "hotMemoryEnabled", "memoryQualityFilter.enabled", "llmAudit.enabled"] },
       { key: "group.enhance", items: ["entityExtractionEnabled", "codingRetrospect", "rerankEnabled", "resilientModelDownload", "searchSemanticDedup", "bm25SearchEnabled", "heatEnabled", "documentMemoryEnabled"] },
       { key: "group.dream", items: ["autoDream", "sleepModeEnabled"] },
       // v0.8.0 A4（issue #17）：作用域隔离组——标注总开关 + 严格硬过滤。
@@ -1925,8 +1933,8 @@ window.__ModuleLoader__.load({
     // 实体抽取思考强度（issue #109）：与后端 FEATURE_FLAG_ENUMS 枚举对齐。
     const ENTITY_REASONING = ["none", "low", "medium", "high"];
 
-    function FeatureRow({ name, hint, on, disabled, onToggle }) {
-      return h("div", { className: "mneme-featrow" },
+    function FeatureRow({ name, hint, on, disabled, onToggle, sub }) {
+      return h("div", { className: "mneme-featrow", style: sub ? { paddingLeft: 18, opacity: 0.86 } : undefined },
         h("div", { className: "mneme-featmain" },
           h("div", { className: "mneme-featname" }, name),
           h("div", { className: "mneme-feathint" }, hint)
@@ -2017,14 +2025,23 @@ window.__ModuleLoader__.load({
         put({ [key]: raw });
       };
 
-      const boolRow = (k) => h(FeatureRow, {
+      const boolRow = (k, opts = {}) => h(FeatureRow, {
         key: k,
         name: t(`memory.features.${k}`),
-        hint: t(`memory.features.${k}.hint`),
+        hint: t(`memory.features.${k}.hint`)
+          + (opts.gate && !eff[opts.gate] ? ` · ${t("memory.features.parentOff")}` : ""),
         on: !!eff[k],
         disabled: busy,
+        sub: !!opts.sub,
         onToggle: () => put({ [k]: !eff[k] })
       });
+
+      // 带子项的父开关：父行 + 紧随其后的子行（子行缩进，父关时标注不生效）。
+      const flagRow = (k) => {
+        const kids = FEATURE_CHILDREN[k];
+        if (!kids) return boolRow(k);
+        return h(react.Fragment, { key: k }, boolRow(k), kids.map((c) => boolRow(c, { sub: true, gate: k })));
+      };
 
       // 模型枚举项的统一形状：string 或 {id, name?}（/llm-providers 契约）。
       const modelLabel = (m) => (typeof m === "string" ? m : String((m && (m.name || m.id)) ?? ""));
@@ -2216,7 +2233,7 @@ window.__ModuleLoader__.load({
           : h(react.Fragment, null,
               FEATURE_GROUPS.map((g) => h(react.Fragment, { key: g.key },
                 h("div", { className: "mneme-featgroup" }, t(`memory.features.${g.key}`)),
-                g.items.map(boolRow),
+                g.items.map(flagRow),
                 g.key === "group.enhance" && h(react.Fragment, null, embedSub, entitySub),
                 g.key === "group.dream" && h(react.Fragment, null, dreamSub, sleepSub)
               )),
@@ -2230,7 +2247,7 @@ window.__ModuleLoader__.load({
                   h(Icon, { name: showAdv ? "chevronDown" : "chevronRight", size: 12 }),
                   t("memory.features.advancedToggle"))
               ),
-              showAdv && FEATURE_ADVANCED_BOOLS.map(boolRow)
+              showAdv && FEATURE_ADVANCED_BOOLS.map((k) => boolRow(k))
             )
       );
     }

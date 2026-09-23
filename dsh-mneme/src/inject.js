@@ -3,6 +3,7 @@ import { createHotMemory } from "./hot-memory.js";
 import { STR, langOf } from "./lang.js";
 import { MEMORY_GUIDE_SECTION } from "./guide.js";
 import { adaptiveInjectBudget } from "./search/adaptive.js";
+import { injectChildEnabled } from "./config.js";
 
 // Issue #179：注入预览的数据底座。systemPrompt 渲染是同步回调，面板只能事后
 // 拉取，所以在这里旁路缓存「最近一帧组装」——快照就是本次渲染用过的同一份
@@ -283,12 +284,15 @@ export function createInjector(ctx, service, settings, config) {
     return escapePromptVars(lines.join("\n"));
   }
 
-  // #249 第一批：能力说明的系统提示段。order 150 = 插件指引段的既有惯例
+  // #249 能力说明的系统提示段。order 150 = 插件指引段的既有惯例
   // （ACP 的 ACP_SYSTEM_PROMPT 与 mnemon 的 routing 段都在 150）。文本是常量、
   // 同会话内不随轮次变化，故不影响其后的前缀缓存，也不逐轮复读。宿主若不提供
   // section seam 就静默跳过——#249 §3 的口径是「只用现成 seam，拿不到位的语义
   // 降级处理」：能力说明仍落在工具描述上，不算失败。
-  const guideSection = config.injectGuidanceEnabled === true && typeof ctx.systemPrompt?.section === "function"
+  // 走父／子闸门（#249 第二批）：注入器本身只在 `autoInject` 开时挂载，这里是
+  // 第二道、也是同一个判据的显式落点——两处消费点共用 injectChildEnabled，
+  // 不在各自的地方重写「父关则子不生效」。
+  const guideSection = injectChildEnabled(config, "injectGuidanceEnabled") && typeof ctx.systemPrompt?.section === "function"
     ? ctx.systemPrompt.section({ name: "memory-guide", order: 150, text: MEMORY_GUIDE_SECTION })
     : null;
 
