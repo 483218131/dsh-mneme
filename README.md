@@ -10,7 +10,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3E63DD?style=flat-square" alt="license"></a>
   <a href="https://github.com/slow-stack/dsh-mneme/actions"><img src="https://img.shields.io/github/actions/workflow/status/slow-stack/dsh-mneme/ci.yml?style=flat-square&label=CI" alt="CI"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-22%2B-3E63DD?style=flat-square&logo=nodedotjs&logoColor=white" alt="node"></a>
-  <a href="https://github.com/slow-stack/dsh-mneme"><img src="https://img.shields.io/badge/tests-1275%20passed-3E63DD?style=flat-square" alt="tests"></a>
+  <a href="https://github.com/slow-stack/dsh-mneme"><img src="https://img.shields.io/badge/tests-1290%20passed-3E63DD?style=flat-square" alt="tests"></a>
   <a href="https://codecov.io/gh/slow-stack/dsh-mneme"><img src="https://img.shields.io/codecov/c/github/slow-stack/dsh-mneme/main?style=flat-square" alt="coverage"></a>
   <a href="https://github.com/awesome-dsh-plugin/awesome-dsh-plugin"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome"></a>
 </p>
@@ -153,7 +153,7 @@ dsh web
 | **v0.5** | 召回融合与记忆可视化：BM25 + 图谱 + 热记忆 | ✅ |
 | **v0.6** | 会话生命周期：删对话 ≠ 删记忆 | ✅ |
 | **v0.7** | 自进化记忆：热度衰减 + 睡眠双保护 + 桌面端工作台/功能开关 | ✅ |
-| **v0.8** | 作用域隔离（agent/workspace 双维隔离 + 检索加权 + opt-in 硬过滤）+ 冲突队列人工裁决 + 归属显式声明 + 生态化（stdio MCP server / 图召回轴 / 冷启动 / 注入截断与状态条 / 蒸馏可靠性 / 注入形态与 agent 主动整理接口） | ✅ 已发布（至 v0.8.5） |
+| **v0.8** | 作用域隔离（agent/workspace 双维隔离 + 检索加权 + opt-in 硬过滤）+ 冲突队列人工裁决 + 归属显式声明 + 生态化（stdio MCP server / 图召回轴 / 冷启动 / 注入截断与状态条 / 蒸馏可靠性 / 注入形态与 agent 主动整理接口） | ✅ 已发布（至 v0.8.6） |
 
 > 完整逐小版本路线图见 [dsh-mneme/README.md](dsh-mneme/README.md#-进化路线图)。
 
@@ -161,7 +161,7 @@ dsh web
 
 ```bash
 cd dsh-mneme && npm install
-npm test        # 1275 个测试
+npm test        # 1290 个测试
 npm run stress  # 三轴线压测
 npm run sync    # src → lib 同步
 ```
@@ -314,7 +314,7 @@ It works out of the box. To feel its value in five minutes:
 | **v0.5** | Recall fusion & visualization: BM25 + graph + hot memory | ✅ |
 | **v0.6** | Session lifecycle: delete session ≠ delete memory | ✅ |
 | **v0.7** | Self-evolving memory: heat decay + sleep dual-protection + desktop workbench/feature toggles | ✅ |
-| **v0.8** | Scope isolation (agent/workspace stamping + retrieval weighting + opt-in hard filter) + conflict review queue + explicit attribution + ecosystem (stdio MCP server / graph recall axis / cold-start bootstrap / injection truncation & status bar / distill reliability / injection shaping & agent-driven organize) | ✅ Released (up to v0.8.5) |
+| **v0.8** | Scope isolation (agent/workspace stamping + retrieval weighting + opt-in hard filter) + conflict review queue + explicit attribution + ecosystem (stdio MCP server / graph recall axis / cold-start bootstrap / injection truncation & status bar / distill reliability / injection shaping & agent-driven organize) | ✅ Released (up to v0.8.6) |
 
 > Full per-minor-version roadmap in [dsh-mneme/README.md](dsh-mneme/README.md#-evolution-roadmap).
 
@@ -322,7 +322,7 @@ It works out of the box. To feel its value in five minutes:
 
 ```bash
 cd dsh-mneme && npm install
-npm test        # 1275 tests
+npm test        # 1290 tests
 npm run stress  # three-axis stress test
 npm run sync    # src → lib sync
 ```

@@ -459,6 +459,7 @@ export const apply = (ctx, config) => {
       minIntervalMs: (cfg.dreamMinIntervalMinutes ?? 0) * 60000,
       logger: ctx.logger,
       semantic: { embedder, vectorIndex },
+      lastRunAtSeed: store.lastDreamRunAt("auto"),
       onRun: () => (dream ? dream.runDream(ctx, service, cfg) : Promise.resolve({ ok: true, skipped: true }))
     });
     service.setDreamHook(() => dream.maybeSchedule(service));
@@ -475,6 +476,7 @@ export const apply = (ctx, config) => {
       service,
       config: cfg,
       logger: ctx.logger,
+      lastRunAtSeed: store.lastDreamRunAt("sleep"),
       onRun: (signal) => (sleep ? runSleep(ctx, service, cfg, ctx.logger, { embedder, vectorIndex }, signal) : Promise.resolve({ ok: true, skipped: true }))
     });
     service.setSleepHook(() => sleep.noteWrite());
