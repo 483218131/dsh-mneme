@@ -17,6 +17,12 @@
 
 ## 🆕 新增
 
+- **MCP server 拆出独立包 `mneme-memory`（讨论 #300 双包方案第一批）**：根目录新增
+  `mcp/` 包目录（bin 名 `mneme-mcp`），零依赖单文件从 `dsh-mneme/bin/` 迁出——工具面、
+  渲染与 standalone API 数据面完全不变，插件包内旧 bin `dsh-mneme-mcp` 原样保留
+  （向后兼容，已部署挂载零迁移）。新增 env 别名 `MNEME_URL` / `MNEME_TOKEN`（与
+  `DSH_MNEME_*` 同级、后者优先，config 文件不收新键）；跨包平价回归测试锁新包
+  工具定义与 `src/tools.js` 逐字一致，漂移即红。mcp 包独立版本号从 0.1.0 起步。
 - **recall_runs 审计回执附带 per-source 检索信号（检索融合权重画像的前置侦察）**：
   `searchMemories` 的 recall 回执里每个 candidate 附 `signals`——keyword/vector/bm25/entity
   四路的融合前原始分。`fuseRecall` 本就无条件计算这组分数（此前只服务 `signalTransparency`
