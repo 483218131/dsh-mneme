@@ -129,7 +129,7 @@ dsh web
 
 ## 用在其他 AI 工具里（MCP）
 
-插件自带零依赖 stdio MCP server，任何 MCP 客户端都能挂载记忆六件套（`memory_save` / `memory_search` / `memory_list` / `memory_get` / `memory_update` / `memory_delete`）。
+插件自带零依赖 stdio MCP server（独立 npm 包 **`mneme-memory`**，bin 名 `mneme-mcp`），任何 MCP 客户端都能挂载记忆六件套（`memory_save` / `memory_search` / `memory_list` / `memory_get` / `memory_update` / `memory_delete`）。
 
 **前置条件（一次性）**：
 
@@ -140,14 +140,14 @@ dsh web
 
 | 客户端 | 挂载方式 |
 |--------|---------|
-| **Claude Code** | 项目根 `.mcp.json`：`{"mcpServers": {"dsh-mneme": {"command": "dsh-mneme-mcp", "env": {"DSH_MNEME_TOKEN": "<你的token>"}}}}` |
-| **Cursor** | 设置 → MCP → Add Server，command 填 `dsh-mneme-mcp`，env 加 `DSH_MNEME_TOKEN` |
-| **Codex** | `~/.codex/config.toml`：`[mcp_servers.dsh-mneme]` 段，`command = "dsh-mneme-mcp"`，`env = { DSH_MNEME_TOKEN = "<你的token>" }` |
-| **Hermes** | `~/.hermes/config.yaml` 的 `mcp_servers:` 段：`dsh-mneme: {command: "dsh-mneme-mcp", env: {DSH_MNEME_TOKEN: "<你的token>"}}`，重启生效 |
-| **OpenCode** | `opencode.json`：`{"mcp": {"dsh-mneme": {"type": "local", "command": ["dsh-mneme-mcp"], "environment": {"DSH_MNEME_TOKEN": "<你的token>"}}}}` |
-| **OpenClaw** | `openclaw mcp add dsh-mneme --command dsh-mneme-mcp --env DSH_MNEME_TOKEN=<你的token>`，或 Control UI → Settings → MCP |
+| **Claude Code** | 项目根 `.mcp.json`：`{"mcpServers": {"mneme-memory": {"command": "mneme-mcp", "env": {"MNEME_TOKEN": "<你的token>"}}}}` |
+| **Cursor** | 设置 → MCP → Add Server，command 填 `mneme-mcp`，env 加 `MNEME_TOKEN` |
+| **Codex** | `~/.codex/config.toml`：`[mcp_servers.mneme-memory]` 段，`command = "mneme-mcp"`，`env = { MNEME_TOKEN = "<你的token>" }` |
+| **Hermes** | `~/.hermes/config.yaml` 的 `mcp_servers:` 段：`mneme-memory: {command: "mneme-mcp", env: {MNEME_TOKEN: "<你的token>"}}`，重启生效 |
+| **OpenCode** | `opencode.json`：`{"mcp": {"mneme-memory": {"type": "local", "command": ["mneme-mcp"], "environment": {"MNEME_TOKEN": "<你的token>"}}}}` |
+| **OpenClaw** | `openclaw mcp add mneme-memory --command mneme-mcp --env MNEME_TOKEN=<你的token>`，或 Control UI → Settings → MCP |
 
-> 未全局安装 npm 包时，把 `command` 换成 `npx` 并追加参数 `-p @modusensus/dsh-mneme dsh-mneme-mcp`（Claude Code/OpenCode 写进 args 数组，Codex 写 `args = ["-p", "@modusensus/dsh-mneme", "dsh-mneme-mcp"]`）。配置细节、npx 挂法与安全注意事项见[完整文档](dsh-mneme/README.md#mcp-server任意-mcp-客户端接入)。
+> **旧挂载兼容**：已部署的 `dsh-mneme-mcp` + `DSH_MNEME_TOKEN` 写法继续有效（bin 与 env 变量均保留，无需迁移）。未全局安装 npm 包时，把 `command` 换成 `npx` 并追加参数 `-p mneme-memory mneme-mcp`（Claude Code/OpenCode 写进 args 数组，Codex 写 `args = ["-p", "mneme-memory", "mneme-mcp"]`）。配置细节与安全注意事项见[完整文档](dsh-mneme/README.md#mcp-server任意-mcp-客户端接入)。
 
 ## 文档
 
@@ -311,7 +311,7 @@ It works out of the box. To feel its value in five minutes:
 
 ## Use it in other AI tools (MCP)
 
-The plugin ships a zero-dependency stdio MCP server. Any MCP client can mount the six memory tools (`memory_save` / `memory_search` / `memory_list` / `memory_get` / `memory_update` / `memory_delete`).
+The plugin ships a zero-dependency stdio MCP server (standalone npm package **`mneme-memory`**, bin `mneme-mcp`). Any MCP client can mount the six memory tools (`memory_save` / `memory_search` / `memory_list` / `memory_get` / `memory_update` / `memory_delete`).
 
 **One-time prerequisites**:
 
@@ -322,14 +322,14 @@ The plugin ships a zero-dependency stdio MCP server. Any MCP client can mount th
 
 | Client | Setup |
 |--------|-------|
-| **Claude Code** | Project-root `.mcp.json`: `{"mcpServers": {"dsh-mneme": {"command": "dsh-mneme-mcp", "env": {"DSH_MNEME_TOKEN": "<your-token>"}}}}` |
-| **Cursor** | Settings → MCP → Add Server; command `dsh-mneme-mcp`, env `DSH_MNEME_TOKEN` |
-| **Codex** | `~/.codex/config.toml`: `[mcp_servers.dsh-mneme]` section, `command = "dsh-mneme-mcp"`, `env = { DSH_MNEME_TOKEN = "<your-token>" }` |
-| **Hermes** | `mcp_servers:` section of `~/.hermes/config.yaml`: `dsh-mneme: {command: "dsh-mneme-mcp", env: {DSH_MNEME_TOKEN: "<your-token>"}}`, then restart |
-| **OpenCode** | `opencode.json`: `{"mcp": {"dsh-mneme": {"type": "local", "command": ["dsh-mneme-mcp"], "environment": {"DSH_MNEME_TOKEN": "<your-token>"}}}}` |
-| **OpenClaw** | `openclaw mcp add dsh-mneme --command dsh-mneme-mcp --env DSH_MNEME_TOKEN=<your-token>`, or Control UI → Settings → MCP |
+| **Claude Code** | Project-root `.mcp.json`: `{"mcpServers": {"mneme-memory": {"command": "mneme-mcp", "env": {"MNEME_TOKEN": "<your-token>"}}}}` |
+| **Cursor** | Settings → MCP → Add Server; command `mneme-mcp`, env `MNEME_TOKEN` |
+| **Codex** | `~/.codex/config.toml`: `[mcp_servers.mneme-memory]` section, `command = "mneme-mcp"`, `env = { MNEME_TOKEN = "<your-token>" }` |
+| **Hermes** | `mcp_servers:` section of `~/.hermes/config.yaml`: `mneme-memory: {command: "mneme-mcp", env: {MNEME_TOKEN: "<your-token>"}}`, then restart |
+| **OpenCode** | `opencode.json`: `{"mcp": {"mneme-memory": {"type": "local", "command": ["mneme-mcp"], "environment": {"MNEME_TOKEN": "<your-token>"}}}}` |
+| **OpenClaw** | `openclaw mcp add mneme-memory --command mneme-mcp --env MNEME_TOKEN=<your-token>`, or Control UI → Settings → MCP |
 
-> If the npm package is not installed globally, use `npx` as the command with args `-p @modusensus/dsh-mneme dsh-mneme-mcp` (an args array in Claude Code/OpenCode; `args = ["-p", "@modusensus/dsh-mneme", "dsh-mneme-mcp"]` in Codex). Full config details, npx mounting, and security notes: [full docs](dsh-mneme/README.md#mcp-server任意-mcp-客户端接入) (Chinese).
+> **Legacy mounts keep working**: `dsh-mneme-mcp` + `DSH_MNEME_TOKEN` remain supported (both the bin and env vars are preserved; no migration needed). If the npm package is not installed globally, use `npx` as the command with args `-p mneme-memory mneme-mcp` (an args array in Claude Code/OpenCode; `args = ["-p", "mneme-memory", "mneme-mcp"]` in Codex). Full config details and security notes: [full docs](dsh-mneme/README.md#mcp-server任意-mcp-客户端接入) (Chinese).
 
 ## Docs
 
