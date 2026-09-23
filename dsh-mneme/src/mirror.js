@@ -13,19 +13,26 @@ export const TYPE_FILE = {
   pitfall: "pitfalls.md",
   constraint: "constraints.md",
   rejected_solution: "rejected-solutions.md",
-  pattern: "patterns.md"
+  pattern: "patterns.md",
+  document: "documents.md"
 };
 
-// 不落镜像的 type（#278 第一批）：document 行（#230）是指针行——记忆内容是摘要，
-// 真正的文档在 agent 侧那个文件里（库里多存 doc_path + evidence），而镜像块渲染的
-// 字段里没有 doc_path，落一个 documents.md 会得到「看着完整、其实找不到文件」的视图。
-// 它的落点属于 #230 那条线自己的决定，不在本批范围。这个排除由
-// test/mirror-types.test.js 钉死（TYPES \ TYPE_FILE 必须恰好等于本集合），将来新增
-// type 时必须显式决定它落不落镜像——静默漏掉才是 #278 要修的那种盲区。
-export const MIRROR_EXCLUDED_TYPES = new Set(["document"]);
+// 不落镜像的 type。现在是空集：document 由 #296 第二批收进来——第一版排除它的
+// 理由是「镜像块渲染的字段里没有 doc_path，落一个 documents.md 会得到看着完整、
+// 其实找不到文件的视图」，doc_path 进指针行以后这条理由不再成立。这个集合由
+// test/mirror-types.test.js 钉死（TYPES \ TYPE_FILE 必须恰好等于本集合）：将来
+// 新增 type 时必须显式决定它落不落镜像，静默漏掉才是 #278 要修的那种盲区。
+export const MIRROR_EXCLUDED_TYPES = new Set([]);
+
+// 只读视图（#296）：document 的镜像只有指针行（id + 标题 + 摘要首句 + doc_path），
+// 没有可编辑的正文，所以它不参与 readHumanEdits 的人改合并，手工改动一律被下次
+// 同步覆盖；导出/导入也不带它（那两个是 round-trip 通道，见 api.js）。
+export const MIRROR_READONLY_TYPES = new Set(["document"]);
 
 const ESCAPE = /([\\`*_[\]{}()#+.!|>~-])/g;
 const UNESCAPE = new RegExp("\\\\" + ESCAPE.source, "g");
+// 只读视图里摘要首句的字符上限（#296）：够定位就行，长摘要不该把一行撑成一段。
+const POINTER_MAX = 120;
 
 function esc(text) {
   return String(text).replace(ESCAPE, "\\$1");
@@ -130,6 +137,24 @@ export function renderFileHeader(type, items, coverage = "active-only") {
 }
 
 /**
+ * document 的只读视图一行（#296）：一句话定位 + 文件指针，正文按 doc_path 去读。
+ * 摘要首句按句末标点切，切不出来就整段（超长再按字符数兜底），保证「一行一个
+ * 文档」的形态不被长摘要撑破。
+ */
+function renderPointer(m) {
+  const flat = String(m.content ?? "").replace(/\s+/g, " ").trim();
+  // 句末标点切首句：中文的。！？ 后面通常不跟空格，不能像英文那样要求一个空白
+  // （要求了就一句都切不出来，整段摘要被当成「首句」塞进视图）。英文的 . 仍要求
+  // 后接空白或结尾，免得把 e.g. / v1.2 这类点号当成句末。
+  const first = flat.match(/^.*?(?:[。！？]|[!?]|[.](?=\s|$))|^.*$/s)?.[0] ?? flat;
+  // 按码点切，不按 UTF-16 码元：后者会在 emoji / 代理对中间落刀，落盘成 U+FFFD。
+  const chars = [...first];
+  const summary = chars.length > POINTER_MAX ? `${chars.slice(0, POINTER_MAX).join("")}…` : first;
+  const where = m.doc_path ? ` · \`${oneLine(m.doc_path)}\`` : "";
+  return `- \`${m.id}\` **${oneLine(m.title)}**：${oneLine(summary)}${where}\n`;
+}
+
+/**
  * Render one type's memories into exactly the mirror-file text (header +
  * per-memory blocks, updated_at DESC like sync). sync() writes this to disk;
  * the /export endpoint reuses the same entry blocks for its per-type sections,
@@ -137,7 +162,8 @@ export function renderFileHeader(type, items, coverage = "active-only") {
  * mergeHumanEdits. Unknown type → undefined.
  *
  * `fileHeader: false` 供 /export 用：一个文档只能有一个 frontmatter 块（在文档
- * 最前，见 api.js 的 /export），所以分节不再各自带文件头。
+ * 最前，见 api.js 的 /export），所以分节不再各自带文件头。只读 type（#296 的
+ * document）只走磁盘镜像这一条：渲染指针行 + 只读文件头，导出侧不取它。
  */
 export function renderMirrorText(type, memories, language = "zh", { fileHeader = true } = {}) {
   const name = TYPE_FILE[type];
@@ -145,8 +171,9 @@ export function renderMirrorText(type, memories, language = "zh", { fileHeader =
   const items = (memories ?? [])
     .slice()
     .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
-  const header = STR.mirrorHeader[language](name);
-  const body = items.map((m) => renderMemory(m, language)).join("\n");
+  const readonly = MIRROR_READONLY_TYPES.has(type);
+  const header = readonly ? STR.mirrorReadonlyHeader[language](name) : STR.mirrorHeader[language](name);
+  const body = items.map((m) => (readonly ? renderPointer(m) : renderMemory(m, language))).join("\n");
   return (fileHeader ? renderFileHeader(type, items) : "") + header + body;
 }
 
@@ -242,7 +269,10 @@ export function createMirror(dir, language = "zh") {
    * this wrapper only owns the "read file → text" side.
    */
   function readHumanEdits(type = undefined) {
-    const types = type ? [type] : Object.keys(TYPE_FILE);
+    // 只读 type 不参与人改合并（#296）：它们的文件里没有可编辑的正文，解析出来的
+    // 指针行文本若被当成「人改」写回库，会污染摘要。整类跳过，包括 type 指定的
+    // 那条调用路径。
+    const types = (type ? [type] : Object.keys(TYPE_FILE)).filter((t) => !MIRROR_READONLY_TYPES.has(t));
     const edits = [];
     for (const t of types) {
       const file = filePath(t);

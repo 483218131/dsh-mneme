@@ -64,6 +64,25 @@
   「父开关关闭时不生效」，开关本身仍可点——值要能提前设好；后端同一份关系由
   `test/inject-parent-gate.test.js` 做漂移检查（渲染点、双语计数、白名单三条断言；做过变异验证）。测试 1302 → **1307**。
 
+- **document 的落盘目录与归属：`documentDir`、`index.md` 机器所有、镜像只读视图（issue #296 第二批）**：
+  document 型记忆的正文归 agent，但落点由 agent 每次自己选，路径散落；镜像第一版还把它整个排除在
+  落盘之外（渲染字段里没有 `doc_path`，落了会得到「看着完整、其实找不到文件」的视图）。① `documentDir`：
+  默认 `<memoryDir>/documents/`（空串 = 跟随），`~` 与相对路径按 memoryDir 同一套解析（相对路径落在
+  memoryDir 下），目录按需创建、创建失败只 warn 不阻断——它是机器产物，不该因为一个不可写的路径让整个
+  插件加载失败；与 memoryDir 一样是路径配置，因此不进 feature flags 白名单、也不上 `/features` 面板。
+  ② managed / external 的边界：`documentDir` 内是 mneme 管的树（`index.md` 与镜像 md 同权），目录外只
+  登记指针行，正文一个字节都不碰；判定按归一化路径且 Windows 大小写不敏感，`documents-old` 这种前缀
+  相像的兄弟目录不算 managed。③ `<documentDir>/index.md`：整文件机器所有，一行一个 document
+  （id + 标题 + managed/external + 路径），可从库重建——文件里不写生成时间，删掉再同步得到逐字节相同的
+  文件；写失败只 warn，不让触发它的业务写失败。④ 镜像侧 `documents.md`：`MIRROR_EXCLUDED_TYPES` 清空、
+  document 收进 `TYPE_FILE`，但作为**只读视图**——一行 = id + 标题 + 摘要首句（上限 120 字符）+ `doc_path`，
+  不含正文，文件头换成「只读视图」那句；`MIRROR_READONLY_TYPES` 让它不参与 `readHumanEdits` 的人改合并，
+  导出/导入也不带它（那两个是 round-trip 通道，视图没有可回填的正文）。⑤ 两个落点共用既有
+  `documentMemoryEnabled` 闸（默认关）：闸关时 document 行不进渲染集，陈旧的 `documents.md` 由既有的
+  「空 type 删文件」路径清掉，`index.md` 由 `syncDocumentIndex` 一起清掉（留一份陈旧索引就是「看着还在、
+  其实已关」的视图，而且会列出已归档的行），闸重开后下一次业务写从库重建。`docs/MIGRATION.md` 与
+  `README.md` 的镜像文件清单同步改为十个并标出只读视图。测试 1307 → **1316**。
+
 ## [0.8.6] - 2026-09-23
 
 ## 🆕 新增

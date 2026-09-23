@@ -203,6 +203,17 @@ export const STR = {
     zh: (name) => `# ${name} — dsh-mneme 镜像\n\n<!-- 条目标题与正文可编辑，会被合并回记忆库（人工优先）；文件头与条目元数据行由机器维护，改动会在下次同步时被覆盖。 -->\n\n`,
     en: (name) => `# ${name} — dsh-mneme mirror\n\n<!-- Entry titles and bodies are editable and merged back into the memory store (human edits win); the file header and entry metadata lines are machine-owned and get overwritten on the next sync. -->\n\n`
   },
+  // document 的镜像只有指针行（#296 第二批）：没有可编辑的正文，手工改动一律被
+  // 下次同步覆盖——所以不能复用上面那句「可编辑、会被合并回记忆库」。
+  mirrorReadonlyHeader: {
+    zh: (name) => `# ${name} — dsh-mneme 只读视图\n\n<!-- 只含指针行：id + 标题 + 摘要首句 + 文件路径，不含正文。正文在路径指向的文件里，批注请写进记忆库；本文件由机器维护，手工改动会在下次同步时被覆盖。 -->\n\n`,
+    en: (name) => `# ${name} — dsh-mneme read-only view\n\n<!-- Pointer rows only: id + title + first sentence of the summary + file path, never the full text. The document itself lives at that path, annotations belong in the memory store, and this file is machine-owned: hand edits are overwritten on the next sync. -->\n\n`
+  },
+  // documentDir 的 index.md（#296 第二批）：整文件机器所有、可从库重建。
+  documentIndexHeader: {
+    zh: () => "# document 索引 — dsh-mneme\n\n<!-- 整文件机器所有，可从记忆库随时重建（所以这里不写生成时间）；要批注请写进记忆库（memory_save）。managed = 文件在 documentDir 内。 -->\n\n",
+    en: () => "# document index — dsh-mneme\n\n<!-- Machine-owned as a whole and rebuildable from the memory store at any time (which is why it carries no generation timestamp). Annotations belong in the memory store (memory_save). managed = the file sits inside documentDir. -->\n\n"
+  },
 
   prompts: PROMPTS
 };
