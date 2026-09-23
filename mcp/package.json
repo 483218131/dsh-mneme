@@ -1,0 +1,33 @@
+{
+  "name": "mneme-memory",
+  "version": "0.1.0",
+  "description": "Mneme memory tools as a stdio MCP server — cross-session memory for any MCP client (Claude Code / Cursor / Codex / Hermes / OpenCode / OpenClaw), backed by the dsh-mneme plugin's standalone API.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "mneme-mcp": "bin/mneme-mcp.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/slow-stack/dsh-mneme.git",
+    "directory": "mcp"
+  },
+  "bugs": {
+    "url": "https://github.com/slow-stack/dsh-mneme/issues"
+  },
+  "homepage": "https://github.com/slow-stack/dsh-mneme#readme",
+  "keywords": [
+    "mcp",
+    "memory",
+    "mneme",
+    "llm",
+    "agent",
+    "claude",
+    "codex",
+    "stdio",
+    "model-context-protocol"
+  ]
+}
