@@ -1,5 +1,5 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { createScopeResolver, normalizeExplicitScope } from "./scope.js";
+import { createScopeResolver, normalizeExplicitScope, sessionKeyOf } from "./scope.js";
 import { describeLocalRuntime, resolveRuntimeEntry } from "./runtime/loader.js";
 import { defaultRuntimeDir } from "./runtime/layout.js";
 import { hostModulesDir, loadRuntimeManifest, provisionRuntime } from "./runtime/provision.js";
@@ -165,6 +165,10 @@ export function createTools(ctx, service, config, embedder) {
           ? { value: normalizeExplicitScope(args.workspace_scope), source: "explicit" }
           : autoStamping && scope ? { value: scope.workspace_scope, source: "auto" } : null;
         const { action, memory } = service.saveWithDedupe({
+          // #254 写入准入（第一阶段只计量）的计数单位：会话键作为瞬时字段随写入
+          // 传递（与 _mergeInto / _overwrite 同款约定，不落库）。缺会话身份的宿主
+          // 返回 null = 这次写入不进预算。
+          _sessionKey: sessionKeyOf(exec),
           type: args.type,
           title: args.title,
           content: args.content,

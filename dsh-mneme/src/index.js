@@ -3,6 +3,8 @@ import { createMirror, TYPE_FILE } from "./mirror.js";
 import { createDocumentIndex } from "./document-index.js";
 import { resolveDocumentDir } from "./document.js";
 import { createService } from "./service.js";
+// #254 写入准入（第一阶段只计量，不拦截）：见 src/write-admission.js 的文件头。
+import { createWriteAdmission } from "./write-admission.js";
 import { createTools } from "./tools.js";
 import { createInjector } from "./inject.js";
 import { createSummarizer } from "./summarize.js";
@@ -264,7 +266,12 @@ export const apply = (ctx, config) => {
     documentIndex.remove();
   }
 
-  const service = createService({ store, mirror, config: cfg, logger: ctx.logger, documentIndex });
+  // 写入准入实例：本批次只做计量（决策恒放行、写审计行），所以不需要新开关——它
+  // 不改变任何写入行为，也不新增拦截分支；既有的 llmAudit.enabled 关掉时它同样
+  // 不写（那个开关连审计行的启动期清理一起关掉）。第二阶段把拦截打开时才按仓库
+  // 惯例引入 opt-in 默认关的配置键，届时只改这一个实例的构造与 service 的调用点。
+  const writeAdmission = createWriteAdmission({ store, config: cfg, logger: ctx.logger });
+  const service = createService({ store, mirror, config: cfg, logger: ctx.logger, documentIndex, writeAdmission });
 
   // F-NEW-03: if the mirror sync failed last run (persisted dirty state), retry
   // a safe re-render at boot so a stale mirror converges without needing a

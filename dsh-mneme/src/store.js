@@ -192,7 +192,8 @@ CREATE TABLE IF NOT EXISTS llm_audit_logs (
   status            TEXT NOT NULL,          -- success | error | skipped
   error_message     TEXT,
   related_memory_ids TEXT,                  -- JSON: ids the call operated on
-  metadata          TEXT                    -- JSON: free-form extras
+  metadata          TEXT,                   -- JSON: free-form extras
+  session_key       TEXT                    -- #254 写入准入的会话键（LLM 调用行恒 NULL）
 );
 CREATE INDEX IF NOT EXISTS idx_llm_audit_timestamp ON llm_audit_logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_llm_audit_source ON llm_audit_logs(trigger_source);
@@ -607,7 +608,9 @@ function toLlmAudit(row) {
     status: row.status,
     error_message: row.error_message ?? undefined,
     related_memory_ids: parseJsonArray(row.related_memory_ids),
-    metadata
+    metadata,
+    // #254 写入准入的会话键；LLM 调用行恒 NULL。
+    session_key: row.session_key ?? undefined
   };
 }
 
@@ -723,6 +726,13 @@ export function createStore(path) {
   addColumn("mirror_state", "generation", "ALTER TABLE mirror_state ADD COLUMN generation INTEGER NOT NULL DEFAULT 0");
   addColumn("mirror_state", "applied_generation", "ALTER TABLE mirror_state ADD COLUMN applied_generation INTEGER NOT NULL DEFAULT 0");
   addColumn("mirror_state", "type_status", "ALTER TABLE mirror_state ADD COLUMN type_status TEXT");
+
+  // #254 写入准入（第一阶段只计量）：准入决策行按会话聚合——「会话内新建了几行」
+  // 与「同话题重复间隔」都靠它算出来，所以会话键必须是可等值查询的列，而不是塞在
+  // metadata 里做 JSON 匹配。列可空且不带 DEFAULT（存量行零重写）。索引建在加列
+  // 之后：老库打开时列还不存在（SCHEMA 的 CREATE TABLE 只对新建库生效）。
+  addColumn("llm_audit_logs", "session_key", "ALTER TABLE llm_audit_logs ADD COLUMN session_key TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_llm_audit_session ON llm_audit_logs(session_key);");
 
   // Audit peer F: a legacy DB may hold a non-integer generation/applied_generation
   // (pre-v0.3.9 the JS gate truncated with Math.trunc and SQLite's CHECK only
@@ -1766,8 +1776,8 @@ export function createStore(path) {
     db.prepare(
       `INSERT INTO llm_audit_logs (timestamp, trigger_source, operation_type, model_id,
         input_tokens, output_tokens, total_tokens, cost_usd, duration_ms, status,
-        error_message, related_memory_ids, metadata)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        error_message, related_memory_ids, metadata, session_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       entry.timestamp ?? now,
       entry.trigger_source,
@@ -1783,18 +1793,24 @@ export function createStore(path) {
       JSON.stringify(entry.related_memory_ids ?? []),
       entry.metadata !== undefined
         ? (typeof entry.metadata === "string" ? entry.metadata : JSON.stringify(entry.metadata))
-        : null
+        : null,
+      entry.session_key ?? null
     );
     return toLlmAudit(db.prepare("SELECT * FROM llm_audit_logs ORDER BY id DESC LIMIT 1").get());
   }
 
-  function listLlmAudits({ limit = 50, offset = 0, source } = {}) {
+  function listLlmAudits({ limit = 50, offset = 0, source, sessionKey } = {}) {
     const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
     const clauses = [];
     const params = [];
     if (source) {
       clauses.push("trigger_source = ?");
       params.push(source);
+    }
+    // #254 写入准入：会话内的话题回填只需要该会话的行（走 idx_llm_audit_session）。
+    if (sessionKey) {
+      clauses.push("session_key = ?");
+      params.push(sessionKey);
     }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = db.prepare(
@@ -1803,12 +1819,16 @@ export function createStore(path) {
     return rows.map(toLlmAudit);
   }
 
-  function countLlmAudits({ source } = {}) {
+  function countLlmAudits({ source, sessionKey } = {}) {
     const clauses = [];
     const params = [];
     if (source) {
       clauses.push("trigger_source = ?");
       params.push(source);
+    }
+    if (sessionKey) {
+      clauses.push("session_key = ?");
+      params.push(sessionKey);
     }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     return db.prepare(`SELECT count(*) AS c FROM llm_audit_logs ${where}`).get(...params).c;

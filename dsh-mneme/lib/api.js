@@ -788,7 +788,11 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
         const page = Math.max(1, Number(url.searchParams.get("page") ?? 1) || 1);
         const pageSize = Math.min(200, Math.max(1, Number(url.searchParams.get("pageSize") ?? 50) || 50));
         const source = url.searchParams.get("source") ?? undefined;
-        const items = service.listLlmAudits?.({ limit: pageSize, offset: (page - 1) * pageSize, source }) ?? [];
+        // 写入准入（#254）的 session_key 是内部计数键——session_id 不是对外的归属
+        // 标识（见 scope.js 文件头），而本端点按注释在 apiToken 之下也保持开放，所以
+        // 不回传它。按会话离线聚合直接读库。
+        const items = (service.listLlmAudits?.({ limit: pageSize, offset: (page - 1) * pageSize, source }) ?? [])
+          .map((row) => (row.session_key === undefined ? row : { ...row, session_key: undefined }));
         const total = service.countLlmAudits?.({ source }) ?? items.length;
         sendJson(res, 200, { items, total, page, pageSize });
       } catch {
