@@ -876,12 +876,17 @@ export function createService({ store, mirror, config, onWrite, logger }) {
           mode,
           topK: lim,
           threshold: threshold ?? null,
+          // Per-source 信号随回执落盘（fuseRecall 本就无条件计算，此前只服务
+          // signalTransparency 展示）：复用侧查询画像（query 型 → 各路权重的
+          // 离线聚合，AssoMem arXiv 2510.10397 消融所示收益大头）需要这份原料。
+          // 纯加字段——recall_runs 无 schema 变更，旧行 candidates 缺该键照常读。
           candidates: result.map((m) => ({
             id: m.id,
             title: m.title,
             content: m.content,
             score: m.score ?? null,
-            source: m.source ?? "keyword"
+            source: m.source ?? "keyword",
+            signals: signals.get(m.id) ?? {}
           })),
           createdAt: new Date().toISOString()
         });

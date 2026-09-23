@@ -4,6 +4,14 @@
 
 ## 🆕 新增
 
+- **recall_runs 审计回执附带 per-source 检索信号（检索融合权重画像的前置侦察）**：
+  `searchMemories` 的 recall 回执里每个 candidate 附 `signals`——keyword/vector/bm25/entity
+  四路的融合前原始分。`fuseRecall` 本就无条件计算这组分数（此前只服务 `signalTransparency`
+  的展示装饰），现在随回执一起落进 `recall_runs.candidates`。纯加字段：无 schema 迁移、
+  无新配置开关、不改任何排序行为，旧行照常读；`mode='inject'` 的注入回执没有检索信号，
+  不加。动机：自适应融合加权的收益已被消融实验锚定（AssoMem, arXiv 2510.10397，去掉
+  自适应权重分配 Acc@10 -10.3），而查表版权重的离线聚合需要「per-source 分数 × 复用
+  数据」成对出现——先记录后立项，攒够 recall 数据再评估第二阶段。
 - **镜像与导出补齐落盘盲区、文件头 frontmatter、去掉 500 条静默截断（issue #278 第一批）**：
   镜像与 markdown 导出的落点原先只有 5 个 type——`pitfall` / `constraint` / `rejected_solution` /
   `pattern` 从不落盘，对近一半活跃记忆是盲的，且没有任何提示；同时 `syncMirror` 用
