@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## 🧹 清理
+
+- **移除过时文档**：`docs/devlog/`（6 篇 v0.1.x 开发日志，叙事已被 CHANGELOG 覆盖且全仓库零引用）、
+  `dsh-mneme/docs/MIGRATION.md`（v0.3→v0.4 升级说明，迁移幂等自动执行，现无适用场景）、根目录 `IDEA.md`
+  （未跟踪的早期头脑草稿）。双 README 与 CONTRIBUTING 目录树中指向 MIGRATION.md 的 6 处链接同步移除；
+  ENTITIES / SEMANTIC / LOCAL_MODEL / SLEEP 四篇专题文档不动。
+
 ## 🆕 新增
 
 - **recall_runs 审计回执附带 per-source 检索信号（检索融合权重画像的前置侦察）**：

@@ -110,7 +110,7 @@ dsh web
 - **Fail-safe**：每阶段独立 try/catch，LLM 故障只跳过对应阶段；无 LLM 路由时纯规则降级（demotion/relations）照常执行
 - **审计延续**：睡眠周期写入 `dream_runs`，`run_type='sleep'`，与 autoDream 共用审计表可追溯
 
-> 配置详见 `docs/SLEEP.md`；迁移说明见 `docs/MIGRATION.md`。
+> 配置详见 `docs/SLEEP.md`。
 
 官方设置面板 → 「记忆库设置」→「记忆」标签：按类型浏览、全文搜索；启用向量搜索后可用「语义」切换做向量召回。
 
@@ -175,7 +175,7 @@ v0.3.0 起新增**记忆基因**层：从记忆里抽取**命名实体**、**带
   - `attr:国籍` → 该属性键的**全部**当前有效记忆（value 为空契约）
 - **autoDream 联动**：update 决策写 `supersedes` 自引用（属性版本被替代）；merge 决策把 loser 的属性归属迁移到 keeper（keeper 已有同键当前值则失效）
 
-> 📖 详见 [实体结构化记忆设计](docs/ENTITIES.md) · [语义增强架构](docs/SEMANTIC.md) · [本地模型部署指南](docs/LOCAL_MODEL.md) · [从 v0.1 升级说明](docs/MIGRATION.md)
+> 📖 详见 [实体结构化记忆设计](docs/ENTITIES.md) · [语义增强架构](docs/SEMANTIC.md) · [本地模型部署指南](docs/LOCAL_MODEL.md)
 
 ### 记忆质量过滤 🧼（v0.4.6，默认开）
 
@@ -738,7 +738,6 @@ npm run sync       # 把 src/ 同步到 lib/（发布时由 prepack 钩子自动
 - [实体结构化记忆设计](docs/ENTITIES.md)
 - [语义增强架构](docs/SEMANTIC.md)
 - [本地模型部署指南](docs/LOCAL_MODEL.md)
-- [从 v0.1 升级说明](docs/MIGRATION.md)
 
 ## 🙏 致谢
 
