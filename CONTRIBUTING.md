@@ -24,7 +24,7 @@ dsh-mneme-repo/           # repo root (docs only, no package.json)
     ├── lib/              # build output; DSH actually loads lib/index.js
     ├── scripts/          # sync-lib.js, check-sync.js, e2e-dsh.js, stress-dsh.js, benchmark-*
     ├── test/             # node:test test suite
-    ├── docs/             # SEMANTIC / SLEEP / ENTITIES / MIGRATION deep-dives
+    ├── docs/             # SEMANTIC / SLEEP / ENTITIES / LOCAL_MODEL deep-dives
     ├── package.json      # plugin metadata and scripts
     └── cordis.patch.yml  # DSH injection patch
 ```
@@ -228,7 +228,7 @@ dsh-mneme-repo/           # 仓库根（仅文档清单，无 package.json）
     ├── lib/              # 构建产物，DSH 实际加载的是 lib/index.js
     ├── scripts/          # sync-lib.js、check-sync.js、e2e-dsh.js、stress-dsh.js、benchmark-*
     ├── test/             # node:test 测试
-    ├── docs/             # SEMANTIC / SLEEP / ENTITIES / MIGRATION 等专题文档
+    ├── docs/             # SEMANTIC / SLEEP / ENTITIES / LOCAL_MODEL 等专题文档
     ├── package.json      # 插件包元数据与 scripts
     └── cordis.patch.yml  # DSH 注入补丁
 ```
