@@ -77,12 +77,16 @@ export const Config = z.object({
   // maxInjectedItems 上限——只做**单向收缩**，绝不越过用户配置的上限；判据只看
   // 查询本身，不做额外检索（先探针检索等于白付一次 fuseRecall）。
   injectUncertaintyAdaptive: z.boolean().default(false),
-  // #249（第一批）：能力说明——「怎么用记忆」的判断指引。落两个零注入成本的
-  // 位：①`memory_search` / `memory_save` 的工具描述补一句判断指引（工具描述是
-  // 常驻文本，不进每轮上下文）；②一段 order 150 的系统提示段（一次性、同会话
-  // 内不随轮次变化，因此不作废前缀缓存），只讲总则（优先序、何时查、何时写、
-  // 何时 no-op）。默认关：关闭时工具描述与提示段与既有行为逐字节一致。
-  injectGuidanceEnabled: z.boolean().default(false),
+  // #249（第一批；第二批归位为注入子开关）：能力说明——「怎么用记忆」的判断
+  // 指引。落两个零注入成本的位：①`memory_search` / `memory_save` 的工具描述补
+  // 一句判断指引（工具描述是常驻文本，不进每轮上下文）；②一段 order 150 的
+  // 系统提示段（一次性、同会话内不随轮次变化，因此不作废前缀缓存），只讲总则
+  // （优先序、何时查、何时写、何时 no-op）。默认开＝基础档：#249 §10 的判据是
+  // 「只修正既有位、不引入新注入时机／新表面／额外 LLM 调用」的子项随父开关
+  // 生效——「agent 不知道何时该查、何时该写」是已实测的缺口，把它默认关着是反的。
+  // 父开关 `autoInject` 关闭时它不生效（闸门见 injectChildEnabled）；用户显式写进
+  // feature_flags 的值永远优先于这里的默认值。
+  injectGuidanceEnabled: z.boolean().default(true),
   // #249（第一批）：B1 pin 池预算——约束/偏好类注入条目的独立小上限。约束与
   // 偏好被静默降级是本议题的立项核心（同类知识与情景日志同池同速率摘要，实测
   // 一轮压缩后仅保 53%、五轮 10%），故这两类不进相关性竞争、不参与跨轮轮换、
@@ -607,6 +611,9 @@ const LIGHT_MODE_OFF = [
   "rerankEnabled",
   "autoReindexOnBoot",
   "hybridInject",
+  // #249 第二批：能力说明在轻量档保持关闭——它是工具描述与提示段上的额外常驻
+  // 文本，轻量档（小模型 / 小上下文）不该因默认值翻转而多付这份提示成本。
+  "injectGuidanceEnabled",
   "searchSemanticDedup",
   "selectiveInjectEnabled",
   "bm25SearchEnabled",
@@ -631,4 +638,36 @@ export function applyLightModePreset(cfg) {
   const preset = { ...cfg, lightMode: true };
   for (const key of LIGHT_MODE_OFF) preset[key] = false;
   return preset;
+}
+
+/**
+ * #249 第二批：注入形态的父／子开关。父 = `autoInject`（既有的挂载总闸，默认
+ * 开）。子项按 #249 §10 的判据分档——看它是否引入**新的注入时机／新的注入
+ * 表面／额外成本**：
+ *
+ * - 只修正既有每轮块内的位（能力说明）→ 随父开关生效，键的默认值给开；
+ * - 需要新时机或新表面（N2 回合结束提醒、N3 压缩边缘）→ 独立开关、默认关，
+ *   实现时挂到这张表下（今天还没有这两个键，故表里只有能力说明一项）。
+ *
+ * 语义：**父关 = 子项一律不生效，但子项的持久值原样保留**（父关是「不生效」，
+ * 不是「重置用户配置」）。用户显式写进 kv 的值也不因父关被改写。
+ *
+ * 闸门放在消费点而不是合并后的 cfg 上：压 cfg 会让 `/features` 的 effective
+ * 失去「子项自己勾着、父关时当前不生效」这个状态，面板就显示不出来。跨文件
+ * 契约见 test/inject-parent-gate.test.js（含面板侧关系的漂移检查）。
+ *
+ * 表里只放**顶层扁平键**：点号键（如 `memoryQualityFilter.enabled`）在合并后的
+ * cfg 里是嵌套对象，`cfg?.["a.b"]` 取不到，挂进来会恒判不生效且不报错。N2/N3
+ * 是扁平键，不受这条限制。
+ */
+export const INJECT_CHILD_FLAGS = Object.freeze({
+  autoInject: Object.freeze(["injectGuidanceEnabled"])
+});
+
+/** 子开关的运行时生效值：父开关显式关（false）时恒不生效。 */
+export function injectChildEnabled(cfg, key) {
+  for (const [parent, children] of Object.entries(INJECT_CHILD_FLAGS)) {
+    if (children.includes(key) && cfg?.[parent] === false) return false;
+  }
+  return cfg?.[key] === true;
 }

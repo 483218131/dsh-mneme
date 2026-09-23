@@ -6,6 +6,7 @@ import { hostModulesDir, loadRuntimeManifest, provisionRuntime } from "./runtime
 import { matchesPlatform } from "./runtime/closure.js";
 import { verifyPayload } from "./runtime/verify.js";
 import { TOOL_GUIDE } from "./guide.js";
+import { injectChildEnabled } from "./config.js";
 
 const TEXT_OUTPUT = (text) => [{ type: "text", text }];
 // Per-registry tool-name registry: guards against duplicate registration on
@@ -84,11 +85,13 @@ export function createTools(ctx, service, config, embedder) {
   // flag 关闭时恒返回 null——写入不标注，检索不加权，行为与 A1 前完全一致。
   // logger 透传：registry 反查失败时 warnOnce 才有出口（否则静默降级无观测）。
   const resolveSessionScope = createScopeResolver({ ctx, config, logger: ctx.logger });
-  // #249 第一批：能力说明（injectGuidanceEnabled）开启时，给「何时用」最有歧义
-  // 的两个工具补一句判断指引。工具描述常驻、不进每轮上下文，这个位子零注入
-  // 成本；关闭时描述逐字节不变，也不动其他工具的文案。
+  // #249 能力说明（injectGuidanceEnabled）：开启时给「何时用」最有歧义的两个
+  // 工具补一句判断指引。工具描述常驻、不进每轮上下文，这个位子零注入成本；
+  // 关闭时描述逐字节不变，也不动其他工具的文案。
+  // 它是注入父开关的子项（#249 第二批）：`autoInject` 关掉时这里同样不生效——
+  // 工具描述是这个子项唯一住在注入器之外的落点，不在闸门内就漏了。
   const withToolGuide = (name, description) =>
-    config?.injectGuidanceEnabled === true && TOOL_GUIDE[name] ? `${description}${TOOL_GUIDE[name]}` : description;
+    injectChildEnabled(config, "injectGuidanceEnabled") && TOOL_GUIDE[name] ? `${description}${TOOL_GUIDE[name]}` : description;
 
   // 复核项 4（issue #170）：strictScope 下他 scope（explicit）的行对工具侧按
   // 「不存在」处理——update/delete 与 memory_get 同款无存在性泄漏。strictScope
