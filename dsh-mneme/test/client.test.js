@@ -208,8 +208,8 @@ test("entry tracks native class, inherits native sizing, and lifts the toolbar d
     "the entry must use the native button width, which reserves its horizontal margins"
   );
   assert.ok(
-    clientSource.includes(".mneme-topentry{display:flex;flex-direction:column}"),
-    "the entry wrapper must stretch the native button within a column flex layout"
+    clientSource.includes(".mneme-topentry{display:flex;flex-direction:column;position:relative}"),
+    "the entry wrapper must stretch the native button within a column flex layout (position:relative hosts the #177 badge)"
   );
   assert.equal(
     clientSource.includes(".mneme-topentry-native .mneme-topentry-label{flex:1;min-width:0;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"),
@@ -844,8 +844,55 @@ test("a11y: entity graph svg exposes a count summary", () => {
   }
 });
 
-// --- issue #179：注入预览（状态页卡片 + /inject-preview 端点透传的旁路快照） ---
+// --- issue #177：冲突队列交互与视觉重做 ---
 
+// 相似度进度条：只从「相似度 X / similarity X」锚定短语回收数字（防把年份当
+// 相似度），A/B 卡片带侧色类，冻结徽章替代预裁决阶段的「已归档」徽章。
+test("conflict queue: similarity bar, side colors and frozen badge", () => {
+  assert.ok(clientSource.includes("similarityOf(it.reason)"), "reason must be parsed for similarity");
+  assert.ok(clientSource.includes("/(?:相似度|similarity)\\s*([01](?:\\.\\d+)?)/i"), "parse must anchor on the similarity phrase");
+  for (const key of ["memory.status.conflictQueue.similarity", "memory.status.conflictQueue.frozenBadge"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  assert.ok(clientSource.includes('"mneme-conflict-side--a"'), "side A must carry the A color class");
+  assert.ok(clientSource.includes('"mneme-conflict-side--b"'), "side B must carry the B color class");
+  assert.ok(!/s\.archived && h\("span", \{ className: "mneme-badge mneme-badge--archived"/.test(clientSource),
+    "the pre-ruling archived badge must be replaced by the frozen badge");
+  assert.ok(clientSource.includes("mneme-badge--frozen"), "frozen badge class must exist");
+});
+
+// 词级 diff：LCS 对齐是纯函数，锁它的存在、上限护栏与渲染接线（无损性由
+// difftest 独立验证，此处只锁形状）。
+test("conflict queue: word diff is wired with size guards", () => {
+  assert.ok(clientSource.includes("function wordDiff(aText, bText)"), "wordDiff must exist");
+  assert.ok(clientSource.includes("mneme-conflict-mark--del"), "del highlight class must exist");
+  assert.ok(clientSource.includes("mneme-conflict-mark--ins"), "ins highlight class must exist");
+  assert.ok(clientSource.includes("n > 800 || m > 800"), "DP must bail on oversized inputs");
+});
+
+// 空态教育卡：0 冲突时也渲染（原来整块 return null），解释冻结是什么。
+test("conflict queue: empty-state explainer card", () => {
+  assert.ok(!/if \(!items \|\| items\.length === 0\) return null;/.test(clientSource),
+    "empty queue must render the explainer instead of nothing");
+  for (const key of ["memory.status.conflictQueue.emptyTitle", "memory.status.conflictQueue.emptyBody"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// 状态卡待处理高亮 + 侧边栏入口 badge（挂 portal 与回退两个按钮）。
+test("conflict queue: actionable status card and sidebar entry badge", () => {
+  assert.ok(clientSource.includes('"mneme-conflict-jump"'), "pending>0 card must carry the highlight class");
+  assert.ok(clientSource.includes("mneme-statuscard--actionable"), "highlight CSS must exist");
+  assert.ok((clientSource.match(/h\(ConflictBadge, \{ pending \}\)/g) || []).length === 2,
+    "badge must be wired into both entry buttons");
+  assert.ok((clientSource.match(/= useConflictBadgeCount\(t\)/g) || []).length === 2,
+    "both entry components must subscribe to the badge count");
+  assert.ok(clientSource.includes('"/api/dsh-mneme/dream-status"'), "badge must reuse the dream-status endpoint");
+});
+
+// --- issue #179：注入预览（状态页卡片 + /inject-preview 端点透传的旁路快照） ---
 test("a11y+preview: inject preview card is wired on the status tab", () => {
   assert.ok(clientSource.includes('"/api/dsh-mneme/inject-preview"'), "card must fetch the preview endpoint");
   assert.ok(clientSource.includes("h(InjectPreviewCard, { t })"), "status grid must render the preview card");
