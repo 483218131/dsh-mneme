@@ -459,7 +459,7 @@ export const apply = (ctx, config) => {
       minIntervalMs: (cfg.dreamMinIntervalMinutes ?? 0) * 60000,
       logger: ctx.logger,
       semantic: { embedder, vectorIndex },
-      lastRunAtSeed: store.lastDreamRunAt(),
+      lastRunAtSeed: store.lastDreamRunAt("auto"),
       onRun: () => (dream ? dream.runDream(ctx, service, cfg) : Promise.resolve({ ok: true, skipped: true }))
     });
     service.setDreamHook(() => dream.maybeSchedule(service));

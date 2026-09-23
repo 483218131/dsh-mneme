@@ -822,6 +822,8 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
     const logger = ctx.logger;
     let memories = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
     if (memories.length === 0) return { ok: true, applied: 0, skipped: true, summary: false };
+    // Issue #89：开跑时刻既喂给审计行（created_at），也是调度器闸门的时间基准。
+    const dreamStartedAt = Date.now();
     // v0.4.4 滑动窗口：只 consolidation 最近 dreamMaxSnapshotSize 条记忆，
     // 窗口外的旧记忆不进 snapshot（大记忆量下全量快照会撑爆 LLM 输入，配合
     // 隐式 keep 让 run 始终可收敛）。按 updated_at 倒序取前 maxSize 条。
@@ -888,6 +890,9 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
       try {
         service.saveDreamRun({
           id: runId,
+          // Issue #89：审计行记开跑时刻而非完成时刻——lastDreamRunAt 以它做
+          // 重启后的间隔种子，落完成时刻会让 run 耗时白白计入下一轮最小间隔。
+          created_at: new Date(dreamStartedAt).toISOString(),
           status,
           error: result.error,
           provider: route?.provider,

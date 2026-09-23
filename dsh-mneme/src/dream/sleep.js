@@ -611,6 +611,9 @@ function deriveStatus(phases) {
  */
 export async function runSleep(ctx, service, config, logger, semantic = null, signal = null) {
   const runId = randomUUID();
+  // Issue #89：开跑时刻——审计行 created_at 的基准（= 冷却种子），run 耗时
+  // （LLM 各 phase）不应计入重启后的冷却窗口。
+  const sleepStartedAt = Date.now();
   const phases = {};
   const attempt = async (name, fn) => {
     if (signal?.aborted) return; // user resumed activity — stop before next phase
@@ -647,6 +650,9 @@ export async function runSleep(ctx, service, config, logger, semantic = null, si
   try {
     service.saveDreamRun({
       id: runId,
+      // Issue #89：审计行记开跑时刻而非完成时刻——run 耗时（含 LLM 各 phase）
+      // 不该计入重启后的 sleep 冷却种子。
+      created_at: new Date(sleepStartedAt).toISOString(),
       status,
       provider: route?.provider,
       model: route?.model,

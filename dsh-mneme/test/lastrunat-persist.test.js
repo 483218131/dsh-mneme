@@ -21,6 +21,7 @@ test("issue#89: store.lastDreamRunAt recovers the last run timestamp (with run_t
   store.saveDreamRun({ status: "ok", snapshot_hash: "h2", input_count: 1, receipt: "r", created_at: "2026-09-09T20:00:00.000Z", run_type: "sleep" });
   assert.equal(store.lastDreamRunAt(), Date.parse("2026-09-10T01:05:23.640Z"), "latest run regardless of type");
   assert.equal(store.lastDreamRunAt("sleep"), Date.parse("2026-09-09T20:00:00.000Z"), "filtered by run_type");
+  assert.equal(store.lastDreamRunAt("auto"), Date.parse("2026-09-10T01:05:23.640Z"), "auto filter ignores sleep rows");
   store.close();
 });
 
@@ -28,14 +29,16 @@ test("issue#89: dream scheduler seeded from the audit trail — restart no longe
   const store = createStore(":memory:");
   const service = createService({ store, mirror: null, config: {} });
   // 模拟上一进程刚跑过一轮（10ms 前开跑）并留下审计行，然后「重启」：
+  // minIntervalMs 取 1min——断言窗口远宽于用例执行时间，真实时钟抖动（调度、
+  // 慢盘）不会把 10ms 偏移推出闸门外造成间歇性假失败。
   store.saveDreamRun({
     status: "ok", snapshot_hash: "h", input_count: 1, receipt: "r",
     created_at: new Date(Date.now() - 10).toISOString(), run_type: "auto"
   });
   const dream = createDreamScheduler({
     onRun: async () => ({ ok: false, error: "llm failed" }),
-    thresholdCount: 1, thresholdChars: 0, delayMs: 0, minIntervalMs: 5000,
-    lastRunAtSeed: store.lastDreamRunAt(),
+    thresholdCount: 1, thresholdChars: 0, delayMs: 0, minIntervalMs: 60000,
+    lastRunAtSeed: store.lastDreamRunAt("auto"),
     logger: { warn: () => {} }
   });
   service.saveWithDedupe({ type: "project", title: "a", content: "x" });
@@ -71,4 +74,28 @@ test("issue#89: sleep scheduler seeded — cooldown survives a restart", async (
   const rearm = timers[0];
   assert.ok(rearm, "re-armed for the remaining cooldown window (not dropped, #187 semantics)");
   assert.equal(rearm.at, lastRunAt + 3_600_000 + 1000, "re-arms at CD expiry (+1s guard)");
+});
+
+// --- CodeRabbit #291 findings 5/6：index.js 的 seed 注入是单行无分支接线，仓库
+// 没有插件级挂载 harness（apply 需要完整宿主 ctx），起全量挂载只为准两条断言
+// 不成比例——改为源码级锁：删掉 index.js 的对应注入行即红。import 用绝对路径，
+// 不依赖测试进程 CWD。
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+const indexSrc = readFileSync(fileURLToPath(new URL("../src/index.js", import.meta.url)), "utf8");
+
+test("issue#89: index.js wires the dream scheduler seed from the audit trail", () => {
+  assert.match(
+    indexSrc,
+    /lastRunAtSeed:\s*store\.lastDreamRunAt\("auto"\)/,
+    "dream scheduler must seed its min-interval gate from dream_runs (run_type='auto') — remove this line and restart-bypass returns"
+  );
+});
+
+test("issue#89: index.js wires the sleep scheduler seed from the audit trail", () => {
+  assert.match(
+    indexSrc,
+    /lastRunAtSeed:\s*store\.lastDreamRunAt\("sleep"\)/,
+    "sleep scheduler must seed its cooldown gate from dream_runs (run_type='sleep') — remove this line and restart-bypass returns"
+  );
 });
