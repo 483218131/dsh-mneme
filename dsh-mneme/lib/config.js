@@ -212,6 +212,15 @@ export const Config = z.object({
   // document 摘要行的注入预算（#230 拍板）：次优先档内最多注入的 document
   // 行数，超预算跳过由后续候选补位。只约束注入，不约束检索。
   documentInjectBudget: z.natural().min(1).max(5).default(2),
+  // document 的 managed 落盘目录（#296 第二批）：空串 = 跟随 memoryDir 的
+  // `<memoryDir>/documents/`。`~` / `~/` / `~\` 展开到 home，绝对路径原样用，相对
+  // 路径落在 memoryDir 下（这是本键自己的规则：memoryDir 的相对路径是原样留着的
+  // cwd 语义，两者刻意不同；`~user` 形式两边都不展开）。目录由 mneme 建，里面的
+  // `index.md`
+  // 整文件机器所有。这个目录**之外**的文件只登记指针行，正文一个字节都不碰
+  // （= #230 的「管线对正文零读零写」）；与 memoryDir 一样是路径配置，不是
+  // 行为开关，故不进 settings.js 的 feature flags 白名单、也不上面板。
+  documentDir: z.string().default(""),
   // 隐式 keep（v0.4.4）：LLM 未提及的 snapshot 记忆自动补 {action:"keep"}，
   // 避免"未覆盖即全拒"白白浪费整轮 run。设为 false 时保留旧的严格校验
   // （未覆盖即拒绝整单）。

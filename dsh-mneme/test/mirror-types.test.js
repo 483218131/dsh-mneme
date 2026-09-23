@@ -1,16 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MIRROR_EXCLUDED_TYPES, TYPE_FILE, createMirror, parseHumanEdits, renderMirrorText } from "../src/mirror.js";
+import { MIRROR_EXCLUDED_TYPES, MIRROR_READONLY_TYPES, TYPE_FILE, createMirror, parseHumanEdits, renderMirrorText } from "../src/mirror.js";
 import { createStore, TYPES } from "../src/store.js";
 import { createService } from "../src/service.js";
 import { PACKAGE_VERSION } from "../src/version-check.js";
 
 // #278 第一批：落盘盲区。TYPE_FILE 原先只有 5 个键，pitfall / constraint /
 // rejected_solution / pattern 这些后加的 type 从不进镜像与导出——落点存在，但对
-// 一半活跃记忆是盲的，且没有任何提示。documents 的排除见 MIRROR_EXCLUDED_TYPES。
+// 一半活跃记忆是盲的，且没有任何提示。#296 第二批把 document 也收了进来（只读
+// 指针视图），排除集因此为空；两个集合的边界仍由下面的双向断言钉住。
 const FORMERLY_UNCOVERED = ["pitfall", "constraint", "rejected_solution", "pattern"];
 
 function tempDir() {
@@ -65,12 +66,14 @@ test("#278: file header carries type / covered / coverage / tags union", () => {
   assert.equal(parseHumanEdits(text).length, 2);
 });
 
-test("#278: mirror writes the formerly uncovered files on disk and skips documents", () => {
+test("#278/#296: mirror writes the formerly uncovered files, and documents land as a pointer view", () => {
   const dir = tempDir();
   try {
     const mirror = createMirror(dir);
     const rows = FORMERLY_UNCOVERED.map((type, i) => memory(type, { id: `m${i}`, content: `内容${i}` }));
-    rows.push(memory("document", { id: "doc1", doc_path: "C:/docs/report.md" }));
+    rows.push(memory("document", {
+      id: "doc1", title: "报告", content: "第一句。第二句不该出现。", doc_path: "C:/docs/report.md"
+    }));
     mirror.sync(rows);
     for (const [i, type] of FORMERLY_UNCOVERED.entries()) {
       const file = join(dir, TYPE_FILE[type]);
@@ -79,7 +82,31 @@ test("#278: mirror writes the formerly uncovered files on disk and skips documen
       assert.equal(edit.id, `m${i}`);
       assert.equal(edit.content, `内容${i}`);
     }
-    assert.ok(!existsSync(join(dir, "documents.md")), "document 指针行不落镜像（排除集钉住）");
+    // #296 第 4 条：document 落盘，但只给指针行——id + 标题 + 摘要首句 + 路径，
+    // 不含正文；文件头必须说清这是只读视图（不能复用「可编辑」那句）。
+    assert.ok(MIRROR_READONLY_TYPES.has("document"), "document 是只读 type");
+    assert.ok(existsSync(join(dir, "documents.md")), "document 指针行现在落盘");
+    const docs = readFileSync(join(dir, "documents.md"), "utf8");
+    assert.match(docs, /只读视图/);
+    assert.ok(docs.includes("doc1") && docs.includes("报告") && docs.includes("第一句"));
+    assert.ok(docs.includes("report.md"), "指针行必须给出 doc_path，否则「看着完整、其实找不到文件」的老问题原样回来");
+    assert.ok(!docs.includes("第二句"), "只读视图不含全文，只留摘要首句");
+    assert.equal(parseHumanEdits(docs).length, 0, "指针行不是可回填的条目");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#296: readHumanEdits never returns the read-only type — a hand-edited view cannot reach the store", () => {
+  const dir = tempDir();
+  try {
+    const mirror = createMirror(dir);
+    mirror.sync([memory("document", { id: "doc1", doc_path: "/tmp/report.md" })]);
+    // 模拟有人在 documents.md 里手改（视图是机器所有，改动必须被忽略而不是回填）
+    const file = join(dir, TYPE_FILE.document);
+    writeFileSync(file, readFileSync(file, "utf8") + "- **ID**: `doc1`\n- **类型**: document\n被人改过的正文\n", "utf8");
+    assert.deepEqual(mirror.readHumanEdits("document"), [], "指定的只读 type 也要跳过");
+    assert.deepEqual(mirror.readHumanEdits().filter((e) => e.id === "doc1"), [], "全量扫描同样跳过它");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

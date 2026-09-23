@@ -1,7 +1,7 @@
 import { URL } from "node:url";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import { FEATURE_FLAG_SPEC } from "./settings.js";
-import { TYPE_FILE, renderMirrorText, renderFileHeader, parseHumanEdits } from "./mirror.js";
+import { TYPE_FILE, renderMirrorText, renderFileHeader, parseHumanEdits, MIRROR_READONLY_TYPES } from "./mirror.js";
 import { langOf } from "./lang.js";
 import { computeHeat } from "./heat.js";
 import { describeStreamFailure, resolveRoute } from "./dream.js";
@@ -1008,10 +1008,11 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
         }
         const byType = {};
         for (const row of rows) {
-          // 没有 TYPE_FILE 条目的 type 不进 markdown 导出——与磁盘镜像共用同一套
-          // 排除（见 mirror.js 的 MIRROR_EXCLUDED_TYPES：document 指针行）。json
-          // 分支是全字段导出，不受影响。
-          if (TYPE_FILE[row.type]) (byType[row.type] ??= []).push(row);
+          // 没有 TYPE_FILE 条目的 type 不进 markdown 导出，只读 type（#296 的
+          // document 指针行）同样不进：导出/导入是 round-trip 通道，只读视图没有
+          // 可回填的正文。两个排除都在 mirror.js 那张表里（MIRROR_EXCLUDED_TYPES /
+          // MIRROR_READONLY_TYPES）。json 分支是全字段导出，不受影响。
+          if (TYPE_FILE[row.type] && !MIRROR_READONLY_TYPES.has(row.type)) (byType[row.type] ??= []).push(row);
         }
         const sections = [];
         for (const type of Object.keys(TYPE_FILE)) {
@@ -1047,6 +1048,12 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
           const body = parseBody(text);
           if (typeof body.type !== "string" || !Object.hasOwn(TYPE_FILE, body.type)) {
             sendJson(res, 400, { error: "invalid-type" });
+            return;
+          }
+          // 只读 type 是合法 type，只是没有可回填的正文（#296）：单独的码，调用方
+          // 不会被误导去改 type 名重试。
+          if (MIRROR_READONLY_TYPES.has(body.type)) {
+            sendJson(res, 400, { error: "readonly-type" });
             return;
           }
           if (typeof body.markdown !== "string" || !body.markdown.trim()) {

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { TYPE_FILE } from "./mirror.js";
+import { TYPE_FILE, MIRROR_READONLY_TYPES } from "./mirror.js";
 import { updatedAtBounds } from "./store.js";
 import { normalizeExplicitScope, scopeKeyOf } from "./scope.js";
 import { STR, langOf } from "./lang.js";
@@ -167,7 +167,7 @@ export function computeRetrievalMetrics(actualIds, expectedIds) {
   };
 }
 
-export function createService({ store, mirror, config, onWrite, logger }) {
+export function createService({ store, mirror, config, onWrite, logger, documentIndex }) {
   const language = langOf(config);
   // Optional dream scheduler hook, installed via setDreamHook after creation
   // (the scheduler holds a reference back to the service, so it cannot be
@@ -1560,6 +1560,10 @@ export function createService({ store, mirror, config, onWrite, logger }) {
    * Only content/title are taken; structure fields stay machine-owned.
    */
   function mergeHumanEdits(type, edits) {
+    // #296：只读 type 的结构性守卫。调用点（启动合并 / reconcileHumanEdits）都已
+    // 跳过它们，但这条不变量属于「人改回填」本身——将来多一个调用点不该重开这个口
+    // （指针行文本被当正文写回 document 行会污染摘要）。
+    if (MIRROR_READONLY_TYPES.has(type)) return 0;
     let applied = 0;
     for (const edit of edits) {
       if (!edit.id) continue; // corrupt/malformed edit: skip it, keep merging the rest
@@ -1787,6 +1791,26 @@ export function createService({ store, mirror, config, onWrite, logger }) {
    * non-forgotten memories are mirrored: forgotten entries must not reach the
    * human-editable file (a human "edit" could otherwise resurrect them).
    */
+  // #296 第二批：documentDir/index.md 的写后语。与注册入口共用同一个
+  // documentMemoryEnabled 闸（默认关）：闸开时只列活跃指针行（正文永远不进这个
+  // 文件），闸关时把索引删掉——document 子系统整体退出，留一份陈旧索引会列出已
+  // 归档的行，正是镜像侧 documents.md 在闸关时被删掉要避免的那种「看着还在、其实
+  // 已关」的视图。两步都只 warn：索引是机器产物，不能让触发它的业务写失败。
+  function syncDocumentIndex() {
+    if (!documentIndex) return;
+    if (config?.documentMemoryEnabled !== true) {
+      const removed = documentIndex.remove();
+      if (!removed?.ok) logger?.warn?.("document index remove failed:", removed?.error);
+      return;
+    }
+    try {
+      const result = documentIndex.sync(store.list({ type: "document", limit: null }));
+      if (!result?.ok) logger?.warn?.("document index sync failed:", result?.error);
+    } catch (error) {
+      logger?.warn?.("document index sync failed:", error);
+    }
+  }
+
   // syncMirror: 同步 mirror，并在失败/成功时持久记录 dirty 状态；保证自身不抛出。
   // v0.3.6（audit peer 4 阻断）：
   //   - 开始时 incrementGeneration 绑定本次期望轮次 gen；成功用
@@ -1796,7 +1820,12 @@ export function createService({ store, mirror, config, onWrite, logger }) {
   //   - 逐 type 用 setTypeStatus 记录部分成功/失败（type_status JSON）；
   //   - 所有 store 状态写入各自 try/catch，失败只 warn，绝不向外抛（F-NEW-03）。
   function syncMirror() {
-    if (txDepth > 0 || !mirror) return { success: true, deferred: true }; // deferred to the transaction's commit
+    if (txDepth > 0) return { success: true, deferred: true }; // deferred to the transaction's commit
+    // #296 第二批：documentDir/index.md 走同一条写后语——它与镜像一样是「从库渲染
+    // 的机器产物」，同样只在内容变化时落盘、同样自己吞掉失败。放在 !mirror 短路
+    // 之前：索引在不在，不该取决于镜像是否装配（无镜像的宿主与测试同样要有它）。
+    syncDocumentIndex();
+    if (!mirror) return { success: true, deferred: true };
     const now = new Date().toISOString();
     let gen;
     try {
@@ -1821,7 +1850,11 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       // 代价是全表读，且落在每次业务写后的最热路径上（#202 自记 all() 5k 行
       // 231ms → ~135ms）。要压这一层得换按 type 分页取，属另一批的事；
       // 在这里退回任何截断都不行——「宣称覆盖活跃集」与静默截断不能共存。
-      const list = store.all().filter((m) => !m.forgotten && !m.archived);
+      const list = store.all().filter((m) => !m.forgotten && !m.archived
+        // #296 第二批：镜像里的 documents.md 与 index.md 共用 documentMemoryEnabled
+        // 闸。关掉时把 document 行也从渲染集里去掉——sync 对「空 type」的既有处理
+        // 会把陈旧的 documents.md 删掉，不留一个「看着还在、其实已关」的视图。
+        && (m.type !== "document" || config?.documentMemoryEnabled === true));
       for (const memory of list) {
         if (memory?.type && TYPE_FILE[memory.type]) {
           coveredTypes.add(memory.type);
