@@ -28,12 +28,18 @@ window.__ModuleLoader__.load({
     }
 
     // #177 词级 diff：经典 LCS 对齐——删除片段标红、新增标绿、公共部分原样。
-    // 中文按字符切分、拉丁词按单词切分（Unicode 分段），CJK 无空格文本同样有
-    // 词粒度效果。相邻同侧片段合并成 run。输入先截 800 字符；O(n·m) DP 仅在
-    // 小文本启用（任一侧 > 800 词或 edit run > 200 时返回 null），caller 退回
-    // 原文展示，不为极端文本烧内存。
+    // 分词两段式：Han 段先切出再逐字打散（\p{L} 把整句中文当一个词，必须单列），
+    // 其余按 Unicode 词边界（拉丁按词、标点独立）。相邻同侧片段合并成 run。
+    // 输入先截 800 字符；O(n·m) DP 仅在小文本启用（任一侧 > 800 词或 edit run
+    // > 200 时返回 null），caller 退回原文展示，不为极端文本烧内存。
     function wordDiff(aText, bText) {
-      const tokenize = (s) => (s || "").split(/(?=[^\p{L}\p{N}])|(?<=[^\p{L}\p{N}])/u).filter(Boolean);
+      const HAN = /^[\u{3400}-\u{4DBF}\u{4E00}-\u{9FFF}\u{F900}-\u{FAFF}]+$/u;
+      const tokenize = (s) => (s || "")
+        .split(/([\u{3400}-\u{4DBF}\u{4E00}-\u{9FFF}\u{F900}-\u{FAFF}]+)/u)
+        .filter(Boolean)
+        .flatMap((seg) => HAN.test(seg)
+          ? [...seg]
+          : seg.split(/(?=[^\p{L}\p{N}])|(?<=[^\p{L}\p{N}])/u).filter(Boolean));
       const a = tokenize((aText || "").slice(0, 800)), b = tokenize((bText || "").slice(0, 800));
       const n = a.length, m = b.length;
       if (n === 0 && m === 0) return null;
@@ -1286,6 +1292,8 @@ window.__ModuleLoader__.load({
       ".mneme-conflict-empty-body{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}",
       ".mneme-statuscard--actionable{border-color:color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 55%,transparent);box-shadow:0 0 0 1px color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 35%,transparent)}",
       ".mneme-entrybadge{position:absolute;top:-3px;right:-3px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:var(--dsw-alias-state-error,#c33);color:var(--dsw-alias-bg-layer-1,#fff);font-size:10.5px;line-height:16px;font-weight:600;text-align:center;box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1)}",
+      ".mneme-triggerwrap{position:relative;pointer-events:none}",
+      ".mneme-triggerwrap .mneme-trigger{pointer-events:auto}",
       ".mneme-conflict-jump .mneme-statuscard{border-color:color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 55%,transparent);box-shadow:0 0 0 1px color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 35%,transparent)}",
       ".mneme-conflict-jump:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px;border-radius:12px}",
       // 详情抽屉：sheet 内右侧滑出，覆盖在浏览区之上
@@ -3159,19 +3167,25 @@ window.__ModuleLoader__.load({
       const [state, setState] = useState({ loading: true, error: false, lastRun: null, pending: 0 });
       useEffect(() => {
         let cancelled = false;
-        apiFetch("/api/dsh-mneme/dream-status")
-          .then((res) => { if (!res.ok) throw new Error("http"); return res.json(); })
-          .then((d) => {
-            if (cancelled) return;
-            setState({
-              loading: false,
-              error: false,
-              lastRun: (d && d.lastRun) || null,
-              pending: Number((d && d.pendingConflicts) ?? 0)
-            });
-          })
-          .catch(() => { if (!cancelled) setState({ loading: false, error: true, lastRun: null, pending: 0 }); });
-        return () => { cancelled = true; };
+        const loadOnce = () => {
+          apiFetch("/api/dsh-mneme/dream-status")
+            .then((res) => { if (!res.ok) throw new Error("http"); return res.json(); })
+            .then((d) => {
+              if (cancelled) return;
+              setState({
+                loading: false,
+                error: false,
+                lastRun: (d && d.lastRun) || null,
+                pending: Number((d && d.pendingConflicts) ?? 0)
+              });
+            })
+            .catch(() => { if (!cancelled) setState({ loading: false, error: true, lastRun: null, pending: 0 }); });
+        };
+        loadOnce();
+        // #295 评审：裁决完成后队列会广播 mneme:conflicts-changed，这里重取
+        // 计数，状态卡的「待确认冲突」不再停留旧值。
+        window.addEventListener("mneme:conflicts-changed", loadOnce);
+        return () => { cancelled = true; window.removeEventListener("mneme:conflicts-changed", loadOnce); };
       }, []);
       const run = state.lastRun;
       const num = run ? formatRelativeTime(run.created_at, t) : t("memory.status.dreamNever");
@@ -3281,12 +3295,15 @@ window.__ModuleLoader__.load({
     // 队列为空时整块不渲染（不打扰无冲突实例）。
     function ConflictsQueue({ t }) {
       const [items, setItems] = useState(null);
+      const [loadError, setLoadError] = useState(false);
       const [busy, setBusy] = useState(false);
       const load = (silent) => {
         apiFetch("/api/dsh-mneme/conflicts")
           .then((res) => { if (!res.ok) throw new Error("http"); return res.json(); })
-          .then((d) => { setItems(d.items || []); if (!silent) announce(t("memory.status.conflictQueue.refreshed")); })
-          .catch(() => setItems([]));
+          .then((d) => { setItems(d.items || []); setLoadError(false); if (!silent) announce(t("memory.status.conflictQueue.refreshed")); })
+          // #295 评审：加载失败 ≠ 没有冲突——错误态渲染错误卡而不是空态教育卡，
+          // 不能让 500 把「暂时看不到」伪装成「没有冲突」。
+          .catch(() => { setItems([]); setLoadError(true); });
       };
       useEffect(() => { load(); }, []);
       // #177：空队列不再整块消失——空态教育卡要渲染（原 return null 已移除）。
@@ -3305,24 +3322,37 @@ window.__ModuleLoader__.load({
           .then(() => {
             announce(t("memory.status.conflictQueue.resolved").replace("{name}",
               (winner === "a" ? (it.memory_a && it.memory_a.title) : winner === "b" ? (it.memory_b && it.memory_b.title) : "") || ""));
+            // #295 评审：裁决改变了 pending 总数——DreamStatusCards 只在挂载时
+            // 读一次 dream-status，不广播的话状态卡停留在旧计数。同页两个组件
+            // 用一个 window 事件对齐（比提升状态到 StatusPanel 少动三处）。
+            try { window.dispatchEvent(new CustomEvent("mneme:conflicts-changed")); } catch { /* 非浏览器环境 */ }
             load(true);
           })
           .catch(() => {})
           .finally(() => setBusy(false));
       };
-      const side = (s, label, sideClass, ops) => h("div", { className: `mneme-conflict-side ${sideClass}` },
+      const side = (s, label, sideClass, ops, diffSide) => h("div", { className: `mneme-conflict-side ${sideClass}` },
         h("div", { className: "mneme-conflict-sidelabel" }, label),
         s.missing
           ? h("div", { className: "mneme-conflict-missing" }, t("memory.status.conflictQueue.missing"))
           : h(react.Fragment, null,
               h("div", { className: "mneme-conflict-sidetitle", title: s.title }, s.title || "…"),
-              // #177：词级 diff 可用（LCS 无损对齐成功）时用高亮视图替代纯文本，
-              // title 提示颜色语义；否则保留原 snippet。A/B 各渲染整段（diff 同源）。
+              // #177：词级 diff 可用（LCS 无损对齐成功）时用高亮视图替代纯文本。
+              // 侧别过滤（#295 评审修正）：A 侧渲染 same+del（它被删的部分高亮），
+              // B 侧渲染 same+ins（它新增的部分高亮）——每列忠实于自己的原文。
+              // title 提示颜色语义；diff 不可用时保留原 snippet。
               ops
                 ? h("div", { className: "mneme-conflict-diff", title: t("memory.status.conflictQueue.diffTitle") },
-                    ops.map((o, k) => o.kind === "same"
-                      ? o.text
-                      : h("span", { key: k, className: `mneme-conflict-mark mneme-conflict-mark--${o.kind === "del" ? "del" : "ins"}` }, o.text)))
+                    ops.map((o, k) => {
+                      if (o.kind === "same") return o.text;
+                      if (o.kind === "del" && diffSide === "a") {
+                        return h("span", { key: k, className: "mneme-conflict-mark mneme-conflict-mark--del" }, o.text);
+                      }
+                      if (o.kind === "ins" && diffSide === "b") {
+                        return h("span", { key: k, className: "mneme-conflict-mark mneme-conflict-mark--ins" }, o.text);
+                      }
+                      return null; // 对侧的编辑片段不出现在本列
+                    }))
                 : h("div", { className: "mneme-conflict-snippet" }, (s.content || "").slice(0, 140)),
               // #177：预裁决阶段两侧都还活着——「已归档」徽章换成「冻结中」，
               // 原注销记说明（applyHint）挪进 tooltip，不再整段占一行动态区。
@@ -3347,10 +3377,13 @@ window.__ModuleLoader__.load({
             h(Icon, { name: "refresh", size: 12 }), t("memory.status.conflictQueue.refresh"))),
         // #177 空态教育卡：队列没有条目时也渲染（整块此前直接 return null），
         // 解释「什么情况会产生冲突、冻结是什么」——新用户第一次遇见冻结时
-        // 状态页已有解释在等他。
-        items.length === 0 && h("div", { className: "mneme-conflict-empty" },
-          h("div", { className: "mneme-conflict-empty-title" }, t("memory.status.conflictQueue.emptyTitle")),
-          h("div", { className: "mneme-conflict-empty-body" }, t("memory.status.conflictQueue.emptyBody"))),
+        // 状态页已有解释在等他。加载失败时显示错误卡而不是空态卡。
+        items.length === 0 && (loadError
+          ? h("div", { className: "mneme-conflict-empty", role: "alert" },
+              h("div", { className: "mneme-conflict-empty-title" }, t("memory.status.error")))
+          : h("div", { className: "mneme-conflict-empty" },
+              h("div", { className: "mneme-conflict-empty-title" }, t("memory.status.conflictQueue.emptyTitle")),
+              h("div", { className: "mneme-conflict-empty-body" }, t("memory.status.conflictQueue.emptyBody")))),
         items.map((it) => {
           const sim = similarityOf(it.reason);
           const aText = (it.memory_a && it.memory_a.content) || "";
@@ -3367,8 +3400,8 @@ window.__ModuleLoader__.load({
               h("span", { className: "mneme-conflict-simfill", style: { width: `${Math.round(sim * 100)}%` } })),
             h("span", null, `${Math.round(sim * 100)}%`)),
           h("div", { className: "mneme-conflict-pair" },
-            side(it.memory_a, t("memory.status.conflictQueue.sideA"), "mneme-conflict-side--a", diff),
-            side(it.memory_b, t("memory.status.conflictQueue.sideB"), "mneme-conflict-side--b", diff)),
+            side(it.memory_a, t("memory.status.conflictQueue.sideA"), "mneme-conflict-side--a", diff, "a"),
+            side(it.memory_b, t("memory.status.conflictQueue.sideB"), "mneme-conflict-side--b", diff, "b")),
           h("div", { className: "mneme-conflict-actions" },
             h("span", { className: "mneme-conflict-hint", title: t("memory.status.conflictQueue.applyHintTitle") },
               t("memory.status.conflictQueue.applyHint")),
@@ -4618,18 +4651,22 @@ window.__ModuleLoader__.load({
     }
     function SidebarFallbackTrigger({ wide, t }) {
       const pending = useConflictBadgeCount(t);
-      return h("button", {
-        type: "button",
-        className: wide ? "mneme-trigger" : "mneme-trigger mneme-rail",
-        "aria-label": pending > 0
-          ? `${t("memory.sidebar.aria")} · ${t("memory.status.conflicts")} ${pending}`
-          : t("memory.sidebar.aria"),
-        title: t("memory.panel.open"),
-        onClick: openLibrary,
-        "data-mneme-overlay-opener": "true"
-      },
-        h(IconArchiveOutline20, { size: wide ? 16 : 18 }),
-        wide && h("span", { className: "mneme-trigger-label" }, t("memory.panel.open")),
+      // #295 评审：.mneme-trigger 自身 overflow:hidden 且无定位上下文，badge
+      // 直接放里面会被裁剪——包一层定位容器，badge 挂在容器上。
+      return h("div", { className: "mneme-triggerwrap" },
+        h("button", {
+          type: "button",
+          className: wide ? "mneme-trigger" : "mneme-trigger mneme-rail",
+          "aria-label": pending > 0
+            ? `${t("memory.sidebar.aria")} · ${t("memory.status.conflicts")} ${pending}`
+            : t("memory.sidebar.aria"),
+          title: t("memory.panel.open"),
+          onClick: openLibrary,
+          "data-mneme-overlay-opener": "true"
+        },
+          h(IconArchiveOutline20, { size: wide ? 16 : 18 }),
+          wide && h("span", { className: "mneme-trigger-label" }, t("memory.panel.open"))
+        ),
         h(ConflictBadge, { pending })
       );
     }
