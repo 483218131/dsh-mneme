@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.modusensus/mneme-memory",
+  "title": "Mneme Memory",
+  "description": "Cross-session memory for AI coding agents. Six tools (save/search/list/get/update/delete) backed by the dsh-mneme plugin's local SQLite store with Markdown mirror, semantic search, and background consolidation. Requires the dsh-mneme DSH plugin running with its standalone API.",
+  "version": "0.1.1",
+  "repository": {
+    "source": "github",
+    "url": "https://github.com/slow-stack/mneme"
+  },
+  "websiteUrl": "https://github.com/slow-stack/mneme",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "mneme-memory",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ],
+  "keywords": [
+    "memory",
+    "persistence",
+    "cross-session",
+    "knowledge-management",
+    "sqlite",
+    "local-first"
+  ],
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "modusensus"
+    }
+  ]
+}
