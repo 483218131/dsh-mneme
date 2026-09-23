@@ -127,6 +127,28 @@ dsh web
 - 默认零网络依赖，不需要 API Key
 - 无遥测、无分析、无远程日志
 
+## 用在其他 AI 工具里（MCP）
+
+插件自带零依赖 stdio MCP server，任何 MCP 客户端都能挂载记忆六件套（`memory_save` / `memory_search` / `memory_list` / `memory_get` / `memory_update` / `memory_delete`）。
+
+**前置条件（一次性）**：
+
+1. DSH 在运行且插件已安装（MCP 数据面走插件的独立 API `127.0.0.1:8790`）
+2. 在 DSH 面板「设置 → 外部访问 API」生成 token
+
+**各客户端挂载**（`<你的token>` 替换为上一步生成的值）：
+
+| 客户端 | 挂载方式 |
+|--------|---------|
+| **Claude Code** | 项目根 `.mcp.json`：`{"mcpServers": {"dsh-mneme": {"command": "dsh-mneme-mcp", "env": {"DSH_MNEME_TOKEN": "<你的token>"}}}}` |
+| **Cursor** | 设置 → MCP → Add Server，command 填 `dsh-mneme-mcp`，env 加 `DSH_MNEME_TOKEN` |
+| **Codex** | `~/.codex/config.toml`：`[mcp_servers.dsh-mneme]` 段，`command = "dsh-mneme-mcp"`，`env = { DSH_MNEME_TOKEN = "<你的token>" }` |
+| **Hermes** | `~/.hermes/config.yaml` 的 `mcp_servers:` 段：`dsh-mneme: {command: "dsh-mneme-mcp", env: {DSH_MNEME_TOKEN: "<你的token>"}}`，重启生效 |
+| **OpenCode** | `opencode.json`：`{"mcp": {"dsh-mneme": {"type": "local", "command": ["dsh-mneme-mcp"], "environment": {"DSH_MNEME_TOKEN": "<你的token>"}}}}` |
+| **OpenClaw** | `openclaw mcp add dsh-mneme --command dsh-mneme-mcp --env DSH_MNEME_TOKEN=<你的token>`，或 Control UI → Settings → MCP |
+
+> 未全局安装 npm 包时，把 `command` 换成 `npx` 并追加参数 `-p @modusensus/dsh-mneme dsh-mneme-mcp`（Claude Code/OpenCode 写进 args 数组，Codex 写 `args = ["-p", "@modusensus/dsh-mneme", "dsh-mneme-mcp"]`）。配置细节、npx 挂法与安全注意事项见[完整文档](dsh-mneme/README.md#mcp-server任意-mcp-客户端接入)。
+
 ## 文档
 
 | 文档 | 路径 |
@@ -154,7 +176,7 @@ dsh web
 | **v0.7** | 自进化记忆：热度衰减 + 睡眠双保护 + 桌面端工作台/功能开关 | ✅ |
 | **v0.8** | 作用域隔离（agent/workspace 双维隔离 + 检索加权 + opt-in 硬过滤）+ 冲突队列人工裁决 + 归属显式声明 + 生态化（stdio MCP server / 图召回轴 / 冷启动 / 注入截断与状态条 / 蒸馏可靠性 / 注入形态与 agent 主动整理接口） | ✅ 已发布（至 v0.8.6） |
 
-> 完整逐小版本路线图见 [dsh-mneme/README.md](dsh-mneme/README.md#-进化路线图)。
+> 完整逐小版本说明见 [CHANGELOG](dsh-mneme/CHANGELOG.md)。
 
 ## 🧪 本地开发
 
@@ -287,6 +309,28 @@ It works out of the box. To feel its value in five minutes:
 - Zero network dependency by default, no API key required
 - No telemetry, no analytics, no remote logging
 
+## Use it in other AI tools (MCP)
+
+The plugin ships a zero-dependency stdio MCP server. Any MCP client can mount the six memory tools (`memory_save` / `memory_search` / `memory_list` / `memory_get` / `memory_update` / `memory_delete`).
+
+**One-time prerequisites**:
+
+1. DSH is running with the plugin installed (the MCP data plane goes through the plugin's standalone API at `127.0.0.1:8790`)
+2. Generate a token in the DSH panel under **Settings → External API**
+
+**Per-client setup** (replace `<your-token>` with the value from the previous step):
+
+| Client | Setup |
+|--------|-------|
+| **Claude Code** | Project-root `.mcp.json`: `{"mcpServers": {"dsh-mneme": {"command": "dsh-mneme-mcp", "env": {"DSH_MNEME_TOKEN": "<your-token>"}}}}` |
+| **Cursor** | Settings → MCP → Add Server; command `dsh-mneme-mcp`, env `DSH_MNEME_TOKEN` |
+| **Codex** | `~/.codex/config.toml`: `[mcp_servers.dsh-mneme]` section, `command = "dsh-mneme-mcp"`, `env = { DSH_MNEME_TOKEN = "<your-token>" }` |
+| **Hermes** | `mcp_servers:` section of `~/.hermes/config.yaml`: `dsh-mneme: {command: "dsh-mneme-mcp", env: {DSH_MNEME_TOKEN: "<your-token>"}}`, then restart |
+| **OpenCode** | `opencode.json`: `{"mcp": {"dsh-mneme": {"type": "local", "command": ["dsh-mneme-mcp"], "environment": {"DSH_MNEME_TOKEN": "<your-token>"}}}}` |
+| **OpenClaw** | `openclaw mcp add dsh-mneme --command dsh-mneme-mcp --env DSH_MNEME_TOKEN=<your-token>`, or Control UI → Settings → MCP |
+
+> If the npm package is not installed globally, use `npx` as the command with args `-p @modusensus/dsh-mneme dsh-mneme-mcp` (an args array in Claude Code/OpenCode; `args = ["-p", "@modusensus/dsh-mneme", "dsh-mneme-mcp"]` in Codex). Full config details, npx mounting, and security notes: [full docs](dsh-mneme/README.md#mcp-server任意-mcp-客户端接入) (Chinese).
+
 ## Docs
 
 | Doc | Path |
@@ -314,7 +358,7 @@ It works out of the box. To feel its value in five minutes:
 | **v0.7** | Self-evolving memory: heat decay + sleep dual-protection + desktop workbench/feature toggles | ✅ |
 | **v0.8** | Scope isolation (agent/workspace stamping + retrieval weighting + opt-in hard filter) + conflict review queue + explicit attribution + ecosystem (stdio MCP server / graph recall axis / cold-start bootstrap / injection truncation & status bar / distill reliability / injection shaping & agent-driven organize) | ✅ Released (up to v0.8.6) |
 
-> Full per-minor-version roadmap in [dsh-mneme/README.md](dsh-mneme/README.md#-evolution-roadmap).
+> Full per-minor-version changelog in [CHANGELOG](dsh-mneme/CHANGELOG.md).
 
 ## 🧪 Local development
 

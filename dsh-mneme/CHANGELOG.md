@@ -4,6 +4,12 @@
 
 ## 🧹 清理
 
+- **README 版本历史瘦身**：包 README 移除「最近版本亮点」逐版本大表与逐小版本路线图表（~140 行），
+  压缩为指向 [CHANGELOG](CHANGELOG.md) 与 [GitHub Releases](https://github.com/slow-stack/dsh-mneme/releases)
+  的短节 + 一行进化链——版本说明以 Release 为唯一事实来源，日后发版不再需要同步改 README；
+  根 README 路线图的失效锚点改指 CHANGELOG。**新增「用在其他 AI 工具里（MCP）」速查节**
+  （根 README 双语）：Claude Code / Cursor / Codex / Hermes / OpenCode / OpenClaw 六客户端的最小
+  挂载配置表，包 README MCP 节头互链对齐。
 - **移除过时文档**：`docs/devlog/`（6 篇 v0.1.x 开发日志，叙事已被 CHANGELOG 覆盖且全仓库零引用）、
   `dsh-mneme/docs/MIGRATION.md`（v0.3→v0.4 升级说明，迁移幂等自动执行，现无适用场景）、根目录 `IDEA.md`
   （未跟踪的早期头脑草稿）。双 README 与 CONTRIBUTING 目录树中指向 MIGRATION.md 的 6 处链接同步移除；
