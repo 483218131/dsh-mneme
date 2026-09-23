@@ -1,0 +1,35 @@
+{
+  "name": "mneme-memory",
+  "description": "Cross-session memory for AI coding agents: six tools over a local-first SQLite store with Markdown mirror, semantic search and background consolidation.",
+  "author": "modusensus",
+  "repository": "https://github.com/slow-stack/mneme",
+  "package": "mneme-memory",
+  "license": "MIT",
+  "categories": ["Knowledge & Memory"],
+  "environmentVariables": [
+    {
+      "name": "DSH_MNEME_TOKEN",
+      "required": false,
+      "description": "Bearer token for the dsh-mneme standalone API (preferred legacy name)"
+    },
+    {
+      "name": "MNEME_TOKEN",
+      "required": false,
+      "description": "Bearer token for the dsh-mneme standalone API (new-package alias)"
+    },
+    {
+      "name": "DSH_MNEME_URL",
+      "required": false,
+      "description": "Base URL of the standalone API (default: http://127.0.0.1:8790)"
+    },
+    {
+      "name": "MNEME_URL",
+      "required": false,
+      "description": "Base URL alias (same priority rules as the token)"
+    }
+  ],
+  "command": {
+    "command": "npx",
+    "args": ["-y", "mneme-memory", "mneme-mcp"]
+  }
+}
