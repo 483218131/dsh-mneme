@@ -27,6 +27,19 @@
   时服务端重新排队嵌入，回收不是单程票。实测（活库副本上跑：177 个 run 的输入快照 + 295 行
   归档向量，磁盘足迹 69.5 MiB 到 50.8 MiB，VACUUM 含 checkpoint 1.2 s）与代价见
   [`docs/STORAGE.md`](docs/STORAGE.md)。
+- **写入准入第一阶段：只计量、不拦截（issue #254）**：新增 `src/write-admission.js`。会话写入
+  预算（g1）与同话题冷却（g2）两个闸门这一阶段只产遥测——不装阈值、不加拦截分支，写入行为
+  逐字节不变（维护者 2026-09-23 拍板口径「先记录不拦，由遥测定」，N 与 X 等真实分布再定）。
+  测量点落进既有 `llm_audit_logs`（`trigger_source='writeAdmission'`、`operation_type='write_admission'`、
+  `status='skipped'`、`metadata.gate='g1'`），并新增可空列 `session_key` 与索引：一行一个新建行，
+  「会话内新建条数」按会话直接计数即得；同话题新建行重复时在该行附 `metadata.g2`（`topic` 与
+  `gap_ms`），即得「同话题重写间隔」分布。口径收口在三处：只在新行上取测量点（并入已有行不算，
+  纯合并是去重机制在正常工作，也因此不刷新同话题基准）；pinned 类型（constraint / preference）
+  不进预算也不进基准，但仍照记一行（`metadata.exempt='pinned'`，穿透频率可观测）；无会话身份的
+  写入（dream / summarize / import / organize）不进预算。`llmAudit.enabled=false` 时一行都不写：
+  那个开关同时关掉了审计行的启动期清理，否则就是在无保留期的表里按写入频次增长。计量全程旁路，
+  任一步失败只 warn、绝不反噬写入；审计列表端点不外泄 `session_key`（内部计数键）。第二阶段的
+  拦截与 `memory_save({confirm:true})` 不在本批。
 - **MCP server 拆出独立包 `mneme-memory`（讨论 #300 双包方案第一批）**：根目录新增
   `mcp/` 包目录（bin 名 `mneme-mcp`），零依赖单文件从 `dsh-mneme/bin/` 迁出——工具面、
   渲染与 standalone API 数据面完全不变，插件包内旧 bin `dsh-mneme-mcp` 原样保留

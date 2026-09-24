@@ -29,7 +29,9 @@ const CODING_MEMORY_TYPES = new Set(["rejected_solution", "pitfall", "constraint
 // 注意 constraint 同时属于 CODING_MEMORY_TYPES，非编码任务里已被 codingGate
 // 滤掉，pin 池同样拿不到它；是否豁免该门控是待维护者拍板的口径问题，本批次
 // 不动既有门控（不放大行为面）。
-const PINNED_MEMORY_TYPES = new Set(["constraint", "preference"]);
+// 导出给写入准入（#254 的穿透口）与注入侧共用一份定义：两处各写一份 list 迟早
+// 漂移成「pin 池豁免了、预算没豁免」这类两套口径。
+export const PINNED_MEMORY_TYPES = new Set(["constraint", "preference"]);
 
 /**
  * 判断一段文本是否编码类任务（关键词匹配，codingRetrospect 读取侧门控）。
@@ -167,7 +169,7 @@ export function computeRetrievalMetrics(actualIds, expectedIds) {
   };
 }
 
-export function createService({ store, mirror, config, onWrite, logger, documentIndex }) {
+export function createService({ store, mirror, config, onWrite, logger, documentIndex, writeAdmission }) {
   const language = langOf(config);
   // Optional dream scheduler hook, installed via setDreamHook after creation
   // (the scheduler holds a reference back to the service, so it cannot be
@@ -1248,6 +1250,17 @@ export function createService({ store, mirror, config, onWrite, logger, document
       scheduleEmbed(result);
       return { action: "merged", memory: result };
     }
+    // #254 写入准入（第一阶段只计量）：决策恒 allow、不拦写入，只把两个闸门的
+    // 测量点算出来。放在 store.save 之前——第二阶段要在这里拦下写入，接缝先摆好。
+    // 计量是旁路：任何一环失败只 warn，绝不反噬写入（与质量打分同款容错）。
+    let admission = null;
+    if (writeAdmission) {
+      try {
+        admission = writeAdmission.evaluate({ memory, sessionKey: memory._sessionKey });
+      } catch (e) {
+        try { logger?.warn?.(`[dsh-mneme] write admission evaluate failed: ${String(e)}`); } catch { /* 不反噬 */ }
+      }
+    }
     const created = store.save({
       type: memory.type,
       title: memory.title,
@@ -1268,6 +1281,17 @@ export function createService({ store, mirror, config, onWrite, logger, document
       ...(quality ? { quality_score: quality.score } : {})
     });
     const result = applyQualityDisposition(created, quality, qf);
+    if (admission) {
+      try {
+        writeAdmission.record({
+          sessionKey: memory._sessionKey,
+          verdict: admission,
+          memoryId: created.id
+        });
+      } catch (e) {
+        try { logger?.warn?.(`[dsh-mneme] write admission record failed: ${String(e)}`); } catch { /* 不反噬 */ }
+      }
+    }
     afterSync("write");
     notifyWrite();
     scheduleEmbed(result);
