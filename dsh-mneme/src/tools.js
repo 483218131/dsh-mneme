@@ -489,7 +489,11 @@ export function createTools(ctx, service, config, embedder) {
         "intersects evidence with real memory ids (all-fabricated evidence is rejected; unknown ids are dropped and the row " +
         "is tagged evidence_degraded), and dedupes: re-registering the same path or title supersedes the old row (the old " +
         "file is never touched; content_history stays traceable), while a merely near-duplicate summary of a different " +
-        "document row is rejected — update that row instead. Use for 'where is the conclusion doc for this project?' " +
+        "document row is rejected — update that row instead. On success the absorbed atomic evidence rows leave the active " +
+        "face in the same transaction (recoverable, nothing deleted); constraint/preference rows and other " +
+        "document/summary rows are never auto-archived, and keep_evidence_active: true opts out. Ids this same document " +
+        "absorbed on an earlier version still count as its evidence, so re-registering a new version is not read as " +
+        "fabricated evidence. Use for 'where is the conclusion doc for this project?' " +
         "lookups; atomic facts still go to memory_save.",
       parameters: {
         path: { type: "string", required: true, description: "Absolute path of the document file (~ is expanded); must already exist as a non-empty regular file. The full text stays agent-owned — this pipeline never touches it." },
@@ -497,7 +501,8 @@ export function createTools(ctx, service, config, embedder) {
         summary: { type: "string", required: true, description: "One-paragraph summary stored in the DB and used for injection (any language)" },
         tags: { type: "array", items: { type: "string" }, description: "Optional tags (English recommended)" },
         importance: { type: "integer", description: "1-5 (default 3); the summary row injects at the next-priority tier within documentInjectBudget when importance >= threshold" },
-        evidence: { type: "array", items: { type: "string" }, description: "Memory ids this document is grounded in; each is verified against the store (fabricated evidence is rejected; unknown/archived ids are dropped and the row is tagged evidence_degraded)" },
+        evidence: { type: "array", items: { type: "string" }, description: "Memory ids this document is grounded in (atomic facts, not other pointer rows); each is verified against the store — fabricated evidence is rejected, unknown/archived ids are dropped and the row is tagged evidence_degraded, except ids this same document absorbed on an earlier version, which stay its evidence. On success the absorbed atomic rows leave the active face unless keep_evidence_active is true." },
+        keep_evidence_active: { type: "boolean", description: "Opt out of archiving the evidence rows absorbed by this document. Default false: after a successful registration the absorbed atomic rows leave the active face (recoverable, nothing deleted; constraint/preference rows and other document/summary rows are never auto-archived)." },
         source: { type: "string", description: "Optional provenance" },
         sensitivity: { type: "string", description: "Optional sensitivity label (free-form, e.g. personal). Part of the supersede matching key — same path/title with a different sensitivity stays a separate document." },
         agent_scope: { type: "string", description: "Optional explicit agent-scope declaration (issue #170): 'global' or '*' makes this document visible to every agent; any other value narrows it to that label. Overrides the automatic carrier label for this write; honored even when automatic scope labeling is disabled." },
@@ -513,12 +518,13 @@ export function createTools(ctx, service, config, embedder) {
             superseded_id: { type: "string" },
             evidence_kept: { type: "integer", required: true },
             evidence_dropped: { type: "integer", required: true },
+            evidence_archived: { type: "integer", required: true },
             degraded: { type: "boolean", required: true }
           }
         },
         render: (_args, value) => {
           const sup = value.superseded_id ? ` (supersedes ${value.superseded_id})` : "";
-          const ev = ` | evidence: ${value.evidence_kept} kept, ${value.evidence_dropped} dropped${value.degraded ? " [degraded]" : ""}`;
+          const ev = ` | evidence: ${value.evidence_kept} kept, ${value.evidence_dropped} dropped, ${value.evidence_archived} archived${value.degraded ? " [degraded]" : ""}`;
           return TEXT_OUTPUT(`document ${value.action}: ${value.id}${sup}${ev}`);
         }
       },
@@ -557,13 +563,18 @@ export function createTools(ctx, service, config, embedder) {
           ...(args.sensitivity !== undefined ? { sensitivity: args.sensitivity } : {}),
           ...(agentLabel ? { agent_scope: agentLabel.value, agent_scope_source: agentLabel.source } : {}),
           ...(workspaceLabel ? { workspace_scope: workspaceLabel.value, workspace_scope_source: workspaceLabel.source } : {})
-        }, { hiddenEvidenceIds: hiddenEvidence });
+        }, {
+          hiddenEvidenceIds: hiddenEvidence,
+          // 默认开着归档（#275 拍板 5）；agent 显式要保留活跃面时走 keep_evidence_active。
+          archiveEvidence: args.keep_evidence_active !== true
+        });
         return {
           action: result.action,
           id: result.memory.id,
           ...(result.superseded ? { superseded_id: result.superseded.id } : {}),
           evidence_kept: result.evidence_kept,
           evidence_dropped: result.evidence_dropped,
+          evidence_archived: result.evidence_archived,
           degraded: result.degraded
         };
       }

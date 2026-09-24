@@ -8,7 +8,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createStore } from "../src/store.js";
-import { createService } from "../src/service.js";
+import { createService, PINNED_MEMORY_TYPES } from "../src/service.js";
 import { createDocumentRegistrar } from "../src/document.js";
 import { MEMORY_ITEM_SCHEMA } from "../src/tools.js";
 import { TYPE_DECAY_DEFAULTS } from "../src/heat.js";
@@ -30,7 +30,7 @@ async function makeDocDir() {
 }
 
 /** 单元级 registrar：注入假 embedQuery，隔离 vector 档行为。 */
-function makeRegistrar(store, config = {}, embedQuery = async () => null) {
+function makeRegistrar(store, config = {}, embedQuery = async () => null, { pinnedTypes = PINNED_MEMORY_TYPES } = {}) {
   const finalized = [];
   const register = createDocumentRegistrar({
     store,
@@ -42,7 +42,9 @@ function makeRegistrar(store, config = {}, embedQuery = async () => null) {
       ...(Array.isArray(existing?.content_history) ? existing.content_history : [])
     ].slice(0, 20),
     transaction: (fn) => fn(),
-    finalize: (rows) => finalized.push(...rows)
+    finalize: (rows) => finalized.push(...rows),
+    // #275 拍板 5：service.js 注入的 #249 逐字保真池（这里同款注入，保持行为一致）
+    pinnedTypes
   });
   return { register, finalized };
 }
@@ -141,6 +143,152 @@ test("evidence intersection: valid subset kept, unknown dropped + degraded tag, 
     assert.equal(clean.degraded, false);
     assert.deepEqual(clean.memory.evidence, []);
     assert.ok(!clean.memory.tags.includes("evidence_degraded"));
+  } finally {
+    cleanup();
+    close();
+  }
+});
+
+// ============================ 升格吸收的 evidence 归档（#275 拍板 5，同事务）
+
+// 拍板原文：registerDocument 成功后同一事务把 absorbed 的 evidence 行翻 archived
+// （可恢复、审计全留），带 opt-out；pinned（constraint / preference）永不自动归档；
+// supersede 的 loser 行同样翻 archived（后者本来就是本模块既有行为，这里一并锁住）。
+
+test("absorbed evidence rows are archived with the document; pinned rows are exempt", async () => {
+  const { store, service, close } = makeService({ documentMemoryEnabled: true });
+  const { writeDoc, cleanup } = await makeDocDir();
+  try {
+    const pinned = service.saveWithDedupe({ type: "constraint", title: "C", content: "边界条件" }).memory;
+    const decision = service.saveWithDedupe({ type: "decision", title: "D", content: "一个决定" }).memory;
+    const p = await writeDoc("absorb.md");
+
+    const res = await service.registerDocument({
+      path: p, title: "Absorb", summary: "summary", evidence: [pinned.id, decision.id]
+    });
+
+    assert.equal(res.evidence_kept, 2, "引用本身照旧全留下：doc 行的 evidence 数组是正向链");
+    assert.equal(res.evidence_archived, 1, "只有非 pinned 的那条被动");
+    const after = service.getById(decision.id);
+    assert.equal(after.archived, true, "被吸收的行退出活跃面（「21 行不是 1 行」）");
+    assert.equal(after.content, "一个决定", "只翻标志位：内容与审计全留（可恢复）");
+    assert.equal(service.getById(pinned.id).archived, false, "#249 的逐字保真池，升格不能绕过");
+    assert.equal(store.list().some((m) => m.id === decision.id), false, "默认面不再列出吸收行");
+  } finally {
+    cleanup();
+    close();
+  }
+});
+
+test("archiveEvidence: false（工具侧 keep_evidence_active）保留吸收行的活跃面", async () => {
+  const { service, close } = makeService({ documentMemoryEnabled: true });
+  const { writeDoc, cleanup } = await makeDocDir();
+  try {
+    const d = service.saveWithDedupe({ type: "decision", title: "D", content: "c" }).memory;
+    const res = await service.registerDocument(
+      { path: await writeDoc("optout.md"), title: "OptOut", summary: "s", evidence: [d.id] },
+      { archiveEvidence: false }
+    );
+    assert.equal(res.evidence_kept, 1);
+    assert.equal(res.evidence_archived, 0, "opt-out 时不归档");
+    assert.equal(service.getById(d.id).archived, false);
+  } finally {
+    cleanup();
+    close();
+  }
+});
+
+test("re-registering a document whose evidence was absorbed keeps the references", async () => {
+  // 这条防的是「补丁把常规路径打坏」：吸收行一旦归档，重注册同一份文档（出新版）
+  // 时同一批 evidence 会全落 dropped，进而撞上捏造判据——最常规的路径反而报错。
+  const { service, close } = makeService({ documentMemoryEnabled: true });
+  const { writeDoc, cleanup } = await makeDocDir();
+  try {
+    const d = service.saveWithDedupe({ type: "decision", title: "D", content: "c" }).memory;
+    const p = await writeDoc("ver.md");
+    const first = await service.registerDocument({ path: p, title: "Ver", summary: "v1", evidence: [d.id] });
+    assert.equal(first.evidence_archived, 1);
+
+    const second = await service.registerDocument({ path: p, title: "Ver", summary: "v2", evidence: [d.id] });
+    assert.equal(second.action, "superseded");
+    assert.deepEqual(second.memory.evidence, [d.id], "吸收行仍为它所属的那份文档背书");
+    assert.equal(second.evidence_kept, 1);
+    assert.equal(second.degraded, false, "不误报成捏造证据");
+    // 认回是窄口径的：已归档行只为**吸收它的那份**文档背书。别的文档（新注册、无
+    // 同名目标）拿它当证据，照旧走既有的捏造判据——不因为这条补丁放宽。
+    const other = await writeDoc("other.md");
+    await assert.rejects(
+      () => service.registerDocument({ path: other, title: "Other", summary: "s", evidence: [d.id] }),
+      /fabricated evidence is rejected/
+    );
+  } finally {
+    cleanup();
+    close();
+  }
+});
+
+test("registrar without the pinned pool wiring archives nothing (fail-safe)", async () => {
+  // 拿不到 pinned 集合就不做这一步：宁可少做，也不能把保真池当普通行收走。
+  const store = createStore(":memory:");
+  const { writeDoc, cleanup } = await makeDocDir();
+  try {
+    const d = store.save({ type: "decision", title: "D", content: "c" });
+    const { register } = makeRegistrar(store, { documentMemoryEnabled: true }, async () => null, { pinnedTypes: null });
+    const res = await register({ path: await writeDoc("noset.md"), title: "NoSet", summary: "s", evidence: [d.id] });
+    assert.equal(res.evidence_archived, 0);
+    assert.equal(store.getById(d.id).archived, false);
+  } finally {
+    cleanup();
+    store.close();
+  }
+});
+
+test("自有生命周期的类型不被吸收：document 行保持活跃，同 path 的 supersede 链不断", async () => {
+  // 回归点（单盲审查 H1）：把另一份 document 行当 evidence 时，若照普通行吸收，它会
+  // 被静默归档——走不到 loser 分支（没有 [superseded by] 指针与 content_history），
+  // 而 supersede 探测只看活跃行，于是重注册同 path 会再铸一行、同一个文件留下两行。
+  const { store, service, close } = makeService({ documentMemoryEnabled: true });
+  const { writeDoc, cleanup } = await makeDocDir();
+  try {
+    const pA = await writeDoc("a.md");
+    const docA = (await service.registerDocument({ path: pA, title: "DocA", summary: "v1" })).memory;
+    const docB = await service.registerDocument({
+      path: await writeDoc("b.md"), title: "DocB", summary: "grounded in A", evidence: [docA.id]
+    });
+    assert.equal(docB.evidence_archived, 0, "document 行不参与吸收");
+    assert.equal(service.getById(docA.id).archived, false, "被引用不改变它的活跃状态");
+
+    const again = await service.registerDocument({ path: pA, title: "DocA", summary: "v2" });
+    assert.equal(again.action, "superseded", "指针行仍能被 supersede 探测看到");
+    assert.equal(again.superseded.id, docA.id);
+    assert.ok(again.superseded.content.includes(again.memory.id), "旧行拿到 [superseded by] 指针");
+    assert.equal(store.all().filter((m) => m.doc_path === pA).length, 2, "同一 path 一行新版 + 一行带指针的旧版，没有多余的第三行");
+  } finally {
+    cleanup();
+    close();
+  }
+});
+
+test("自有生命周期的类型不被吸收：summary（dream 总览）保持活跃，不会被当成不存在重铸", async () => {
+  // 回归点：summary 按 source 身份去重（dream 总览）且按注入档位常驻。被吸收归档后
+  // 去重候选集（store.list 默认排除归档）看不到它 → 下一次做梦会再铸一行同源总览。
+  const { service, close } = makeService({ documentMemoryEnabled: true });
+  const { writeDoc, cleanup } = await makeDocDir();
+  try {
+    const digest = service.saveWithDedupe({
+      type: "summary", title: "当前项目状态", content: "resident digest", source: "dream", importance: 5
+    }).memory;
+    const res = await service.registerDocument({
+      path: await writeDoc("with-digest.md"), title: "DocW", summary: "s", evidence: [digest.id]
+    });
+    assert.equal(res.evidence_archived, 0, "summary 不参与吸收");
+    assert.equal(service.getById(digest.id).archived, false);
+
+    const again = service.saveWithDedupe({
+      type: "summary", title: "当前项目状态", content: "resident digest v2", source: "dream", importance: 5
+    });
+    assert.equal(again.action, "merged", "下一次做梦仍认得出这行，不会铸出第二行同源总览");
+    assert.equal(again.memory.id, digest.id);
   } finally {
     cleanup();
     close();

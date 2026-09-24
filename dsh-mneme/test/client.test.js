@@ -25,6 +25,15 @@ test("client bundle is lib-only with no src counterpart", () => {
   assert.equal(existsSync(join(root, "lib/client.js")), true, "lib/client.js must exist");
 });
 
+// 归档侧第五指标（#275）自己按「归档区为空就整段省略」门控，但整卡还有一道 hasData 门：
+// 那道门只认召回回执与活跃僵尸行时，「全归档 + 窗口内无回执」的库会直接 return null，
+// 指标永远不显示（自动评审 #312 指出的回归）。这里锁死 hasData 必须把 archive.total 计进来。
+test("status card: hasData counts the archive metric", () => {
+  const m = clientSource.match(/const hasData =[^;]+;/);
+  assert.ok(m, "the status card must declare hasData");
+  assert.match(m[0], /d\.archive\?\.total/, "hasData must count archive.total, not just runs/active rows");
+});
+
 // The memory entry lives at the sidebar foot, not in the settings modal: the
 // migration must register into `sidebar.footer.action` (the list slot the
 // sidebar shell renders beside Settings) and must not keep a `settings.section`

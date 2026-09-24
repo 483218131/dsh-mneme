@@ -5,6 +5,8 @@
 // 新内聚块从第一行就落在自己的文件里，service.js 保留 barrel 出口、调用方零改动。
 // 纯读不写，绝不触发任何 write hook。
 
+import { scopeKeyOf } from "./scope.js";
+
 /**
  * 口径（issue #217 评论 2026-09-18，锚 5bd2dab）：
  *  - Top-N：窗口内 recall_runs.candidates（最终返回集）按 id 计数，join
@@ -20,6 +22,17 @@
  *  - coverage：recallRecordDefault 开启前的窗口算不到，earliestRunAt 为
  *    null（窗口内无回执）或早于窗口起点时，前端标注可信度；扫描行数有
  *    上限，超出标 truncated（degraded 口径），不静默少算。
+ *  - archive（#275 拍板的第五指标，与上面几项同位）：
+ *    · total = 归档区现有行数；addedInWindow / perDay = 窗口内进入归档区的行数
+ *      与其日均（净增速率）。归档时刻只能取 updated_at（setArchived 翻标志位时刷
+ *      它）——这是代理口径：对已归档行做一次 memory_update，或对同一行重复调
+ *      setArchived(…, true)，都会被算成「本窗口新进归档」，perDay 因此偏高。精确
+ *      口径要一个 archived_at 列（schema 变更，属第二批题材），本版不加；真正的
+ *      「净」增本来也要跨快照比 total（物理删除落地后，差值才会由负向变化体现）。
+ *    · compressible = 可压掉行数：同 type、同 scope 三维且内容哈希完全相同的归档
+ *      行里，多出来的那些（每组留一行）。用内容哈希而不是向量近重复，是因为回收
+ *      动作本身会清掉归档行向量（clearArchivedEmbeddings）——指标不能建在它自己
+ *      的输入会被回收掉的数据上；精确重复与 #254 的计量口径同一把尺。
  *
  * @param {object} store - createStore 产物（只调用 listRecallRunsSince / all）
  * @param {{ windowDays?: number, exemptDays?: number }} [options]
@@ -36,7 +49,8 @@ export function recallStats(store, options = {}) {
   const rawSlots = Number(options.maxInjectSlots ?? 5);
   const maxInjectSlots = Number.isInteger(rawSlots) && rawSlots >= 1 ? rawSlots : 5;
   const now = Date.now();
-  const since = new Date(now - windowDays * 86400000).toISOString();
+  const sinceMs = now - windowDays * 86400000;
+  const since = new Date(sinceMs).toISOString();
 
   const { rows: runs, total } = store.listRecallRunsSince(since);
   const hits = new Map(); // id -> { count, title, source }
@@ -67,8 +81,29 @@ export function recallStats(store, options = {}) {
   let activeCount = 0;
   let zombieCount = 0;
   let exemptCount = 0;
+  // 第五指标（#275）：归档区一侧单独累计，分组键与 #254 的去重候选集同构
+  // （type + 哈希 + scope 三维）——可压掉的必须是「本来就会被判成同一件事」的行。
+  let archivedTotal = 0;
+  let archivedInWindow = 0;
+  const hashGroups = new Map();
   for (const m of memories) {
-    if (m.archived || m.forgotten) continue;
+    if (m.archived) {
+      archivedTotal += 1;
+      const archivedMs = Date.parse(m.updated_at ?? "");
+      if (Number.isFinite(archivedMs) && archivedMs >= sinceMs) archivedInWindow += 1;
+      if (m.content_hash) {
+        const key = [
+          m.type ?? "",
+          m.content_hash,
+          scopeKeyOf(m.agent_scope) ?? "",
+          scopeKeyOf(m.workspace_scope) ?? "",
+          scopeKeyOf(m.sensitivity) ?? ""
+        ].join("\u0000");
+        hashGroups.set(key, (hashGroups.get(key) ?? 0) + 1);
+      }
+      continue;
+    }
+    if (m.forgotten) continue;
     const createdMs = Date.parse(m.created_at ?? "");
     // created_at 解析不了时无法证明已过机会期 → 归入豁免，宁漏勿误伤
     if (!Number.isFinite(createdMs) || now - createdMs < EXEMPT_MS) {
@@ -98,6 +133,14 @@ export function recallStats(store, options = {}) {
     .sort((a, b) => b.count - a.count || a.id.localeCompare(b.id))
     .slice(0, 10);
 
+  let compressibleGroups = 0;
+  let compressibleRows = 0;
+  for (const n of hashGroups.values()) {
+    if (n < 2) continue;
+    compressibleGroups += 1;
+    compressibleRows += n - 1;
+  }
+
   return {
     windowDays,
     generatedAt: new Date(now).toISOString(),
@@ -113,6 +156,13 @@ export function recallStats(store, options = {}) {
       slotFillRate: injectRuns > 0 ? injectedCount / (injectRuns * maxInjectSlots) : null
     },
     topRecalled,
+    // #275 第五指标：归档净增速率 + 可压掉行数（口径见文件头）
+    archive: {
+      total: archivedTotal,
+      addedInWindow: archivedInWindow,
+      perDay: Math.round((archivedInWindow / windowDays) * 100) / 100,
+      compressible: { rows: compressibleRows, groups: compressibleGroups }
+    },
     zombie: {
       activeCount,
       zombieCount,
