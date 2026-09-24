@@ -60,20 +60,34 @@ export function isManagedDocumentPath(dir, path) {
 // id + 旧行 content_history 里的旧摘要（source=superseded）。
 const supersededByPointer = (id) => `\n\n[superseded by ${id}]`;
 
+// 升格吸收不碰的类型（#275 拍板 5 的边界）：吸收的对象是「原子条」，而下面这两种
+// 行各有自己的生命周期，被归档会各自留下第二行——
+//   document：本体是磁盘上的文件。归档它等于替用户撤下外档；而且 supersede 探测
+//     只看活跃行（store.list 默认排除归档），同一 path 下次注册会在旧行还挂着
+//     「新版本」语义时再铸一行，指针注记与 content_history 记账也走不到。
+//   summary：dream 总览与叙述按 source 身份去重、并按注入档位常驻。归档它会让下一
+//     次做梦把它当不存在（候选集同样只取活跃行），于是库里多出一行同源总览。
+// 口径是保守方向的：拿不准的行一律不吸收——少做一步没有代价，收错一步是内容事故。
+const ABSORB_EXEMPT_TYPES = new Set(["document", "summary"]);
+
 /**
  * Build the document registrar. Injected deps are service.js closure members
  * (store / embedQuery / transaction / finalize) so this module stays free of
  * service-internal wiring; `finalize` is the single write epilogue (mirror
  * sync + notify + re-embed) so callers never duplicate it.
  *
- * @returns {(payload: object) => Promise<object>}
+ * `pinnedTypes` 是注入的 #249 逐字保真池（service.js 的 PINNED_MEMORY_TYPES）：
+ * 这里不 import 它在 service.js 里，是因为 service.js 反向 import 本模块——
+ * 方向反了会成环。
+ *
+ * @returns {(payload: object, opts?: object) => Promise<object>}
  *   `{ action: "created"|"superseded", memory, superseded?, evidence_kept,
- *      evidence_dropped, degraded }`
+ *      evidence_dropped, evidence_archived, degraded }`
  * @throws flag 关 / 路径非法或文件缺失 / title 或 summary 为空 / evidence 全部
  *   捏造 / 仅 vector 近重复（疑似重复外档，交 agent 裁决而不是静默二选一）。
  */
-export function createDocumentRegistrar({ store, config, embedQuery, pushContentHistory, transaction, finalize }) {
-  return async function registerDocument(payload, { hiddenEvidenceIds = [] } = {}) {
+export function createDocumentRegistrar({ store, config, embedQuery, pushContentHistory, transaction, finalize, pinnedTypes }) {
+  return async function registerDocument(payload, { hiddenEvidenceIds = [], archiveEvidence = true } = {}) {
     // opt-in 总闸（#230 对齐 #228 形态）：关 = 注册入口整体不存在，错误信息
     // 指回配置键，agent 能准确转告用户去开。
     if (config?.documentMemoryEnabled !== true) {
@@ -121,14 +135,13 @@ export function createDocumentRegistrar({ store, config, embedQuery, pushContent
     const hidden = new Set((Array.isArray(hiddenEvidenceIds) ? hiddenEvidenceIds : []).map((id) => String(id)));
     const kept = [];
     const dropped = [];
+    // 存在但已归档的引用另记一份：它可能是被上一版文档升格吸收走的行（见下方
+    // supersede 目标探测后的「认回」），不能一律按「不可用」处理。
+    const archivedRefs = new Set();
     for (const id of wanted) {
       const row = hidden.has(id) ? null : store.getById(id);
+      if (row?.archived) archivedRefs.add(id);
       (row && !row.archived ? kept : dropped).push(id);
-    }
-    if (wanted.length > 0 && kept.length === 0) {
-      throw new Error(
-        `registerDocument: all ${wanted.length} evidence ids are unknown, archived or out of scope — fabricated evidence is rejected`
-      );
     }
 
     const title = String(payload?.title ?? "").trim();
@@ -162,6 +175,25 @@ export function createDocumentRegistrar({ store, config, embedQuery, pushContent
       .filter((m) => scopeMatches(m));
     const explicitTarget = scopeMatched.find((m) => samePath(m.doc_path, expanded))
       ?? scopeMatched.find((m) => m.title.trim() === title);
+    // 升格吸收过的引用认回（#275 拍板 5 的配套）：evidence 行在文档注册成功后就翻了
+    // archived，于是「同一份文档出新版、evidence 照旧」这一最常规的路径会整批落在
+    // dropped——那会被下面的捏造判据误报成「证据都是编的」。口径：已归档行仍可为
+    // **吸收它的那份文档**背书（loser.evidence 就是它吸收走的名单），不为别的文档
+    // 背书；捏造与跨 scope 照旧拒绝。
+    if (explicitTarget) {
+      const own = new Set(explicitTarget.evidence ?? []);
+      for (const id of archivedRefs) {
+        if (!own.has(id)) continue;
+        const at = dropped.indexOf(id);
+        if (at >= 0) dropped.splice(at, 1);
+        kept.push(id);
+      }
+    }
+    if (wanted.length > 0 && kept.length === 0) {
+      throw new Error(
+        `registerDocument: all ${wanted.length} evidence ids are unknown, archived or out of scope — fabricated evidence is rejected`
+      );
+    }
     if (!explicitTarget) {
       // vector 档：embedder 不可用/向量缺失一律跳过——去重是增强不是写入依赖
       // （findSessionDuplicate 同原则）。probe 用 title+summary，与行向量
@@ -237,7 +269,25 @@ export function createDocumentRegistrar({ store, config, embedQuery, pushContent
         store.setArchived(loser.id, true);
         superseded = store.getById(loser.id);
       }
-      return { created, superseded };
+      // #275 拍板 5（#230 验收口径的补丁）：升格吸收的 evidence 行随之退出活跃面——
+      // 一次吸收 20 条，库里就是「21 行不是 1 行」。四条口径：①与本行同一事务（要么
+      // 都成、要么都不成）；②pinned（constraint / preference，即 #249 的逐字保真池）
+      // 永不自动归档——升格不能绕过它；③自有生命周期的类型（document / summary，见
+      // ABSORB_EXEMPT_TYPES）不吸收，吸收的是原子条；④只翻标志位、内容与审计全留
+      // （可恢复），opt-out 走 archiveEvidence。
+      // pinnedTypes 拿不到就不做这一步：宁可少做，也不能把保真池当普通行收走。
+      let evidenceArchived = 0;
+      if (archiveEvidence && pinnedTypes && typeof pinnedTypes.has === "function") {
+        for (const id of kept) {
+          // 事务内重读：期间被别的进程归档/遗忘的行不重复计数，也不误伤 pinned。
+          const row = store.getById(id);
+          if (!row || row.archived || row.forgotten) continue;
+          if (pinnedTypes.has(row.type) || ABSORB_EXEMPT_TYPES.has(row.type)) continue;
+          store.setArchived(id, true);
+          evidenceArchived += 1;
+        }
+      }
+      return { created, superseded, evidenceArchived };
     });
     finalize(result.superseded ? [result.created, result.superseded] : [result.created]);
     return {
@@ -246,6 +296,7 @@ export function createDocumentRegistrar({ store, config, embedQuery, pushContent
       ...(result.superseded ? { superseded: result.superseded } : {}),
       evidence_kept: kept.length,
       evidence_dropped: dropped.length,
+      evidence_archived: result.evidenceArchived,
       degraded: dropped.length > 0
     };
   };
