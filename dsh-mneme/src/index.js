@@ -12,6 +12,8 @@ import { createDreamScheduler } from "./dream.js";
 import { createSleepScheduler, runSleep } from "./dream/sleep.js";
 import { createApi } from "./api.js";
 import { createStandaloneApi } from "./api-standalone.js";
+// #275 存储生命周期第一批：无损回收（手动入口，不挂启动路径）。
+import { createMaintenance } from "./maintenance.js";
 import { createSettings } from "./settings.js";
 import { createCommandManager } from "./commands.js";
 import { createEmbedder } from "./embedding.js";
@@ -580,13 +582,19 @@ export const apply = (ctx, config) => {
     disposers.push(api.dispose);
   }
 
+  // #275 存储生命周期第一批：无损回收的手动入口。刻意不挂启动路径、不接定时器——
+  // 这一步是不可逆的内容丢弃，只由人显式触发（`dsh-mneme reclaim`）。实例在这里建、
+  // 在 standalone API 上暴露，是为了让 CLI 能在插件进程内跑（VACUUM 要排他锁，跟宿主
+  // 抢锁的那条路走不通）。
+  const maintenance = createMaintenance({ store, config: cfg, logger: ctx.logger });
+
   // Standalone external API (v0.7.12): plain node:http server for ecosystem
   // integrations outside the DSH host. Persisted external_api settings win
   // over the bundle config (enabled/port); the Bearer token lives in the same
   // kv and is auto-generated on first boot by createStandaloneApi. Binding a
   // non-loopback host is the operator's documented responsibility.
   if ((settings.getExternalApi?.()?.enabled ?? cfg.externalApiEnabled) === true) {
-    const standalone = createStandaloneApi({ service, store, config: cfg, logger: ctx.logger, settings });
+    const standalone = createStandaloneApi({ service, store, config: cfg, logger: ctx.logger, settings, maintenance });
     disposers.push(() => standalone.server.close());
     standalone.ready.catch((error) => {
       ctx.logger?.warn?.(`[dsh-mneme] standalone API failed to start: ${String(error)}`);

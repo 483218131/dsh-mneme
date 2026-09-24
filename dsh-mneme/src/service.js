@@ -2162,6 +2162,12 @@ export function createService({ store, mirror, config, onWrite, logger, document
   function archiveMemory(id, f) {
     const updated = store.setArchived(id, f);
     afterSync("write");
+    // #275 B 项：归档行的向量会被手动回收清掉（检索恒带 archived = 0，按定义不可达），
+    // 还原回活跃面时补一次嵌入——否则那行只剩关键词可检索，回收就成了单程票。
+    // 判据用真值（`!f`）而不是 `f === false`：store.setArchived 自己就是按真值归一
+    // （`archived ? 1 : 0`），API/工具传 0 或空串同样会把行放回活跃面，口径必须同一把尺。
+    // 排队语义与写入路径同一处（txDepth / 未就绪由 scheduleEmbed 自己挡）。
+    if (!f) scheduleEmbed(updated);
     return updated;
   }
 
