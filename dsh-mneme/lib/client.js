@@ -68,7 +68,19 @@ window.__ModuleLoader__.load({
       if (ops.filter((o) => o.kind !== "same").length > 200) return null;
       return ops;
     }
-    const IconArchiveOutline20 = primitives.IconArchiveOutline20;
+    // #287 归档图标跨代兼容：primitives 在 0.1.7 把图标命名从「像素后缀」改成
+    // 「字重后缀」（IconArchiveOutline20 → …OutlineRegular / …OutlineMedium），
+    // 旧名不留别名，而 peerDependencies 同时覆盖 0.1.6 与 0.1.7 两代宿主——
+    // 只认某一代的名字，另一代就会取到 undefined，h(undefined) 即 React #130
+    // （整个 slot entry 崩掉）。故按「旧名 → 新名」顺序取第一个存在的；
+    // 两代都缺时降级为不渲染图标，宁可无图标也不把 slot 打崩。
+    const IconArchive = primitives.IconArchiveOutline20
+      ?? primitives.IconArchiveOutlineRegular
+      ?? primitives.IconArchiveOutlineMedium
+      ?? null;
+
+    /** 渲染归档图标；宿主未提供任一候选名时返回 null（无图标，不影响其余内容）。 */
+    const renderArchiveIcon = (props) => (IconArchive ? h(IconArchive, props) : null);
 
     // Portal target for the hero fallback surface. The host whitelists
     // react-dom for its own bundles (dsh-client-ui-trajectory requires it);
@@ -2874,7 +2886,7 @@ window.__ModuleLoader__.load({
         h("div", { className: "mneme-overlay", role: "region", "aria-label": t("memory.view.label"), ref: panelRef },
           h("div", { className: "mneme-overlaybar" },
             h("span", { className: "mneme-overlaytitle" },
-              h(IconArchiveOutline20, { size: 15 }),
+              renderArchiveIcon({ size: 15 }),
               t("memory.view.label")
             ),
             h("button", {
@@ -4696,7 +4708,7 @@ window.__ModuleLoader__.load({
           onClick: openLibrary,
           "data-mneme-overlay-opener": "true"
         },
-          h(IconArchiveOutline20, { size: wide ? 16 : 18 }),
+          renderArchiveIcon({ size: wide ? 16 : 18 }),
           wide && h("span", { className: "mneme-trigger-label" }, t("memory.panel.open"))
         ),
         h(ConflictBadge, { pending })
@@ -4789,7 +4801,7 @@ window.__ModuleLoader__.load({
             onClick: openLibrary,
             "data-mneme-overlay-opener": "true"
           },
-            h(IconArchiveOutline20, { size: wide ? 15 : 18 }),
+            renderArchiveIcon({ size: wide ? 15 : 18 }),
             wide && h("span", { className: "mneme-topentry-label" }, t("memory.panel.open")),
             h(ConflictBadge, { pending })
           )
@@ -4851,7 +4863,7 @@ window.__ModuleLoader__.load({
                   reg.registerTab({
                     id: TAB_ID,
                     title: () => t("memory.view.label"),
-                    icon: (size) => h(IconArchiveOutline20, { size }),
+                    icon: (size) => renderArchiveIcon({ size }),
                     order: 60,
                     component: () => h(MemoryExplorer, { t })
                   });

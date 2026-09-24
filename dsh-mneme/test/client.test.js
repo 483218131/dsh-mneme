@@ -322,6 +322,35 @@ test("graph toggle uses a node-graph glyph, not the share icon", () => {
   );
 });
 
+// #287 跨代图标守卫：primitives 在 0.1.7 把归档图标从「像素后缀」改名成「字重后缀」
+// （IconArchiveOutline20 → …OutlineRegular / …OutlineMedium），旧名不留别名，而
+// peerDependencies 仍同时覆盖 0.1.6 与 0.1.7 两代宿主。只认某一代的名字，另一代就会
+// 把 undefined 交给 h()，落成 slot entry 里的 React #130（该 entry 整块崩），因此必须
+// 探测两代名字、并在全缺时降级为不渲染图标。
+test("#287: archive glyph probes both naming generations and degrades to no glyph", () => {
+  assert.ok(
+    /primitives\.IconArchiveOutline20\s*\?\?\s*primitives\.IconArchiveOutlineRegular\s*\?\?\s*primitives\.IconArchiveOutlineMedium/.test(clientSource),
+    "the glyph must probe the 0.1.6 pixel name before the 0.1.7 weight names"
+  );
+  assert.equal(
+    /h\(IconArchiveOutline20/.test(clientSource),
+    false,
+    "the raw constant must never reach h() — on a host lacking that name it renders undefined (React #130)"
+  );
+  assert.ok(
+    /const renderArchiveIcon = \(props\) => \(IconArchive \? h\(IconArchive, props\) : null\)/.test(clientSource),
+    "the glyph must render through a null-guarded helper so a missing icon degrades to nothing"
+  );
+  for (const site of [
+    "renderArchiveIcon({ size: 15 })",              // 浮层标题栏
+    "renderArchiveIcon({ size: wide ? 16 : 18 })",  // 侧栏 trigger
+    "renderArchiveIcon({ size: wide ? 15 : 18 })",  // portal 到宿主原生侧栏的入口
+    "renderArchiveIcon({ size })"                   // better-sidebar tab 图标
+  ]) {
+    assert.ok(clientSource.includes(site), `every render site must go through the helper: ${site}`);
+  }
+});
+
 // 方案 A：查询收敛。状态页只做仪表盘（小页预览 + 服务端 total + 查看全部），
 // 沉淀/归档的完整浏览走记忆库的 deposited/archived 筛选视图（chip 预置 +
 // 状态页入口跳转），详情抽屉给归档记忆一个反向的「恢复」。
