@@ -559,6 +559,7 @@ window.__ModuleLoader__.load({
         "memory.status.recallStats": "记忆复用",
         "memory.status.recallHint": "复用率 {rate} · 僵尸 {zombie}/{active}（豁免 {exempt}）· 30 天回执 {runs} 次 · Top：{top}",
         "memory.status.recallInject": "注入 {runs} 轮 {count} 条，槽位填充 {fill}%",
+        "memory.status.recallArchive": "归档 {total} 行（{add}/天），精确重复可压掉 {compress} 行",
         "memory.status.viewAll": "查看全部",
         "memory.status.depositedCount": "沉淀的记忆（{n}）",
         "memory.status.archivedCount": "已归档的记忆（{n}）",
@@ -946,6 +947,7 @@ window.__ModuleLoader__.load({
         "memory.status.recallStats": "Recall reuse",
         "memory.status.recallHint": "reuse {rate} · zombie {zombie}/{active} (exempt {exempt}) · {runs} runs in 30d · top: {top}",
         "memory.status.recallInject": "injected {runs} turns · {count} items ({fill}% slots)",
+        "memory.status.recallArchive": "archived {total} rows (+{add}/day) · {compress} exactly-duplicate rows compressible",
         "memory.status.viewAll": "View all",
         "memory.status.depositedCount": "Deposited memories ({n})",
         "memory.status.archivedCount": "Archived memories ({n})",
@@ -3613,7 +3615,7 @@ window.__ModuleLoader__.load({
     // 口径不可信）或库为空时整卡不渲染，前端不感知；truncated（扫描超上限）
     // 只影响 hint 里的回执计数，不挡渲染。
     function RecallStatsCard({ t }) {
-      const [state, setState] = useState({ loading: true, off: false, rate: null, zombie: 0, active: 0, exempt: 0, runs: 0, top: "", inject: "" });
+      const [state, setState] = useState({ loading: true, off: false, rate: null, zombie: 0, active: 0, exempt: 0, runs: 0, top: "", inject: "", archive: "" });
       useEffect(() => {
         let cancelled = false;
         apiFetch("/api/dsh-mneme/recall-stats?window=30")
@@ -3621,7 +3623,11 @@ window.__ModuleLoader__.load({
           .then((d) => {
             if (cancelled) return;
             const z = d.zombie || {};
-            const hasData = (d.coverage?.runsScanned ?? 0) > 0 || (z.activeCount ?? 0) > 0;
+            // 归档侧第五指标（#275）不能只靠 run/active 两路撑整张卡：整库归档是它的正常
+            // 工作状态，那种库「窗口内没有召回回执、也没有活跃僵尸行」时若 hasData 为假，
+            // 组件直接走 off 分支 return null，归档指标永远没机会显示。
+            const hasData = (d.coverage?.runsScanned ?? 0) > 0 || (z.activeCount ?? 0) > 0
+              || (d.archive?.total ?? 0) > 0;
             if (!hasData) {
               setState({ loading: false, off: true });
               return;
@@ -3638,10 +3644,19 @@ window.__ModuleLoader__.load({
                 .replace("{count}", String(inj.injectedCount ?? 0))
                 .replace("{fill}", inj.slotFillRate == null ? "—" : String(Math.round(inj.slotFillRate * 100)))
               : "";
+            // 第五指标（#275）：归档净增速率 + 可压掉行数。与注入口径同款自门控
+            // ——归档区为空时整段省略，不往卡里塞一个恒 0 的数字。
+            const ar = d.archive || {};
+            const archive = (ar.total ?? 0) > 0
+              ? t("memory.status.recallArchive")
+                .replace("{total}", String(ar.total ?? 0))
+                .replace("{add}", String(ar.perDay ?? 0))
+                .replace("{compress}", String(ar.compressible?.rows ?? 0))
+              : "";
             setState({
               loading: false, off: false, rate,
               zombie: z.zombieCount ?? 0, active: z.activeCount ?? 0,
-              exempt: z.exemptCount ?? 0, runs: d.coverage?.runsScanned ?? 0, top, inject
+              exempt: z.exemptCount ?? 0, runs: d.coverage?.runsScanned ?? 0, top, inject, archive
             });
           })
           .catch(() => { if (!cancelled) setState({ loading: false, off: true }); });
@@ -3660,7 +3675,7 @@ window.__ModuleLoader__.load({
           .replace("{active}", String(state.active))
           .replace("{exempt}", String(state.exempt))
           .replace("{runs}", String(state.runs))
-          .replace("{top}", state.top || "—") + (state.inject ? " · " + state.inject : "")
+          .replace("{top}", state.top || "—") + (state.inject ? " · " + state.inject : "") + (state.archive ? " · " + state.archive : "")
       });
     }
 

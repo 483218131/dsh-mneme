@@ -2181,6 +2181,9 @@ export function createService({ store, mirror, config, onWrite, logger, document
     embedQuery,
     pushContentHistory,
     transaction,
+    // #275 拍板 5：升格吸收的 evidence 行随之归档，但 pinned 池（#249）永不自动归档
+    // ——注册器不 import 这个集合，方向反了会成环，所以在这里注入。
+    pinnedTypes: PINNED_MEMORY_TYPES,
     finalize: (rows) => {
       for (const row of rows) scheduleEmbed(row);
     }
