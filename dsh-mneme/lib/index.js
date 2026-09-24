@@ -3,6 +3,8 @@ import { createMirror, TYPE_FILE } from "./mirror.js";
 import { createDocumentIndex } from "./document-index.js";
 import { resolveDocumentDir } from "./document.js";
 import { createService } from "./service.js";
+// #254 写入准入（第一阶段只计量，不拦截）：见 src/write-admission.js 的文件头。
+import { createWriteAdmission } from "./write-admission.js";
 import { createTools } from "./tools.js";
 import { createInjector } from "./inject.js";
 import { createSummarizer } from "./summarize.js";
@@ -195,15 +197,6 @@ export const apply = (ctx, config) => {
   try {
     store.deleteOldFailures(new Date(Date.now() - 90 * 86400000).toISOString());
   } catch { /* non-fatal */ }
-  // Bug8: enforce llm_audit_logs retention on boot (config.llmAudit.retentionDays,
-  // default 90). Best-effort like the failure prune — the audit trail is
-  // bookkeeping and a failed purge must never block plugin boot.
-  try {
-    if (rawCfg.llmAudit?.enabled !== false) {
-      const retentionMs = Number.isInteger(rawCfg.llmAudit?.retentionDays) ? rawCfg.llmAudit.retentionDays : 90;
-      store.deleteOldLlmAudits(new Date(Date.now() - retentionMs * 86400000).toISOString());
-    }
-  } catch { /* non-fatal */ }
 
   // User-configurable settings (profile, rules, panel mode, standalone API
   // token) share the same SQLite file in dedicated tables, isolated from
@@ -242,6 +235,18 @@ export const apply = (ctx, config) => {
     cfg[objKey] = { ...(cfg[objKey] ?? {}), ...sub };
   }
 
+  // Bug8 的启动期清理放在装配之后：面板把 llmAudit.* 写进 kv、经 nestedFlags 合进
+  // cfg，而写入侧（dream / summarize / 写入准入）读的都是装配后的 cfg——清理若读
+  // rawCfg，面板改了保留期它不认，更糟的是「开不开审计」与写入侧可能取到不同的值
+  // （raw 说关 → 不清理，cfg 说开 → 照写，审计表就无保留期地长）。保留期默认 90 天、
+  // 失败只 warn，与失败表清理同款：账本清理绝不许挡住插件启动。
+  try {
+    if (cfg.llmAudit?.enabled !== false) {
+      const retentionMs = Number.isInteger(cfg.llmAudit?.retentionDays) ? cfg.llmAudit.retentionDays : 90;
+      store.deleteOldLlmAudits(new Date(Date.now() - retentionMs * 86400000).toISOString());
+    }
+  } catch { /* non-fatal */ }
+
   // 记忆语言（memory.language）：本实例逐层传入 inject / summarize / dream /
   // sleep / mirror，多实例（如 agent preset 内挂载）互不影响。
   const mirror = createMirror(memoryDir, langOf(cfg));
@@ -264,7 +269,12 @@ export const apply = (ctx, config) => {
     documentIndex.remove();
   }
 
-  const service = createService({ store, mirror, config: cfg, logger: ctx.logger, documentIndex });
+  // 写入准入实例：本批次只做计量（决策恒放行、写审计行），所以不需要新开关——它
+  // 不改变任何写入行为，也不新增拦截分支；既有的 llmAudit.enabled 关掉时它同样
+  // 不写（那个开关连审计行的启动期清理一起关掉）。第二阶段把拦截打开时才按仓库
+  // 惯例引入 opt-in 默认关的配置键，届时只改这一个实例的构造与 service 的调用点。
+  const writeAdmission = createWriteAdmission({ store, config: cfg, logger: ctx.logger });
+  const service = createService({ store, mirror, config: cfg, logger: ctx.logger, documentIndex, writeAdmission });
 
   // F-NEW-03: if the mirror sync failed last run (persisted dirty state), retry
   // a safe re-render at boot so a stale mirror converges without needing a

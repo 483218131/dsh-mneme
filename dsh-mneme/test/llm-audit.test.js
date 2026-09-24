@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Context } from "@deepseek-ai/cordis";
 import { createStore } from "../src/store.js";
+import * as mneme from "../src/index.js";
 import { createService } from "../src/service.js";
 import { createDreamScheduler } from "../src/dream.js";
 import { createSummarizer } from "../src/summarize.js";
@@ -553,4 +559,40 @@ test("entity extraction writes no audit row when llmAudit.enabled === false", as
   assert.ok(text.includes("entities"), "turning the audit off must not break extraction");
   assert.equal(service.listLlmAudits().length, 0, "no audit rows when disabled");
   store.close();
+});
+
+// 启动期保留清理（Bug8）必须与写入侧读**同一份**配置。面板把 llmAudit.enabled 写进
+// kv、经 nestedFlags 合进 cfg，bundle 里可能是关的：清理若读 rawCfg，就会出现「面板
+// 说开 → 各写入点照写，raw 说关 → 不清理」这种无保留期的增长（写入准入 #254 也是读
+// cfg 的写入点之一）。所以这条锁的是「清理跟着装配后的 cfg 走」。
+test("boot retention purge reads the assembled config, not rawCfg", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mneme-audit-retention-"));
+  const dbPath = join(dir, "memory.db");
+
+  const seed = createStore(dbPath);
+  createSettings(seed.db).setFeatureFlags({ "llmAudit.enabled": true });
+  seed.saveLlmAudit({
+    timestamp: new Date(Date.now() - 2 * 86400000).toISOString(),
+    trigger_source: "autoDream",
+    operation_type: "dream_consolidate",
+    model_id: "m",
+    status: "success"
+  });
+  assert.equal(seed.listLlmAudits().length, 1, "先放一行过期审计");
+  seed.close();
+
+  const ctx = new Context();
+  ctx.provide("tools", { register() { return () => {}; } });
+  ctx.provide("commands", { register() { return () => {}; } });
+  ctx.provide("systemPrompt", { context() { return () => {}; } });
+  ctx.provide("agentDefaultModel", { currentSelection() { return { provider: "mock", model: "mock" }; } });
+  ctx.provide("llm", { async *stream() { yield { type: "finish", reason: { kind: "stop" } }; } });
+  ctx.provide("webServer", { register() { return () => {}; } });
+  // bundle 说关、面板说开，保留期 1 天而那行已过期 2 天：只有读装配后的 cfg 才会清掉它
+  await ctx.plugin(mneme, { memoryDir: dir, llmAudit: { enabled: false, retentionDays: 1 } });
+
+  const after = new DatabaseSync(dbPath);
+  const left = after.prepare("SELECT count(*) AS c FROM llm_audit_logs").get().c;
+  after.close();
+  assert.equal(left, 0, "面板开着的审计必须按 cfg 清理，否则审计行只增不减");
 });
