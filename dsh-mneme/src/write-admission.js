@@ -21,10 +21,22 @@
 // 观察穿透频率。穿透行既不参与 g2 判定，也不推进同话题的时间基准——它整个不在闸门
 // 里，成为下一次比较的基准会把 g2 的样本混进穿透流量。
 //
+// 内容哈希（exact duplicate，第三类测量点，维护者 2026-09-24 拍板）：归一化口径定在
+// content-hash.js，命中即「同一内容又被写了一次」。判据用哈希而不是相似度——相似度
+// 阈值在同一件事换个说法 / 不同的事共享话题词之间来回挪，只会换一种错法。候选集先按
+// type 与 scope 三维等值收窄再比哈希（不是全表扫），并把归档行一并纳入：「出口止体积、
+// 不止重复」，被质量闸归档的同一个事实不在 saveWithDedupe 的候选集里（store.list 默认
+// 排除归档），同样的内容再写一次就是一条新行，这正是这条信号要量的穿透。两个穿透口与
+// pinned 豁免同口径：pinned 在这里返回得更早，连候选集查询都不发。
+//
+// 信号跟着同一行审计走，所以内容哈希与 g1/g2 覆盖同一批写入（会话内新建行）；无会话
+// 身份的系统写入（dream / summarize / import / organize）要另立行形状，不在本批。
+//
 // 与 llmAudit.enabled 的关系：那个开关同时关掉审计行的启动期清理（index.js 的
 // deleteOldLlmAudits），所以关掉时本模块一行都不写，否则就是在无保留期的表里做
 // 按写入频次增长。
 import { PINNED_MEMORY_TYPES } from "./service.js";
+import { contentHashOf } from "./content-hash.js";
 
 // 审计口径（llm_audit_logs 的既有列）：trigger_source = 组件名，operation_type =
 // 动作名，status='skipped' = 本行没有产生任何 LLM 花费（与 summarize 的间隔门、
@@ -123,17 +135,48 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
   }
 
   /**
-   * 阶段一决策：恒 allow（本模块里没有阈值），只算出两个闸门的测量点。返回形状一次
+   * 内容哈希候选集查询（#254 第三类测量点）。失败降级为「没命中」：漏一个测量点，
+   * 不影响写入，也不让计量反噬。
+   * 多条命中时的取舍（活区优先）：有活跃/未遗忘的命中就报它（判据是「去重候选集本该
+   * 拦住」），只有归档/遗忘行命中才报它们。store 侧已把活跃行排在窗口头部，这里的 find
+   * 是防御性重复：排序口径将来再变，本判据也不跟着变。
+   * archived 与 forgotten 分开回：两者都是「出口」，但穿透含义不同——只命中已遗忘行时
+   * 若只回 archived=false，读审计的人会以为库里有活跃重复；而 saveWithDedupe 的候选集
+   * 本来就排除遗忘行（store.list 默认 includeForgotten=false），这类命中同样是穿透。
+   * @returns {{memory_id: string, archived: boolean, forgotten: boolean}|null}
+   */
+  function lookupContentDup(memory) {
+    try {
+      const hash = contentHashOf(memory);
+      if (!hash) return null;
+      const hits = store?.findContentHashMatches?.({
+        type: memory?.type,
+        hash,
+        agent_scope: memory?.agent_scope,
+        workspace_scope: memory?.workspace_scope,
+        sensitivity: memory?.sensitivity
+      }) ?? [];
+      const hit = hits.find((h) => !h.archived && !h.forgotten) ?? hits[0];
+      return hit ? { memory_id: hit.id, archived: hit.archived === true, forgotten: hit.forgotten === true } : null;
+    } catch (e) {
+      warn(`[dsh-mneme] write admission content hash lookup failed: ${String(e)}`);
+      return null;
+    }
+  }
+
+  /**
+   * 阶段一决策：恒 allow（本模块里没有阈值），只算出三个闸门的测量点。返回形状一次
    * 定死，阶段二只往里加分支、不改字段：
    *   decision — "allow" | "confirm"（阶段一只可能 allow）
    *   gate     — "g1" | null（null = 这次写入不进预算，不记行）
    *   topics   — 本次写入的确定性话题锚
    *   repeat   — {topic, gapMs} | null（g2 的命中面）
+   *   dup      — {memory_id, archived, forgotten} | null（内容哈希的命中面）
    *   exempt   — null | "pinned"
    * @param {{memory: object, sessionKey?: string|null}} input
    */
   function evaluate({ memory, sessionKey } = {}) {
-    const verdict = { decision: "allow", gate: null, topics: [], repeat: null, exempt: null };
+    const verdict = { decision: "allow", gate: null, topics: [], repeat: null, dup: null, exempt: null };
     // 无会话身份 = 系统写入（dream / summarize / import / organize），不进预算。
     if (!sessionKey) return verdict;
     // 审计关掉时不记行、也不推进话题表（见文件头：那个开关连启动期清理一起关掉）。
@@ -141,6 +184,7 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
     const topics = extractTopicKeys(memory);
     const pinned = PINNED_MEMORY_TYPES.has(String(memory?.type ?? ""));
     if (pinned) return { ...verdict, gate: ADMISSION_GATE_SESSION_BUDGET, topics, exempt: "pinned" };
+    const dup = lookupContentDup(memory);
     const table = topicTable(sessionKey);
     const at = now();
     let repeat = null;
@@ -150,16 +194,19 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
       // 同一行可能命中多个锚：取最近的那次（间隔最短＝最有价值的那次重复）。
       if (!repeat || gapMs < repeat.gapMs) repeat = { topic, gapMs };
     }
-    return { ...verdict, gate: ADMISSION_GATE_SESSION_BUDGET, topics, repeat };
+    return { ...verdict, gate: ADMISSION_GATE_SESSION_BUDGET, topics, repeat, dup };
   }
 
   /**
-   * 把测量点落成审计行（一行一个新建行）。两个信号的读法：
+   * 把测量点落成审计行（一行一个新建行）。三个信号的读法：
    *   g1 会话写入预算：`GROUP BY session_key` 计数即得「会话内新建条数」分布；要剔
    *      掉穿透行（pinned 不进预算）就加 `json_extract(metadata,'$.exempt') IS NULL`。
    *   g2 同话题冷却：`json_extract(metadata,'$.g2.gap_ms')` 即得「同话题新建行间隔」
    *      分布。间隔算的是同一话题两次**新建行**之间——标题命中走并入的那次不在这里
    *      （并入正是冷却要做的事，已经做到了）。
+   *   dup 内容哈希：`json_extract(metadata,'$.dup.memory_id')` 非空即「这条新行的内容
+   *      与某条既有行归一化后逐字节相同」；`$.dup.archived` 区分命中那条在活区还是
+   *      归档区——归档区命中就是去重候选集漏掉的那一类穿透。
    * 计量绝不影响写入：任何异常只 warn。
    * @returns {object[]} 落下的审计行（无测量点或失败时为空数组）
    */
@@ -183,7 +230,16 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
           gate: verdict.gate,
           topics,
           ...(verdict.exempt ? { exempt: verdict.exempt } : {}),
-          ...(verdict.repeat ? { g2: { topic: verdict.repeat.topic, gap_ms: verdict.repeat.gapMs } } : {})
+          ...(verdict.repeat ? { g2: { topic: verdict.repeat.topic, gap_ms: verdict.repeat.gapMs } } : {}),
+          // dup 两个出口分字段落盘：archived 与 forgotten 是两类不同的穿透，合成一个布尔
+          // 会让「只剩遗忘行命中」读起来像「库里有活跃重复」（见 lookupContentDup 注释）。
+          ...(verdict.dup
+            ? { dup: {
+              memory_id: verdict.dup.memory_id,
+              archived: verdict.dup.archived === true,
+              forgotten: verdict.dup.forgotten === true
+            } }
+            : {})
         }
       }));
     } catch (e) {

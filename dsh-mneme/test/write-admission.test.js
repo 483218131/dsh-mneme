@@ -103,6 +103,93 @@ test("g2：并入已有行不算同话题重写", () => {
   assert.equal(rows.length, 1, "合并是去重机制在正常工作，既不进预算也不产生 g2");
 });
 
+// #254 内容哈希（exact duplicate）：判据是归一化后逐字节相同，不是相似度；候选集把
+// 归档行一起纳入——归档行不在 saveWithDedupe 的候选集里（store.list 默认排除归档），
+// 同一个事实再写一次就是新行，这正是这条信号要量的穿透。
+test("dup：命中归档行的重复写入被记下来（归档行在候选集内）", () => {
+  const { store, service } = setup();
+  const first = service.saveWithDedupe({ type: "project", title: "归档事实", content: "同一件事的正文" });
+  store.setArchived(first.memory.id, true);
+  const second = service.saveWithDedupe({
+    _sessionKey: "sess-dup",
+    type: "project",
+    title: "归档事实",
+    content: "同一件事的正文"
+  });
+  assert.equal(second.action, "created", "归档行不在去重候选集里，所以确实新建了一行");
+
+  const rows = admissionRows(store, "sess-dup");
+  assert.equal(rows.length, 1);
+  assert.deepEqual(rows[0].metadata.dup, { memory_id: first.memory.id, archived: true, forgotten: false });
+});
+
+test("dup：只差格式（大小写/空白/标点）的重复也算命中", () => {
+  const { store, service } = setup();
+  const first = service.saveWithDedupe({ type: "project", title: "Task A", content: "Line1.\n\nLine2" });
+  // 标题只差大小写 → saveWithDedupe 的精确标题匹配落空 → 走新建路径
+  const second = service.saveWithDedupe({
+    _sessionKey: "sess-fmt",
+    type: "project",
+    title: "task a",
+    content: "line1 line2"
+  });
+  assert.equal(second.action, "created");
+  const rows = admissionRows(store, "sess-fmt");
+  assert.deepEqual(rows[0].metadata.dup, { memory_id: first.memory.id, archived: false, forgotten: false });
+});
+
+test("dup：同内容既有活跃行又有归档行时报活跃那条（活区优先，而不是谁最近被改过）", () => {
+  // 回归点（单盲审查 L2）：候选集按 updated_at 倒序返回，直接取第一条会把「命中归档
+  // 区」这个信号盖掉（归档动作刚刷过 updated_at）。口径：有活跃命中就报它。
+  const { store, service } = setup();
+  const active = store.save({ type: "project", title: "Task A", content: "同一件事" });
+  const archived = store.save({ type: "project", title: "task a", content: "同一件事" });
+  store.setArchived(archived.id, true);
+  const created = service.saveWithDedupe({
+    _sessionKey: "sess-both", type: "project", title: "TASK a", content: "同一件事"
+  });
+  assert.equal(created.action, "created", "标题只差大小写 → 精确标题匹配落空，走新建路径");
+  assert.deepEqual(admissionRows(store, "sess-both")[0].metadata.dup, { memory_id: active.id, archived: false, forgotten: false });
+});
+
+test("dup：只剩已遗忘未归档的命中时，不把它记成活区命中", () => {
+  // 回归（自动评审 #311 write-admission.js:158）：只回 archived 会把遗忘区命中写成
+  // archived:false，读审计的人会以为存在活跃重复；而 saveWithDedupe 的候选集本来就排除
+  // 遗忘行（store.list 默认 includeForgotten=false），这类命中同样是穿透。两个出口分字段记。
+  // 两条行同标题同正文：遗忘之后标题候选集里已经没有它，第二次写入自然走新建路径。
+  const { store, service } = setup();
+  const first = service.saveWithDedupe({ type: "project", title: "遗忘事实", content: "同一段遗忘正文" });
+  store.setForget(first.memory.id, true);
+  const second = service.saveWithDedupe({
+    _sessionKey: "sess-forgot", type: "project", title: "遗忘事实", content: "同一段遗忘正文"
+  });
+  assert.equal(second.action, "created", "遗忘行不在去重候选集里，所以确实新建了一行");
+  assert.deepEqual(admissionRows(store, "sess-forgot")[0].metadata.dup, {
+    memory_id: first.memory.id, archived: false, forgotten: true
+  });
+});
+
+test("dup：不同内容不记 dup（负样本，免得信号恒真）", () => {
+  const { store, service } = setup();
+  service.saveWithDedupe({ _sessionKey: "s", type: "project", title: "T1", content: "第一件事的正文" });
+  service.saveWithDedupe({ _sessionKey: "s", type: "project", title: "T2", content: "另一件事的正文" });
+  const rows = admissionRows(store, "s");
+  assert.equal(rows.length, 2);
+  for (const row of rows) assert.equal(row.metadata.dup, undefined);
+});
+
+test("dup：pinned 行不查候选集（整个不在闸门里，与 g2 的不当基准同口径）", () => {
+  const { store, service } = setup();
+  service.saveWithDedupe({ _sessionKey: "s", type: "constraint", title: "边界 X", content: "同一段边界" });
+  service.saveWithDedupe({ _sessionKey: "s", type: "constraint", title: "边界 x", content: "同一段边界" });
+  const rows = admissionRows(store, "s");
+  assert.equal(rows.length, 2);
+  for (const row of rows) {
+    assert.equal(row.metadata.exempt, "pinned");
+    assert.equal(row.metadata.dup, undefined, "穿透口不发候选集查询，也不记 dup");
+  }
+});
+
 test("话题表由审计行重建：新实例（进程重启）仍能认出同话题", () => {
   const { store, service } = setup();
   service.saveWithDedupe({ _sessionKey: "s", type: "project", title: "A", content: "#99 的记录" });
