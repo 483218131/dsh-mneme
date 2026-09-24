@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
+import { contentHashOf } from "./content-hash.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS memories (
@@ -14,6 +15,7 @@ CREATE TABLE IF NOT EXISTS memories (
   archived    INTEGER NOT NULL DEFAULT 0,
   source      TEXT,
   content_history TEXT,
+  content_hash TEXT,
   embedding   TEXT,
   epistemic_status TEXT NOT NULL DEFAULT 'subjective',
   last_accessed_at  TEXT,
@@ -407,6 +409,7 @@ function toRow(row) {
     type: row.type,
     title: row.title,
     content: row.content,
+    content_hash: row.content_hash ?? undefined,
     tags: parseTags(row.tags),
     importance: row.importance,
     forgotten: row.forgotten === 1,
@@ -715,6 +718,34 @@ export function createStore(path) {
   addColumn("memories", "workspace_scope_source", "ALTER TABLE memories ADD COLUMN workspace_scope_source TEXT");
   addColumn("memories", "scope_decided_at", "ALTER TABLE memories ADD COLUMN scope_decided_at TEXT");
 
+  // #254 计量信号：内容归一化哈希（口径与动机写在 content-hash.js 的文件头）。派生
+  // 列，不参与任何判定——只给「同一内容又被写了一次」当等值锚。索引建在加列之后：
+  // 老库打开时 SCHEMA 的 CREATE TABLE 对既有表不生效，列还不存在，把索引写进 SCHEMA
+  // 会直接报 no such column（与下方 llm_audit_logs.session_key 同理）。
+  addColumn("memories", "content_hash", "ALTER TABLE memories ADD COLUMN content_hash TEXT");
+  // 列序是 content_hash 打头：哈希几乎唯一，等值 seek 就已收窄到候选行，type 只当同
+  // 一次 seek 里的第二列过滤；反过来（type 打头）下面的存量回填就得全表扫——每次打开
+  // 都要把全部正文读一遍。
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash, type)");
+  // 存量回填：老库（含归档区）的行都没有值，而「归档行纳入去重候选集」这条口径正是
+  // 要靠既有归档行出数据。只算 NULL 行、幂等；改口径不是补 NULL 能修好的，要整列重算
+  // （见 content-hash.js 的文件头）。空标题空正文的行算不出锚，跳过不写——否则每次
+  // 打开都要为这些行再跑一遍 UPDATE。
+  {
+    const updates = db
+      .prepare("SELECT id, title, content FROM memories WHERE content_hash IS NULL")
+      .all()
+      .map((row) => [contentHashOf(row), row.id])
+      .filter(([hash]) => hash);
+    if (updates.length) {
+      const stmt = db.prepare("UPDATE memories SET content_hash = ? WHERE id = ? AND content_hash IS NULL");
+      // 一个事务包住整批：逐条自动提交是每行一次 WAL 提交，几千行的存量库上纯属浪费。
+      runAtomically(() => {
+        for (const [hash, id] of updates) stmt.run(hash, id);
+      });
+    }
+  }
+
   // Legacy dream_runs without policy_epoch → backfill with the default epoch.
   addColumn("dream_runs", "policy_epoch", "ALTER TABLE dream_runs ADD COLUMN policy_epoch INTEGER NOT NULL DEFAULT 0");
   addColumn("dream_runs", "run_type", "ALTER TABLE dream_runs ADD COLUMN run_type TEXT NOT NULL DEFAULT 'auto'");
@@ -953,6 +984,8 @@ export function createStore(path) {
     const importance = Number.isInteger(memory.importance) ? memory.importance : 3;
     const evidence = Array.isArray(memory.evidence) ? JSON.stringify(memory.evidence) : null;
     const docPath = typeof memory.doc_path === "string" && memory.doc_path.trim() ? memory.doc_path : null;
+    // #254 计量锚：由本行的 title/content 派生，调用方传什么都以这里算出的为准。
+    const contentHash = contentHashOf(memory);
     const embedding = Array.isArray(memory.embedding) && memory.embedding.length
       ? JSON.stringify(memory.embedding)
       : null;
@@ -963,8 +996,8 @@ export function createStore(path) {
       : inferEpistemicStatus(memory);
     runAtomically(() => {
       db.prepare(
-        `INSERT INTO memories (id, type, title, content, tags, importance, forgotten, archived, source, content_history, quality_score, embedding, epistemic_status, agent_scope, workspace_scope, agent_scope_source, workspace_scope_source, scope_decided_at, sensitivity, occurred_at, evidence, doc_path, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO memories (id, type, title, content, tags, importance, forgotten, archived, source, content_history, quality_score, embedding, epistemic_status, agent_scope, workspace_scope, agent_scope_source, workspace_scope_source, scope_decided_at, sensitivity, occurred_at, evidence, doc_path, content_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         id,
         type,
@@ -987,6 +1020,7 @@ export function createStore(path) {
         normalizeOccurredAt(memory.occurred_at),
         evidence,
         docPath,
+        contentHash,
         now,
         now
       );
@@ -997,6 +1031,41 @@ export function createStore(path) {
       incrementGeneration();
     });
     return getById(id);
+  }
+
+  /**
+   * #254 计量：与本次写入「归一化内容哈希」相同的既有行（去重候选集）。
+   * 结构化锚先收窄成本：按哈希等值 seek（走 idx_memories_content_hash，哈希几乎唯
+   * 一，落在候选集上的行只有几条），再按 type 与 scope 三维过滤——不是全表扫、也不
+   * 逐行比哈希。scope 用 IS 比（NULL 安全）：未标注行互相匹配、与已标注行不匹配，
+   * 与 service.js 去重键（scopeKeyOf）同口径；入参先按 store 自己的 normalizeScopeText
+   * 归一，免得调用方传 " foo " 就漏配。
+   * 归档行与已遗忘行都在集内：#275 的分界是「出口止体积、不止重复」——被质量闸归档
+   * 的同一个事实必须仍能判成重复，否则同样的内容再写一次又是一条新行（#254 拍板：
+   * 归档行纳入去重候选集）。
+   * 排序即取舍：活跃行排在归档/遗忘行之前，再按 updated_at 倒序。LIMIT 先于调用方的
+   * 「活区优先」判断执行，而归档动作本身会顶 updated_at——纯按时间倒序时，同键命中一
+   * 旦超过窗口宽度，活跃行就被归档行挤出候选集，调用方只能看到归档命中，把「活跃重复」
+   * 误报成「归档重复」，恰好把这条信号要分流的两类弄反。
+   * @returns {Array<{id: string, archived: boolean, forgotten: boolean}>} 活跃行优先，其后按最近写入
+   */
+  function findContentHashMatches({ type, hash, agent_scope: agentScope, workspace_scope: workspaceScope, sensitivity, limit = 10 } = {}) {
+    if (!hash || !type) return [];
+    const lim = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 50) : 10;
+    const rows = db.prepare(
+      `SELECT id, archived, forgotten FROM memories
+       WHERE type = ? AND content_hash = ?
+         AND agent_scope IS ? AND workspace_scope IS ? AND sensitivity IS ?
+       ORDER BY archived ASC, forgotten ASC, updated_at DESC, id LIMIT ?`
+    ).all(
+      type,
+      hash,
+      normalizeScopeText(agentScope),
+      normalizeScopeText(workspaceScope),
+      normalizeScopeText(sensitivity),
+      lim
+    );
+    return rows.map((row) => ({ id: row.id, archived: row.archived === 1, forgotten: row.forgotten === 1 }));
   }
 
   function update(id, patch) {
@@ -1045,13 +1114,18 @@ export function createStore(path) {
     const nextDecidedAt = patch.scope_decided_at !== undefined
       ? normalizeOccurredAt(patch.scope_decided_at)
       : (existing.scope_decided_at ?? null);
+    // #254：标题或正文变了，锚跟着重算——它是当前内容的派生物，留旧值等于让「这行
+    // 现在装的什么」和标记对不上。
+    const nextTitle = patch.title ?? existing.title;
+    const nextContent = patch.content ?? existing.content;
+    const contentHash = contentHashOf({ title: nextTitle, content: nextContent });
     runAtomically(() => {
       db.prepare(
-        `UPDATE memories SET type=?, title=?, content=?, tags=?, importance=?, source=?, content_history=?, quality_score=?, embedding=?, epistemic_status=?, agent_scope=?, workspace_scope=?, agent_scope_source=?, workspace_scope_source=?, scope_decided_at=?, evidence=?, updated_at=? WHERE id=?`
+        `UPDATE memories SET type=?, title=?, content=?, tags=?, importance=?, source=?, content_history=?, quality_score=?, embedding=?, epistemic_status=?, agent_scope=?, workspace_scope=?, agent_scope_source=?, workspace_scope_source=?, scope_decided_at=?, evidence=?, content_hash=?, updated_at=? WHERE id=?`
       ).run(
         type,
-        patch.title ?? existing.title,
-        patch.content ?? existing.content,
+        nextTitle,
+        nextContent,
         JSON.stringify(patch.tags ?? existing.tags),
         Number.isInteger(patch.importance) ? patch.importance : existing.importance,
         patch.source !== undefined ? patch.source : (existing.source ?? null),
@@ -1065,6 +1139,7 @@ export function createStore(path) {
         nextWorkspaceSource,
         nextDecidedAt,
         evidence,
+        contentHash,
         now,
         id
       );
@@ -1126,15 +1201,19 @@ export function createStore(path) {
     // dirty == false — recoverMirror sees no debt and the mirror stays stale.
     // Wrapping both in one transaction means a CAS miss rolls back cleanly too
     // (no write, no generation bump).
+    // 同 update：#254 的锚随标题/正文重算（CAS 路径也改这两列）。
+    const nextTitle = patch.title ?? existing.title;
+    const nextContent = patch.content ?? existing.content;
+    const contentHash = contentHashOf({ title: nextTitle, content: nextContent });
     let applied = false;
     runAtomically(() => {
       const result = db.prepare(
-        `UPDATE memories SET type=?, title=?, content=?, tags=?, importance=?, source=?, content_history=?, quality_score=?, embedding=?, epistemic_status=?, updated_at=?
+        `UPDATE memories SET type=?, title=?, content=?, tags=?, importance=?, source=?, content_history=?, quality_score=?, embedding=?, epistemic_status=?, content_hash=?, updated_at=?
          WHERE id=? AND updated_at=?`
       ).run(
         type,
-        patch.title ?? existing.title,
-        patch.content ?? existing.content,
+        nextTitle,
+        nextContent,
         JSON.stringify(patch.tags ?? existing.tags),
         Number.isInteger(patch.importance) ? patch.importance : existing.importance,
         patch.source !== undefined ? patch.source : (existing.source ?? null),
@@ -1142,6 +1221,7 @@ export function createStore(path) {
         qualityScore,
         embedding,
         epistemicStatus,
+        contentHash,
         now,
         id,
         expectedUpdatedAt
@@ -1193,15 +1273,15 @@ export function createStore(path) {
   function demoteToSummary(id, summary, { minRefTimeMs } = {}) {
     let changed = false;
     runAtomically(() => {
-      const row = db.prepare("SELECT last_accessed_at, content, _full_content FROM memories WHERE id = ?").get(id);
+      const row = db.prepare("SELECT title, last_accessed_at, content, _full_content FROM memories WHERE id = ?").get(id);
       if (!row || row._full_content) return;
       if (minRefTimeMs !== undefined && row.last_accessed_at) {
         const lastMs = Date.parse(row.last_accessed_at);
         if (lastMs >= minRefTimeMs) return; // touched after snapshot — still hot
       }
       db.prepare(
-        "UPDATE memories SET content = ?, _full_content = ?, updated_at = ? WHERE id = ?"
-      ).run(summary, row.content, nowIso(), id);
+        "UPDATE memories SET content = ?, _full_content = ?, content_hash = ?, updated_at = ? WHERE id = ?"
+      ).run(summary, row.content, contentHashOf({ title: row.title, content: summary }), nowIso(), id);
       incrementGeneration();
       changed = true;
     });
@@ -1212,11 +1292,11 @@ export function createStore(path) {
   function restoreContent(id) {
     let changed = false;
     runAtomically(() => {
-      const row = db.prepare("SELECT content, _full_content FROM memories WHERE id = ?").get(id);
+      const row = db.prepare("SELECT title, content, _full_content FROM memories WHERE id = ?").get(id);
       if (!row || !row._full_content) return;
       db.prepare(
-        "UPDATE memories SET content = ?, _full_content = NULL, updated_at = ? WHERE id = ?"
-      ).run(row._full_content, nowIso(), id);
+        "UPDATE memories SET content = ?, _full_content = NULL, content_hash = ?, updated_at = ? WHERE id = ?"
+      ).run(row._full_content, contentHashOf({ title: row.title, content: row._full_content }), nowIso(), id);
       incrementGeneration();
       changed = true;
     });
@@ -2606,6 +2686,8 @@ export function createStore(path) {
     saveDocument,
     update,
     compareAndUpdate,
+    // #254：写入准入的内容哈希候选集（只读）。
+    findContentHashMatches,
     remove,
     setForget,
     setArchived,
