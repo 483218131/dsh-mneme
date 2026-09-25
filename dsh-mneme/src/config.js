@@ -87,6 +87,22 @@ export const Config = z.object({
   // 父开关 `autoInject` 关闭时它不生效（闸门见 injectChildEnabled）；用户显式写进
   // feature_flags 的值永远优先于这里的默认值。
   injectGuidanceEnabled: z.boolean().default(true),
+  // #249 N3（压缩边缘双落点）：上下文即将大幅精简前抢救「正在做什么」。默认关。
+  // 触发靠宿主自己的压缩事件（`compaction/start|summary|end`，都在事件白名单里），
+  // 不自定一套阈值参数——「压缩边缘」由宿主定义，我们再校准一份只会与之漂移。
+  // 为什么是「新时机 + 新表面」因而默认关：它往对话里**追加消息**（新的注入表面，
+  // 参照实现里最容易累积成一堆历史的那类），并多写一张提案表。按 §10 判据，引入
+  // 新时机/新表面/新成本的子项独立成键、默认关；只修正既有块的（基础内容分池、
+  // 库可见性行）才随父开关默认开。`pinnedInjectBudget` 与它同批，但属前者之外：
+  // 那是既有块内的预算，不是新表面。
+  // 双落点是硬要求，不能只留一半：宿主的压缩摘要器**只看对话里的内容**，只落库不
+  // 注入，等于在摘要重建里什么都没留下；只注入不落库，则压缩一过就随旧消息一起
+  // 消失。两者都做，且落库先于注入（注入失败不该丢提案）。
+  // 祖先：`autoInject`（父关则本项不生效，闸门见 injectChildEnabled）。轻量档默认
+  // 置关（见 LIGHT_MODE_OFF）：轻量档多一份注入物是反的，与 injectGuidanceEnabled
+  // 同一取舍。注意预设只是默认值而非强制——装配时用户显式开关在它之后展开，勾了就赢
+  // （合并顺序见 index.js 装配处）。
+  continuityRescueEnabled: z.boolean().default(false),
   // #249（第一批）：B1 pin 池预算——约束/偏好类注入条目的独立小上限。约束与
   // 偏好被静默降级是本议题的立项核心（同类知识与情景日志同池同速率摘要，实测
   // 一轮压缩后仅保 53%、五轮 10%），故这两类不进相关性竞争、不参与跨轮轮换、
@@ -633,7 +649,12 @@ const LIGHT_MODE_OFF = [
   // 轻量模式不开 document 指针行（#230，opt-in：注册/注入/检索增强全随闸）。
   "documentMemoryEnabled",
   // 轻量模式不开热计算（heat 属于重型增强；关掉后 sleep 降级也退回纯时间分层）。
-  "heatEnabled"
+  "heatEnabled",
+  // #249 N3：轻量档默认不开压缩边缘双落点——它往对话里追加消息（新的注入表面），
+  // 轻量档（小模型 / 小上下文）最不该再多一份注入物。这是预设给的默认值、不是强制：
+  // 用户显式勾选仍然赢（合并顺序「用户开关 > 轻量预设 > bundle 配置」，同
+  // injectGuidanceEnabled）。
+  "continuityRescueEnabled"
 ];
 
 /**
@@ -670,7 +691,7 @@ export function applyLightModePreset(cfg) {
  * 是扁平键，不受这条限制。
  */
 export const INJECT_CHILD_FLAGS = Object.freeze({
-  autoInject: Object.freeze(["injectGuidanceEnabled"])
+  autoInject: Object.freeze(["injectGuidanceEnabled", "continuityRescueEnabled"])
 });
 
 /** 子开关的运行时生效值：父开关显式关（false）时恒不生效。 */

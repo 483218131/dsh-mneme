@@ -48,6 +48,9 @@ const FEATURE_FLAG_BOOLEANS = [
   // Issue #249：能力说明（工具描述判断指引 + order 150 总则段）。第二批起它是
   // 注入父开关 autoInject 的子项、默认开（父关时不生效，闸门见 config.js）。
   "injectGuidanceEnabled",
+  // Issue #249 N3：压缩边缘双落点——上下文即将精简前落一条连续性提案 + 往
+  // 序列末尾追加同一份快照。默认关（新注入表面，见 config.js），父开关 autoInject。
+  "continuityRescueEnabled",
   "entityExtractionEnabled",
   // Issue #219：图召回轴——查询命中实体名时把挂联记忆并入检索融合池
   // （默认关；依赖实体抽取产出，lightMode 强制关闭）。

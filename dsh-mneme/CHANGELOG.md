@@ -77,6 +77,26 @@
 
 ## [Unreleased]
 
+## 🆕 新增
+
+- **压缩边缘双落点（issue #249 N3）**：上下文即将被宿主压缩前抢救「正在做什么」，新增
+  opt-in 键 `continuityRescueEnabled`（注入父开关 `autoInject` 的子项，默认关；`lightMode`
+  强制关）。**必须是双落点**：①落一条连续性提案到新表 `continuity_proposals`（脱离对话
+  独立存活）；②把同一份快照追加成序列末尾的插件消息——宿主的压缩摘要器**只看对话里的
+  内容**，只放系统提示段等于白写。触发不自定阈值，直接订阅宿主真的压缩
+  （`compaction/start|summary|end`）：压缩插件在自己那一步先压缩再 `return next()`，所以
+  我们在 `agent/pre-step` 拿到结果时边缘已落库，而返回的 `decision.messages` 由宿主以
+  `surfaceOp: "append"` 追加，晚于压缩的 `replace`——落点天然在压缩之后。三字段
+  （`current_work` / `next_step` / `open_questions`）用确定性抽取、**全程不调模型**：
+  最近一条真实 `user/message` 取头部 200 字符、最近一条 `assistant/message` 取尾部 200
+  字符（下一步活在末尾那句里），`open_questions` 判不出就留白（注入文本里如实标 `none`，
+  不编造）。提案行按 `(session_id, kind)` 唯一键落「同一会话同一类只留一条」：再次触发是
+  刷新而不是新增，`status`/`edge_seq` 就地支撑 #249 §8 要求的触发率与采纳率统计；**队列满
+  则弃新**（200 条，不淘汰旧行——旧行是别的会话还没转正的工作状态）。注入按「统一前缀 +
+  全文」判重，同文本不追加第二次（没有 in-memory 改写钩子，这是形态上限）。宿主若无压缩前
+  时机则**降级为持久规则**（写进 `memory_save` 描述交给 agent 自判），不算失败、不要求宿主
+  加接口。新增回归 14 条（`test/continuity.test.js`），新文档见 [docs/CONTINUITY.md](docs/CONTINUITY.md)。
+
 ## [0.8.6] - 2026-09-23
 
 ## 🆕 新增

@@ -381,6 +381,8 @@ window.__ModuleLoader__.load({
         "memory.features.autoInject.hint": "每轮对话自动携带相关记忆",
         "memory.features.injectGuidanceEnabled": "能力说明",
         "memory.features.injectGuidanceEnabled.hint": "在工具描述与一次性提示段里说明怎么用记忆（何时查、何时写、拿不准就不做）",
+        "memory.features.continuityRescueEnabled": "压缩边缘抢救",
+        "memory.features.continuityRescueEnabled.hint": "上下文即将被精简前，落一条连续性快照（正在做什么 / 下一步 / 未决问题）并追加到对话末尾，让它活过这次压缩",
         "memory.features.parentOff": "父开关关闭时不生效",
         "memory.features.autoSummarize": "自动总结",
         "memory.features.autoSummarize.hint": "对话结束自动提炼记忆条目",
@@ -769,6 +771,8 @@ window.__ModuleLoader__.load({
         "memory.features.autoInject.hint": "Carry relevant memories into every turn",
         "memory.features.injectGuidanceEnabled": "Capability guide",
         "memory.features.injectGuidanceEnabled.hint": "Explain how to use memory (when to search, when to save, when to do nothing) in tool descriptions plus a one-time prompt section",
+        "memory.features.continuityRescueEnabled": "Compaction-edge rescue",
+        "memory.features.continuityRescueEnabled.hint": "Before context compaction, record a continuity snapshot (current work / next step / open questions) and append it near the end of the conversation so it survives the compaction",
         "memory.features.parentOff": "Inactive while auto injection is off",
         "memory.features.autoSummarize": "Auto summarization",
         "memory.features.autoSummarize.hint": "Distill memory entries when a conversation ends",
@@ -1931,7 +1935,7 @@ window.__ModuleLoader__.load({
     // 「重置用户配置」，子项自己勾着的值要留着，也应该能提前设好。同一份关系在
     // 后端 src/config.js 的 INJECT_CHILD_FLAGS（运行时闸门），两侧漂移由
     // test/inject-parent-gate.test.js 钉住。
-    const FEATURE_CHILDREN = { autoInject: ["injectGuidanceEnabled"] };
+    const FEATURE_CHILDREN = { autoInject: ["injectGuidanceEnabled", "continuityRescueEnabled"] };
     const FEATURE_GROUPS = [
       { key: "group.core", items: ["autoInject", "autoSummarize", "hotMemoryEnabled", "memoryQualityFilter.enabled", "llmAudit.enabled"] },
       { key: "group.enhance", items: ["entityExtractionEnabled", "codingRetrospect", "rerankEnabled", "resilientModelDownload", "searchSemanticDedup", "bm25SearchEnabled", "heatEnabled", "documentMemoryEnabled"] },

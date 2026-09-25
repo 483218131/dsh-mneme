@@ -7,6 +7,7 @@ import { createService } from "./service.js";
 import { createWriteAdmission } from "./write-admission.js";
 import { createTools } from "./tools.js";
 import { createInjector } from "./inject.js";
+import { createContinuityRescue } from "./continuity.js";
 import { createSummarizer } from "./summarize.js";
 import { createDreamScheduler } from "./dream.js";
 import { createSleepScheduler, runSleep } from "./dream/sleep.js";
@@ -20,7 +21,7 @@ import { createEmbedder } from "./embedding.js";
 import { createEmbedderByProvider } from "./local-embedder.js";
 import { LocalReranker } from "./reranker.js";
 import { createVectorIndex } from "./vector-index.js";
-import { Config, applyLightModePreset } from "./config.js";
+import { Config, applyLightModePreset, injectChildEnabled } from "./config.js";
 import { langOf } from "./lang.js";
 import { extractEntities } from "./entities/extractor.js";
 import { mkdirSync } from "node:fs";
@@ -558,6 +559,13 @@ export const apply = (ctx, config) => {
   ctx.inject(["systemPrompt"], (promptCtx) => {
     if (cfg.autoInject) disposers.push(createInjector(promptCtx, service, settings, cfg));
   });
+
+  // #249 N3：压缩边缘双落点。触发靠宿主自己落的压缩事件（订阅 + pre-step 追加），
+  // 不需要 systemPrompt / tools 的任何能力，所以不塞进上面的 inject 回调；父／子
+  // 闸门在挂载点判一次，与 inject.js 共用同一个 injectChildEnabled 判据。
+  if (cfg.autoInject && injectChildEnabled(cfg, "continuityRescueEnabled")) {
+    disposers.push(createContinuityRescue(ctx, store));
+  }
 
   ctx.inject(["tools"], (toolsCtx) => {
     disposers.push(createTools(toolsCtx, service, cfg, embedder));

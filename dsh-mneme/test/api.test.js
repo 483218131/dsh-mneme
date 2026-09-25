@@ -663,9 +663,10 @@ test("GET /api/dsh-mneme/features returns empty overrides and effective config d
   // issue #257 新增 sleepMaxTokens、issue #258 新增总览路由两键与
   // dreamSummaryMaxInputs、issue #230 新增 documentMemoryEnabled/
   // documentInjectBudget、issue #249 第一批新增 injectGuidanceEnabled/
-  // pinnedInjectBudget，v0.8.5 新增 disableMemorySearch/disableMemoryArchive，
+  // pinnedInjectBudget、issue #249 N3 新增 continuityRescueEnabled，
+  // v0.8.5 新增 disableMemorySearch/disableMemoryArchive，
   // 本地嵌入池化新增 localEmbedPooling）
-  assert.equal(Object.keys(data.effective).length, 59 + 3 + 2 + 1 + 2 + 2 + 2 + 1);
+  assert.equal(Object.keys(data.effective).length, 59 + 3 + 2 + 1 + 2 + 2 + 2 + 1 + 1);
   assert.equal(data.effective.dreamSkipInvalid, true);
   assert.equal(data.effective.allowCrossTypeMerge, false);
   assert.equal(data.effective.dreamMinIntervalMinutes, 0);
