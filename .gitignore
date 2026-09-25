@@ -36,3 +36,6 @@ memory.db
 
 # 并行工作区车道（git worktree add .worktrees/<lane>）：见 AGENTS.md
 .worktrees/
+
+# 本机个人工具（dsh 目录镜像滞后监控等，非包内容，不进版本库）
+tools/
