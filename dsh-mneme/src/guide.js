@@ -42,3 +42,21 @@ export const TOOL_GUIDE = {
     " Save only durable, cross-session value (a preference, a decision with its rationale, an engineering constraint, " +
     "a pitfall with its root cause). Trivial single-turn work does not belong here, and when unsure, do not save."
 };
+
+/**
+ * #249 N3 的降级路径：宿主若不提供可挂钩的压缩前时机，双落点里的「注入」那一半就没
+ * 有触发者。此时不把功能算作失败，而是把规则交给 agent 自判压力（§4.4 点名的降级
+ * 形态）。落点是工具描述——常驻文本、不进每轮上下文，零注入成本。
+ *
+ * 英文单一正本，理由同 TOOL_GUIDE（见文件头）。字段名用存储与注入那一侧的口径
+ * （`current_work` / `next_step` / open question，#249 §6.2）；规格 §4.4 里的
+ * Current Work / Next Step / Critical Context 是**宿主压缩模板**的字段名，不是这里的。
+ */
+export const CONTINUITY_TOOL_RULE = {
+  memory_save:
+    " If this session's context is about to be compacted, first save a continuity note with this same tool " +
+    "(type: project, title: one stable title for this line of work, e.g. \"continuity: <topic>\"): current_work (what you " +
+    "are doing now), next_step, and any open question. Keep it to those fields, and reuse that same title for later " +
+    "updates: the store merges rows of the same type + title (the merge appends to the note instead of replacing it), " +
+    "so a fresh title each time just leaves a trail of near-duplicate project rows."
+};

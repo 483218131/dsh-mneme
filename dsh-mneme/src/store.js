@@ -276,6 +276,28 @@ CREATE TABLE IF NOT EXISTS mirror_state (
   applied_generation INTEGER NOT NULL DEFAULT 0 CHECK (applied_generation >= 0 AND applied_generation <= 9007199254740991 AND applied_generation = CAST(applied_generation AS INTEGER)), -- 已成功应用的轮次
   type_status TEXT                               -- JSON: 逐 type 状态 {type: {dirty, applied_gen, last_error}}
 );
+
+-- #249 N3（压缩边缘双落点）：连续性提案。压缩边缘只落**提案**行，不进 memories
+-- ——边缘产出若直接进记忆库，一个长会话就会攒出第 N 条同主题条目，正是 #275 记的
+-- 失败形态；转正通道与 #254 的二次确认共用一套，阶段二才打开，本批只写 pending。
+-- 唯一键 (session_id, kind) 就是形态约定里的「同一会话同一类只留一条」：再次触发
+-- 是刷新同一行，不是新增一行。status 为转正通道预留（pending → promoted/discarded）：
+-- 「实际触发率」= 提案行数、「采纳率」= promoted/总数，都能就地统计（#249 §8）。
+-- 时间戳是 ISO（与 memories 同款），created_at 在刷新时不动，updated_at 记最近边缘。
+CREATE TABLE IF NOT EXISTS continuity_proposals (
+  id             TEXT PRIMARY KEY,
+  session_id     TEXT NOT NULL,
+  kind           TEXT NOT NULL,
+  current_work   TEXT,
+  next_step      TEXT,
+  open_questions TEXT,
+  status         TEXT NOT NULL DEFAULT 'pending',
+  edge_seq       INTEGER,            -- 触发本次刷新的压缩事件 seq（证据/复现用）
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_continuity_session_kind ON continuity_proposals(session_id, kind);
+CREATE INDEX IF NOT EXISTS idx_continuity_status ON continuity_proposals(status, updated_at);
 `;
 
 // Exported for API-layer type validation (standalone API POST /memories and
@@ -285,6 +307,12 @@ export const TYPES = new Set(["preference", "project", "decision", "history", "s
   // #230：agent 产长文档的指针行（摘要 + doc_path + evidence）。铸造口唯一
   // （registerDocument）——saveWithDedupe/updateMemory 另有守卫拒绝旁路铸造。
   "document"]);
+
+// #249 N3：连续性提案的 pending 队列上限。「队列满则弃新」是形态约定的一半——满时丢
+// 掉本次触发，**不是**淘汰旧行：旧行是别的会话还没转正的活状态，用"更近的边缘"把它挤
+// 掉，等于让长会话的噪音吃掉短会话的真实工作状态。这个数是存储侧策略，与抽取/注入的
+// 截断上限（continuity.js）是两件事。
+const MAX_CONTINUITY_PENDING = 200;
 
 // Epistemic status: what kind of evidence a memory rests on. Defaults to
 // 'subjective' so legacy rows (and rows without any signal) stay compatible.
@@ -2645,6 +2673,60 @@ export function createStore(path) {
    *  Otherwise wrap in BEGIN/COMMIT so a memory write and its desired-generation
    *  bump commit together: a crash between them can never leave a mutated store
    *  with generation == applied (audit peer blocker 1, "crash window"). */
+  // --- #249 N3：压缩边缘的连续性提案（唯一写入口 = 压缩边缘监听器） -------------
+  /** Upsert one continuity proposal. (session_id, kind) is the形态约定「同一会话同一类
+   *  只留一条」：命中即刷新（created_at 不动、updated_at 记最近边缘），不新增行。
+   *  Queue full → drop the new one and say so (dropped: true) instead of throwing: an edge
+   *  that cannot be recorded must not break the host's step. Returns {id, created, dropped}. */
+  function saveContinuityProposal({
+    sessionId, kind, currentWork = null, nextStep = null, openQuestions = null, edgeSeq = null,
+    maxPending = MAX_CONTINUITY_PENDING
+  } = {}) {
+    if (!sessionId || !kind) throw new TypeError("continuity proposal needs sessionId and kind");
+    const now = new Date().toISOString();
+    const existing = db.prepare("SELECT id FROM continuity_proposals WHERE session_id = ? AND kind = ?").get(sessionId, kind);
+    if (!existing) {
+      const pending = db.prepare("SELECT COUNT(*) AS c FROM continuity_proposals WHERE status = 'pending'").get().c;
+      if (pending >= maxPending) return { id: null, created: false, dropped: true };
+    }
+    // 写入本身是一条 UPSERT：唯一索引 (session_id, kind) 是并发的裁决者。两个宿主共用
+    // memoryDir 时（AGENTS.md 的多进程 WAL 场景）先查后插会有一个撞 SQLITE_CONSTRAINT，
+    // 而这里只该有一条语句决定成不成功。上面的 SELECT 只用于「队列满」与 created 标记。
+    // created_at 与 status 刻意不在 SET 里：命中只刷新内容与最近边缘时刻，不把已转正的行打回 pending。
+    const id = randomUUID();
+    db.prepare(`
+      INSERT INTO continuity_proposals (id, session_id, kind, current_work, next_step, open_questions, status, edge_seq, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+      ON CONFLICT(session_id, kind) DO UPDATE SET
+        current_work = excluded.current_work,
+        next_step = excluded.next_step,
+        open_questions = excluded.open_questions,
+        edge_seq = excluded.edge_seq,
+        updated_at = excluded.updated_at
+    `).run(id, sessionId, kind, currentWork, nextStep, openQuestions, edgeSeq, now, now);
+    const row = db.prepare("SELECT id FROM continuity_proposals WHERE session_id = ? AND kind = ?").get(sessionId, kind);
+    return { id: row?.id ?? id, created: !existing, dropped: false };
+  }
+
+  /** The single proposal for (session, kind), or null. */
+  function getContinuityProposal(sessionId, kind) {
+    return db.prepare("SELECT * FROM continuity_proposals WHERE session_id = ? AND kind = ?").get(sessionId, kind) ?? null;
+  }
+
+  /** Newest-first proposals, optionally filtered by status (转正通道的读侧预置)。 */
+  function listContinuityProposals({ status, limit = 50 } = {}) {
+    const bounded = Number.isSafeInteger(limit) && limit > 0 ? limit : 50;
+    return status
+      ? db.prepare("SELECT * FROM continuity_proposals WHERE status = ? ORDER BY updated_at DESC, id LIMIT ?").all(status, bounded)
+      : db.prepare("SELECT * FROM continuity_proposals ORDER BY updated_at DESC, id LIMIT ?").all(bounded);
+  }
+
+  function countContinuityProposals({ status } = {}) {
+    return status
+      ? db.prepare("SELECT COUNT(*) AS c FROM continuity_proposals WHERE status = ?").get(status).c
+      : db.prepare("SELECT COUNT(*) AS c FROM continuity_proposals").get().c;
+  }
+
   function runAtomically(fn) {
     if (db.isTransaction) return fn();
     db.exec("BEGIN");
@@ -2769,6 +2851,11 @@ export function createStore(path) {
     setTypeStatus,
     getTypeStatus,
     incrementGeneration,
+    // #249 N3：压缩边缘的连续性提案（落提案、转正才进 memories）。
+    saveContinuityProposal,
+    getContinuityProposal,
+    listContinuityProposals,
+    countContinuityProposals,
     close() {
       db.close();
     }

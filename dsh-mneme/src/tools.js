@@ -5,7 +5,7 @@ import { defaultRuntimeDir } from "./runtime/layout.js";
 import { hostModulesDir, loadRuntimeManifest, provisionRuntime } from "./runtime/provision.js";
 import { matchesPlatform } from "./runtime/closure.js";
 import { verifyPayload } from "./runtime/verify.js";
-import { TOOL_GUIDE } from "./guide.js";
+import { TOOL_GUIDE, CONTINUITY_TOOL_RULE } from "./guide.js";
 import { injectChildEnabled } from "./config.js";
 
 const TEXT_OUTPUT = (text) => [{ type: "text", text }];
@@ -90,8 +90,16 @@ export function createTools(ctx, service, config, embedder) {
   // 关闭时描述逐字节不变，也不动其他工具的文案。
   // 它是注入父开关的子项（#249 第二批）：`autoInject` 关掉时这里同样不生效——
   // 工具描述是这个子项唯一住在注入器之外的落点，不在闸门内就漏了。
-  const withToolGuide = (name, description) =>
-    injectChildEnabled(config, "injectGuidanceEnabled") && TOOL_GUIDE[name] ? `${description}${TOOL_GUIDE[name]}` : description;
+  // #249 N3 降级路径（continuityRescueEnabled）：宿主若不提供可挂钩的压缩前时机，
+  // 双落点里的注入那一半就没有触发者，这时把规则交给 agent 自判（见 CONTINUITY_TOOL_RULE）。
+  // 与能力说明各自独立：任一开关关闭时描述逐字节不变。
+  // 本批不做宿主能力探测（没有可靠的探测口），所以子开关打开时这条规则常驻，与自动双落点并存。
+  const withToolGuide = (name, description) => {
+    let text = description;
+    if (injectChildEnabled(config, "injectGuidanceEnabled") && TOOL_GUIDE[name]) text += TOOL_GUIDE[name];
+    if (injectChildEnabled(config, "continuityRescueEnabled") && CONTINUITY_TOOL_RULE[name]) text += CONTINUITY_TOOL_RULE[name];
+    return text;
+  };
 
   // 复核项 4（issue #170）：strictScope 下他 scope（explicit）的行对工具侧按
   // 「不存在」处理——update/delete 与 memory_get 同款无存在性泄漏。strictScope
