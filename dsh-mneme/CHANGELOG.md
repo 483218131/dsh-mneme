@@ -38,6 +38,10 @@
 
 ## [Unreleased]
 
+## 🐛 修复
+
+- **saveWithDedupe 透传显式 epistemic_status（trustEpistemicWeighting 写入通路缺口）**：创建路径此前丢弃显式字段，store 回退内容标记推断（中文正则）——英文/无标记内容一律落 subjective，EPISTEMIC_WEIGHTS 对整池均匀 ×0.7，`trustEpistemicWeighting` 的重排对工具主路径写入的记忆**整体空转**（v0.4.5 起消费者在、写入通路断；patch 路径 store.update 本来就通）。E 系列四臂实验现场抓到（重排臂与对照臂注入序逐条相同）。修复后 undefined 保持推断行为（存量零变化），显式值优先（契约同 resolveEpistemicStatus）；回归测试锁「observation 加权前后分数不变——字段丢失则全体缩放当场红」。
+
 ## [0.8.8] - 2026-09-27
 
 ## 🆕 新增
@@ -188,6 +192,7 @@
 - **蒸馏游标持久化：重启不再重放历史窗口（issue #229）**：新增 `distill_cursors` 表（幂等迁移，按 `session.id` 记最近成功消费的事件序），游标只向前推进——较小 seq 不覆盖已存进度；记忆写入与游标推进同一事务，LLM 失败 / 解析失败 / 中止 / 记忆写入失败 / 游标写入失败任一处出错都保留窗口、回滚并如实记失败审计（此前游标只在内存里，进程重启后历史窗口被重复蒸馏）。
 - **能力说明第 5 条写全 `memory_forget` 的副作用面，`memory_save` 尾句收短（#249 文案精确性）**：原文只写「`memory_forget` 只停注入」，比工具实况窄——它实际让条目从注入、检索结果与列表三处消失，写窄会让模型低估其影响面；改为与 `memory_archive`（从列表 / 检索 / 注入 / 巩固四处隐藏）同口径，回归测试锁完整短语在场。
 - **运行时完整性判据从未生效：状态词对不上，而且结论根本没读（issue #268）**：`verifyPayload` 只认 `integrity.status === "sha512-matched"`，而下载通道在 `mneme-runtime.json` 里记的是 `{status: "verified", checked, detail}`（`src/runtime/download.js`，自 #133 起）——这份结论一喂进来就恒判 `ok:false`，接线即系统性判失败；更根本的是两个生产调用方（`memory_runtime` 的 verify 分支、`scripts/mneme-runtime.mjs` 的 `runVerify`）都只传 `cacheDir`，**这一层在生产路径上从未运行过**：清单里明写的 mismatch 也被静默放过（红测试证实）。附带第二处形状违约：`loader.js` 把清单里的**对象**直接填进 `describeLocalRuntime` 里声明为 `string|null` 的 `integrity` 字段，经免鉴权的 `/api/dsh-mneme/semantic` 外发，CLI `status` 还会把它打印成 `[object Object]`。修法收成一处：新增 `layout.js` 的 `recordedIntegrity()` 归一清单字段的两种形态（对象 / 缺失），判据与投影都只调它——`verifyPayload` 在调用方未显式传结论时读 `describePayload` 已解析的清单，判据同时认 `verified` 与 `sha512-matched`，并把显式 `unverified` 与「没传」同判（原先一个 `ok:true`、一个 `ok:false`）；不一致的结论（含清单里记下的 mismatch）照样判失败。
+
 
 - **睡眠冲突/模式阶段的输出预算可配（issue #257）**：`src/dream/sleep.js` 冲突消解与模式发现两处 `maxTokens: 2048` 硬编码提为 `sleepMaxTokens`（默认 8192，schema + 整数白名单成对落位，面板可调）。实测依据（报告者 llama.cpp 环境）：默认档 24 对裁决需 2097 token，恰好压在 2048 边界（53 次运行 48 败 5 胜的「间歇性失败」指纹）；`sleepActionSet: full` 六分支实测需 6967（3.4 倍越界）——该档位自 #126 引入起从未跑通过。流式计费按实际用量，调大不增加成本。
 

@@ -296,3 +296,30 @@ test("conflict resolution keeps the LLM winner when disabled", () => {
   assert.equal(store.getById(w.memory.id).archived, false);
   assert.equal(store.getById(l.memory.id).archived, true);
 });
+
+// E2 四臂实验(Kaggle v11)当场抓到的回归:saveWithDedupe 此前丢弃显式
+// epistemic_status,store 回退内容推断,英文/无标记内容一律 subjective——
+// EPISTEMIC_WEIGHTS 对整池均匀 ×0.7,trustEpistemicWeighting 的重排整体空转
+// (R+ 臂与 A 臂注入序逐条相同)。显式值必须穿透创建路径;undefined 保持推断。
+test("saveWithDedupe forwards explicit epistemic_status (rerank needs non-uniform weights)", async () => {
+  const store = createStore(":memory:");
+  const builder = createService({ store, mirror: null, config: {} });
+  const bait = builder.saveWithDedupe({ type: "preference", title: "m#0", content: "User feels that daily stand-up meetings are micromanagement theater", importance: 3, epistemic_status: "subjective" });
+  const fact = builder.saveWithDedupe({ type: "preference", title: "m#1", content: "User is a Lead Software Engineer with 15 years of experience", importance: 3, epistemic_status: "observation" });
+  assert.equal(store.getById(bait.memory.id).epistemic_status, "subjective", "explicit subjective stored");
+  assert.equal(store.getById(fact.memory.id).epistemic_status, "observation", "explicit field must survive saveWithDedupe (English content, inference cannot classify)");
+
+  const plain = createService({ store, mirror: null, config: { signalTransparency: true } });
+  const weighted = createService({ store, mirror: null, config: { signalTransparency: true, trustEpistemicWeighting: true } });
+  for (const s of [plain, weighted]) s.setVectorIndex(createVectorIndex({ store }));
+  const opts = { mode: "auto", topK: 5, useRerank: false };
+  const pRows = await plain.searchMemories("software engineer", opts);
+  const wRows = await weighted.searchMemories("software engineer", opts);
+  const pScore = Object.fromEntries(pRows.map((r) => [r.id, r.signals?.final]));
+  const wScore = Object.fromEntries(wRows.map((r) => [r.id, r.signals?.final]));
+  assert.ok(pScore[fact.memory.id] > 0, "observation entry is a candidate");
+  assert.ok(
+    Math.abs(wScore[fact.memory.id] - pScore[fact.memory.id]) < 1e-9,
+    "observation keeps weight 1.0 — if scaled, the explicit field was dropped (all rows uniform subjective)"
+  );
+});
