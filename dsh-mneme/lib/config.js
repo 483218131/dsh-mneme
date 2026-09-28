@@ -588,6 +588,29 @@ export const Config = z.object({
     retentionDays: z.natural().min(1).max(3650).default(90)
   }).default({}),
 
+  // --- write admission (#254) ------------------------------------------------
+  // 写入准入：把「这条该不该进库」前移到 LLM 之前。与 memoryQualityFilter 的分工
+  // 是时点不是判据——那个是**写入后**打分归档（扣分可以错，只影响排序与归档），
+  // 这个是**写入前**判定（硬拒不能错）。
+  //
+  // 两个开关都默认关（验收第 1 条「默认关零行为变化」）：
+  //   enabled — 跑第 1 级确定性判据。关时 evaluate 的返回与只计量那一阶段逐字段
+  //     一致，写入路径完全不碰。
+  //   enforce — 命中时真的拒绝。关时判据照跑、审计照留，决策回落 allow（仅告警）。
+  //     读审计时「metadata.deny 非空且 metadata.decision=allow」就是这一档的指纹。
+  // 分层是为了能把「先观察」和「开始拦」分成两次上线：enforce 打开前先在真实流量
+  // 里看误杀面，而不是靠回滚开关当保险。
+  //
+  // 第 1 级的判据面刻意收窄到两类：密钥/PII（#164 A2 是判据来源，经
+  // createWriteAdmission 的 sensitiveScan 注入；本批只定义它怎么被消费）与空白/
+  // 纯噪声文本。去重键命中**不**进第 1 级——按维护者 09-22 的判定归 write-update
+  // 放行（2606.24535 的失效模式：同步近重复门跑在异步矛盾检测之前，把本该被裁决
+  // 的矛盾直接拒掉）；G1/G2 的阈值继续只计量，等遥测有分布再单独提。
+  writeAdmission: z.object({
+    enabled: z.boolean().default(false),
+    enforce: z.boolean().default(false)
+  }).default({}),
+
   // --- recall evaluation: test-result storage (v0.4.6, 方案 B) --------------
   // Separate retrieval evaluation snapshots from the production recall audit.
   // When false (default) evaluateRetrieval still computes precision/recall/mrr

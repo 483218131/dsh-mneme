@@ -386,7 +386,7 @@ export function createStandaloneApi({ service, store, config = {}, logger, setti
             }
           }
           try {
-            const { action, memory } = service.saveWithDedupe({
+            const result = service.saveWithDedupe({
               type: body.type,
               title: body.title,
               content: body.content,
@@ -398,6 +398,16 @@ export function createStandaloneApi({ service, store, config = {}, logger, setti
               ...(body.agent_scope !== undefined ? { agent_scope: body.agent_scope, agent_scope_source: "explicit" } : {}),
               ...(body.workspace_scope !== undefined ? { workspace_scope: body.workspace_scope, workspace_scope_source: "explicit" } : {})
             });
+            const { action } = result;
+            // #254 写入准入：这条 HTTP 路径今天不带会话身份，evaluate 在无 sessionKey
+            // 时直接早退，所以拦不到；仍然显式分支——将来真接上会话身份时，落到
+            // `toApiList([null])` 上会变成 500，把「被拒」伪装成「服务器出错」，而
+            // 这两件事对调用方的处置完全不同（改内容 vs 重试）。
+            if (action === "denied") {
+              sendJson(res, 422, { error: "write-rejected", reason: result.reason });
+              return;
+            }
+            const { memory } = result;
             // action 随行透出（created/merged）：memory_save 工具语义对齐所需，
             // 附加键对既有消费方（CLI add 等）向后兼容。
             sendJson(res, action === "created" ? 201 : 200, { ...service.toApiList([memory])[0], action });

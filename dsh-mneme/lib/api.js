@@ -135,9 +135,14 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
   ];
   // 嵌套键在 kv 里按点号平铺（"memoryQualityFilter.enabled"），运行时 cfg 里
   // 是嵌套对象，effective 从对象子字段取值；其余键照旧从 cfg 顶层取。
+  // 这张表必须与 settings.js 白名单里的点号键一一对应：#254 加键时漏了这里，
+  // effective 会静默少两个键（configFlagValue 取不到 undefined 就不写进去），
+  // 面板上看不出来、PUT 也存不进去——test/api.test.js 的计数锁就是钉这件事的。
   const NESTED_FLAG_PATHS = {
     "memoryQualityFilter.enabled": ["memoryQualityFilter", "enabled"],
-    "llmAudit.enabled": ["llmAudit", "enabled"]
+    "llmAudit.enabled": ["llmAudit", "enabled"],
+    "writeAdmission.enabled": ["writeAdmission", "enabled"],
+    "writeAdmission.enforce": ["writeAdmission", "enforce"]
   };
   function configFlagValue(key) {
     const path = NESTED_FLAG_PATHS[key];

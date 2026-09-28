@@ -1,10 +1,17 @@
-// #254 写入准入（第一阶段：只计量，不拦截）。
-//
-// 为什么先只计量：会话写入预算的 N 与同话题冷却的 X 在没有真实分布时拍任何数字
-// 都是误杀面（维护者 2026-09-23 拍板「先记录不拦，由遥测定」）。所以这一阶段只把
-// 两个闸门的原始测量点写进 llm_audit_logs（status='skipped'、metadata.gate='g1'
-// 且同话题重复时附 metadata.g2），不做判定、不改任何写入行为；第二阶段把拦截打开
-// 时才引入阈值与二次确认（memory_save({confirm:true})）。
+// #254 写入准入。两个阶段：
+//   阶段一（已合入）：只计量、不拦截。会话写入预算的 N 与同话题冷却的 X 在没有真实
+//   分布时拍任何数字都是误杀面（维护者 2026-09-23 拍板「先记录不拦，由遥测定」）。
+//   所以那两个闸门只把原始测量点写进 llm_audit_logs（status='skipped'、
+//   metadata.gate='g1' 且同话题重复时附 metadata.g2），不做判定、不改任何写入行为；
+//   阈值与二次确认（memory_save({confirm:true})）等遥测有分布再单独提。
+//   阶段一之后（本批）：第 1 级确定性拒绝。按 2026-09-21/09-22 两轮收窄的口径，
+//   第 1 级只剩**密钥/PII 与空白噪声**两类判据走硬拒；去重键命中判 write-update 放行
+//   （不把同步去重升级成拒绝门——2606.24535 记的那个失效模式：同步近重复门抢在异步
+//   矛盾检测之前，本该被裁决的矛盾写入被门直接拒掉）。两类判据都零 LLM、纯确定性。
+//   两个开关都默认关：enabled 打开判定，enforce 打开拦截（关 = 仅告警 + 留审计）。
+//   默认关时 evaluate 的返回与阶段一逐字段一致（验收第 1 条「默认路径零行为变化」）。
+//   密钥/PII 那一类的判据实现不在本模块：按验收第 4 条它是 #164 A2 的判据来源，由
+//   createWriteAdmission 的 sensitiveScan 注入，本模块只定义它怎么被消费。
 //
 // 为什么复用 llm_audit_logs：它是仓库既有的「后台动作回执」表（bookkeeping，不
 // 触发写钩子，见 store.js 的表注释）。第二阶段落地时「第一次 skipped/gate →
@@ -36,7 +43,7 @@
 // deleteOldLlmAudits），所以关掉时本模块一行都不写，否则就是在无保留期的表里做
 // 按写入频次增长。
 import { PINNED_MEMORY_TYPES } from "./service.js";
-import { contentHashOf } from "./content-hash.js";
+import { contentHashOf, normalizeForHash } from "./content-hash.js";
 
 // 审计口径（llm_audit_logs 的既有列）：trigger_source = 组件名，operation_type =
 // 动作名，status='skipped' = 本行没有产生任何 LLM 花费（与 summarize 的间隔门、
@@ -44,6 +51,16 @@ import { contentHashOf } from "./content-hash.js";
 export const ADMISSION_TRIGGER_SOURCE = "writeAdmission";
 export const ADMISSION_OPERATION_TYPE = "write_admission";
 export const ADMISSION_GATE_SESSION_BUDGET = "g1";
+
+// 决策两值。阶段一恒 allow；第 1 级判定命中且 enforce 打开时才 deny。
+export const ADMISSION_DECISION_ALLOW = "allow";
+export const ADMISSION_DECISION_DENY = "deny";
+
+// 第 1 级的拒绝原因（#254 拍板：硬拒绝只留密钥/PII 与空白噪声；去重键命中归
+// write-update 放行，G1/G2 走二次确认）。reason 是审计行里的稳定键，别当展示文案用。
+export const ADMISSION_DENY_BLANK = "blank";
+export const ADMISSION_DENY_NOISE = "noise";
+export const ADMISSION_DENY_SENSITIVE = "sensitive";
 
 // 首次见到某会话时的回填深度：话题表由审计行重建，只回填最近这么多行。更早的
 // 话题会漏（测量口径可接受），换来的是一次查询与有界的常驻内存。
@@ -77,18 +94,57 @@ export function extractTopicKeys(memory) {
 }
 
 /**
+ * 第 1 级「空白 / 纯噪声」判据（#254，零 LLM、纯函数、无状态）。
+ *
+ * 为什么这两类够格进硬拒：它们的命中面**没有解释空间**——一条归一化后什么都不剩的
+ * 写入，进库之后既检索不到也注入不了，写它只有成本没有收益，不存在「误杀有价值内容」
+ * 的可能。这正是硬拒与二次确认的分界：有解释空间的（去重命中、预算/冷却）走二次确认，
+ * 没有解释空间的才硬拒。
+ *
+ * 为什么复用 content-hash 的归一化而不另写一套：判据要的是「有没有信息」，而
+ * normalizeForHash 的口径（NFKC → 小写 → 去标点 → 空白折叠）恰好就是「把格式折掉之后
+ * 还剩什么」。另写一套只会多出一个会漂移的口径（同 content-hash.js 文件头的存量重算
+ * 理由）。两个 reason 分开报是为了可解释：`blank` 是真的什么都没写（提交一个空表单），
+ * `noise` 是写了但只有标点/空白（`...`、`---`）——两者的修法不同。
+ *
+ * 为什么不用 quality-filter 的 `repetitive`（dedupRatio < 0.3）一起判：那是**写入后**
+ * 的评分扣分项，扣分可以错（只影响排序与归档），硬拒不能错。一条字符多样性低的正常
+ * 记忆（同一种分隔符排出的长清单）会被它判成 repetitive，本判据不背这个误杀面。
+ *
+ * @param {{title?: string, content?: string}|null|undefined} memory
+ * @returns {"blank"|"noise"|null} 命中即返回 reason，否则 null
+ */
+export function informationlessReason(memory) {
+  const title = String(memory?.title ?? "").trim();
+  const content = String(memory?.content ?? "").trim();
+  if (!title && !content) return ADMISSION_DENY_BLANK;
+  if (!normalizeForHash(title) && !normalizeForHash(content)) return ADMISSION_DENY_NOISE;
+  return null;
+}
+
+/**
  * 写入准入（#254）。返回的两个方法就是三个消费方共用的那份接口：
- *   evaluate 给出决策形状（阶段一恒 allow），record 把测量点写成审计行。
- * 阶段二在 evaluate 里引入阈值与 confirm 分支；#249 的注入提示与 #275 的水位计数
- * 都读同一份 decision/审计行，而不是各写一套判定。
+ *   evaluate 给出决策形状，record 把测量点/拒绝面写成审计行。
+ * #249 的注入提示与 #275 的水位计数都读同一份 decision/审计行，而不是各写一套判定。
+ *
+ * 两个开关（config.writeAdmission，都默认关——验收第 1 条「默认路径零行为变化」）：
+ *   enabled — 打开第 1 级判定（空白/噪声 + 注入进来的密钥/PII 判据）。
+ *             关时 evaluate 的返回与阶段一逐字段一致，只算三个测量点。
+ *   enforce — 命中时真的拒绝。关时判定照跑、照留审计，但决策回落 allow（仅告警）。
+ * 密钥/PII 那一类判据不在这里实现：按 #254 验收第 4 条，它是 #164 A2 的判据来源，
+ * 由 `sensitiveScan` 注入（见下），本模块只定义它怎么被消费。
  *
  * @param {object} deps
  * @param {object} deps.store 存储层（listLlmAudits / saveLlmAudit）
- * @param {object} [deps.config] 已解析配置（读 llmAudit.enabled）
+ * @param {object} [deps.config] 已解析配置（读 llmAudit.enabled、writeAdmission.*）
  * @param {object} [deps.logger]
  * @param {() => number} [deps.now] 时钟注入（测试用）
+ * @param {(memory: object) => ({reason: string, kind?: string, label?: string}|null)} [deps.sensitiveScan]
+ *   第 1 级的密钥/PII 判据（#164 A2 的落点）。约定：命中返回 `{kind, label}`，未命中
+ *   返回 null，**不抛**（抛出按未命中处理并 warn，判据故障不能让写入变成不可用）。
+ *   缺省时这一类判据整个不参与——本模块在 A2 落地前只跑空白/噪声。
  */
-export function createWriteAdmission({ store, config, logger, now = Date.now } = {}) {
+export function createWriteAdmission({ store, config, logger, now = Date.now, sensitiveScan = null } = {}) {
   // sessionKey → Map<话题锚, 最近一次新建行时刻(ms)>。真相源是审计行，这里只是它的
   // 增量视图：进程重启后按需回填。FIFO 上限防长驻进程内存无界（同 store.js 的
   // embedding 解析缓存口径）。
@@ -115,6 +171,11 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
         // 穿透行（pinned）整个不在闸门里，也就不该进基准表——只挡内存路径不挡回填，
         // 重启后口径就变了（同一个话题会因为一条穿透行而被判成重复）。
         if (metadata.exempt) continue;
+        // 被第 1 级拦下的行同理：它根本没进库。内存路径已经跳过了（见 record 的
+        // enforced 判断），回填路径必须同口径——否则同一条时间线会随进程重启而变：
+        // 重启前不重复、重启后变重复。仅告警档（deny 非空但 decision=allow）要留，
+        // 那条行确实落库了。
+        if (metadata.deny?.enforced === true) continue;
         const at = Date.parse(row.timestamp);
         // 坏时间戳跳过：落到 0 会让 gap 变成几十年，一个离群值就能带偏按分位定的 X。
         if (!Number.isFinite(at)) continue;
@@ -165,25 +226,82 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
   }
 
   /**
-   * 阶段一决策：恒 allow（本模块里没有阈值），只算出三个闸门的测量点。返回形状一次
-   * 定死，阶段二只往里加分支、不改字段：
-   *   decision — "allow" | "confirm"（阶段一只可能 allow）
+   * 第 1 级判据的汇总口（#254）：空白 / 噪声 + 注入进来的密钥 / PII。
+   * 顺序按成本排：字符串判据在前，注入的扫描器在后；扫描器抛异常按「未命中」处理
+   * （warn）——判据故障不能让所有写入变成不可用，这是与计量同一条不反噬原则。
+   * @returns {{reason: string, kind?: string, label?: string}|null}
+   */
+  function firstLevelHit(memory) {
+    const info = informationlessReason(memory);
+    if (info) return { reason: info };
+    if (typeof sensitiveScan !== "function") return null;
+    try {
+      const hit = sensitiveScan(memory);
+      if (!hit) return null;
+      const deny = { reason: ADMISSION_DENY_SENSITIVE };
+      // kind / label 只在判据真给了才落盘：给 undefined 会让审计行里出现一个
+      // 存在但无值的键，读的人分不清「没报」和「报了空串」。
+      if (hit.kind !== undefined) deny.kind = hit.kind;
+      if (hit.label !== undefined) deny.label = hit.label;
+      return deny;
+    } catch (e) {
+      warn(`[dsh-mneme] write admission sensitive scan failed: ${String(e)}`);
+      return null;
+    }
+  }
+
+  /**
+   * 决策形状一次定死，后续只加分支、不改字段：
+   *   decision — "allow" | "deny"
    *   gate     — "g1" | null（null = 这次写入不进预算，不记行）
    *   topics   — 本次写入的确定性话题锚
    *   repeat   — {topic, gapMs} | null（g2 的命中面）
    *   dup      — {memory_id, archived, forgotten} | null（内容哈希的命中面）
    *   exempt   — null | "pinned"
+   *   deny     — null | {reason, kind?, label?}（第 1 级命中面）
+   *
+   * deny 非空但 decision 仍是 allow = 仅告警档（config.writeAdmission.enforce 关）：
+   * 判定照跑、审计照留，写入不拦。读审计时「deny 非空且 decision=allow」就是这一档的
+   * 指纹，不需要再读配置才能解释一行。
+   *
+   * 第 1 级判定放在 pinned 豁免之前：pinned 豁免的是**预算与冷却**（constraint /
+   * preference 是 #249 第一批立的逐字保真池，不该被会话预算拦），不是「这条能不能落库」。
+   * 一条写着私钥的 constraint 仍然是私钥。
    * @param {{memory: object, sessionKey?: string|null}} input
    */
   function evaluate({ memory, sessionKey } = {}) {
-    const verdict = { decision: "allow", gate: null, topics: [], repeat: null, dup: null, exempt: null };
+    const verdict = {
+      decision: ADMISSION_DECISION_ALLOW,
+      gate: null,
+      topics: [],
+      repeat: null,
+      dup: null,
+      exempt: null,
+      deny: null
+    };
     // 无会话身份 = 系统写入（dream / summarize / import / organize），不进预算。
+    // 第 1 级判定同样在这里之外：#164 A2 定的判据面含 autoSummarize / dream 输出，
+    // 那三处的接线是 A2 的落地范围（本模块跑的是会话内的 memory_save 路径）。
     if (!sessionKey) return verdict;
     // 审计关掉时不记行、也不推进话题表（见文件头：那个开关连启动期清理一起关掉）。
     if (config?.llmAudit?.enabled === false) return verdict;
+
+    const hit = config?.writeAdmission?.enabled === true ? firstLevelHit(memory) : null;
+    const judged = hit ? { ...verdict, deny: hit } : verdict;
+
+    // 命中且 enforce：决策已定，不再发候选集查询、不再比较话题（纯白花成本）。
+    if (hit && config?.writeAdmission?.enforce === true) {
+      return {
+        ...judged,
+        decision: ADMISSION_DECISION_DENY,
+        gate: ADMISSION_GATE_SESSION_BUDGET,
+        topics: extractTopicKeys(memory)
+      };
+    }
+
     const topics = extractTopicKeys(memory);
     const pinned = PINNED_MEMORY_TYPES.has(String(memory?.type ?? ""));
-    if (pinned) return { ...verdict, gate: ADMISSION_GATE_SESSION_BUDGET, topics, exempt: "pinned" };
+    if (pinned) return { ...judged, gate: ADMISSION_GATE_SESSION_BUDGET, topics, exempt: "pinned" };
     const dup = lookupContentDup(memory);
     const table = topicTable(sessionKey);
     const at = now();
@@ -194,11 +312,11 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
       // 同一行可能命中多个锚：取最近的那次（间隔最短＝最有价值的那次重复）。
       if (!repeat || gapMs < repeat.gapMs) repeat = { topic, gapMs };
     }
-    return { ...verdict, gate: ADMISSION_GATE_SESSION_BUDGET, topics, repeat, dup };
+    return { ...judged, gate: ADMISSION_GATE_SESSION_BUDGET, topics, repeat, dup };
   }
 
   /**
-   * 把测量点落成审计行（一行一个新建行）。三个信号的读法：
+   * 把测量点与拒绝面落成审计行（一行一个新建行 / 一次被拒的写入）。四个信号的读法：
    *   g1 会话写入预算：`GROUP BY session_key` 计数即得「会话内新建条数」分布；要剔
    *      掉穿透行（pinned 不进预算）就加 `json_extract(metadata,'$.exempt') IS NULL`。
    *   g2 同话题冷却：`json_extract(metadata,'$.g2.gap_ms')` 即得「同话题新建行间隔」
@@ -207,6 +325,10 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
    *   dup 内容哈希：`json_extract(metadata,'$.dup.memory_id')` 非空即「这条新行的内容
    *      与某条既有行归一化后逐字节相同」；`$.dup.archived` 区分命中那条在活区还是
    *      归档区——归档区命中就是去重候选集漏掉的那一类穿透。
+   *   deny 第 1 级命中：#254 验收第 2 条要的「被拒的写入可解释、不静默丢弃」就落在
+   *      这一项。三个键分工——`$.deny.reason` 是稳定判据键（blank / noise / sensitive），
+   *      `$.deny.kind` 是密钥/PII 的子类，`$.deny.enforced` 区分「真拦下了」与「仅告警」。
+   *      enforced=false 时这一行同时也是一个正常的 g1 行（写入确实发生了）。
    * 计量绝不影响写入：任何异常只 warn。
    * @returns {object[]} 落下的审计行（无测量点或失败时为空数组）
    */
@@ -214,6 +336,7 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
     if (!sessionKey || !verdict || verdict.gate == null) return [];
     const at = now();
     const topics = Array.isArray(verdict.topics) ? verdict.topics : [];
+    const enforced = verdict.decision === ADMISSION_DECISION_DENY;
     const rows = [];
     try {
       rows.push(store.saveLlmAudit({
@@ -239,6 +362,24 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
               archived: verdict.dup.archived === true,
               forgotten: verdict.dup.forgotten === true
             } }
+            : {}),
+          // enforced 由 decision 推出而不是另存一个入参：两者若各存一份，将来就会出现
+          // 「decision=deny 但 enforced=false」这种自相矛盾的行。
+          //
+          // decision 只在真有拒绝面时落盘：两个开关都关时，这条 metadata 必须与只计量
+          // 那一阶段逐字节一致（#254 验收第 1 条）。没有 deny 的行本来就默认是放行，
+          // 写一个恒为 "allow" 的键只是把「默认路径零行为变化」变成需要解释的事。
+          // 读法：有 deny 才有 decision，deny 非空且 decision=allow 就是仅告警档。
+          ...(verdict.deny
+            ? {
+              decision: verdict.decision,
+              deny: {
+                reason: verdict.deny.reason,
+                ...(verdict.deny.kind !== undefined ? { kind: verdict.deny.kind } : {}),
+                ...(verdict.deny.label !== undefined ? { label: verdict.deny.label } : {}),
+                enforced
+              }
+            }
             : {})
         }
       }));
@@ -247,8 +388,10 @@ export function createWriteAdmission({ store, config, logger, now = Date.now } =
       warn(`[dsh-mneme] write admission audit failed: ${String(e)}`);
     }
     // 只有真正落库、且不是穿透口的行才推进话题表：审计写失败时内存视图不能跑在审计
-    // 前面（重启回填会得到另一条时间线），pinned 写入整个不在闸门里。
-    if (rows.length > 0 && !verdict.exempt) {
+    // 前面（重启回填会得到另一条时间线），pinned 写入整个不在闸门里。被拦下的写入
+    // 同样不推进——它没进库，成为下一次 g2 的基准就会造出一条不存在的时间线。
+    // 仅告警档（deny 非空但 decision=allow）**要**推进：那条行确实落库了。
+    if (rows.length > 0 && !verdict.exempt && !enforced) {
       const table = topicTable(sessionKey);
       for (const topic of topics) table.set(topic, at);
     }

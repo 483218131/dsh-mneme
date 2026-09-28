@@ -10,9 +10,13 @@ import { createTools } from "../src/tools.js";
 import {
   createWriteAdmission,
   extractTopicKeys,
+  informationlessReason,
+  ADMISSION_DENY_BLANK,
+  ADMISSION_DENY_NOISE,
   ADMISSION_OPERATION_TYPE,
   ADMISSION_TRIGGER_SOURCE
 } from "../src/write-admission.js";
+import { POSITIVE_SAMPLES, NEGATIVE_SAMPLES, SAMPLE_VALUES, referenceScan } from "./helpers/write-admission-samples.js";
 
 // #254 写入准入（第一阶段：只计量，不拦截）。
 // 本批次没有阈值、没有拦截分支，验收看两件事：默认路径零行为变化（无会话身份的
@@ -343,3 +347,207 @@ test("旧库（llm_audit_logs 无 session_key）打开自动补列，准入行�
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// --- 第 1 级确定性拒绝（#254 第二阶段） ----------------------------------------
+// 判据面按 09-21 / 09-22 两轮收窄到两类：空白 / 纯噪声 + 注入进来的密钥 / PII。
+// 去重键命中**不**在这里（归 write-update 放行），G1/G2 阈值也只是计量。
+//
+// 两个开关都默认关，所以这一组测试的第一件事是证明「关掉时逐字段等于只计量那一
+// 阶段」。拦截面本身要证明三件事：拒了（真的没落库）、可解释（审计行里有 reason）、
+// 不误杀（正常文本一条不动）。
+
+function level1Store(opts = {}) {
+  const { enabled = false, enforce = false, sensitiveScan = null, now } = opts;
+  const store = createStore(":memory:");
+  const writeAdmission = createWriteAdmission({
+    store,
+    now,
+    config: { writeAdmission: { enabled, enforce } },
+    sensitiveScan
+  });
+  const service = createService({ store, mirror: null, config: {}, writeAdmission });
+  return { store, service, writeAdmission };
+}
+
+/** 落库行数（含归档 / 遗忘：被拒的写入一条都不该多）。 */
+function rowCount(store) {
+  return store.list({ limit: 500, includeArchived: true, includeForgotten: true }).length;
+}
+
+test("信息量判据：blank 与 noise 分开报，正常文本不命中", () => {
+  assert.equal(informationlessReason({ title: "", content: "" }), "blank");
+  assert.equal(informationlessReason({ title: "   ", content: "\n\t " }), "blank", "纯空白折掉之后什么都没写");
+  assert.equal(informationlessReason({ title: "标题", content: "" }), null, "有一边有内容就不是空写入");
+  assert.equal(informationlessReason({ title: "!!!", content: "--- ..." }), "noise", "只有标点 = 归一化后什么都不剩");
+  assert.equal(informationlessReason({ title: "a", content: "..." }), null, "只剩一个字母也算有信息");
+  // 两种 reason 分开报是为了可解释：blank 是提交了空表单，noise 是只填了标点，修法不同。
+  assert.notEqual(ADMISSION_DENY_BLANK, ADMISSION_DENY_NOISE);
+});
+
+test("默认关：enabled 关时判据根本不跑，连 enforce 开着也没用", () => {
+  const { store, service } = level1Store({ enabled: false, enforce: true });
+  const result = service.saveWithDedupe({ _sessionKey: "s", type: "project", title: "", content: "   " });
+  assert.equal(result.action, "created", "判据没开就不该有任何拒绝分支");
+  assert.equal(rowCount(store), 1);
+  const rows = admissionRows(store, "s");
+  assert.equal(rows.length, 1, "只计量那一阶段的行为逐字段保留");
+  // 验收第 1 条是「默认路径逐字节一致」，所以这里断言的是**整个 metadata**与只计量
+  // 阶段相同：连一个恒为 "allow" 的 decision 键都不该多出来。多一个键就意味着
+  // 「默认关零行为变化」从事实变成了需要解释的说法。
+  assert.deepEqual(rows[0].metadata, { gate: "g1", topics: [] });
+  assert.equal(rows[0].metadata.deny, undefined, "判据没跑就不该有拒绝面");
+});
+
+test("仅告警档：enabled 开、enforce 关 → 写入成功，审计行带拒绝面", () => {
+  const { store, service } = level1Store({ enabled: true, enforce: false });
+  const result = service.saveWithDedupe({ _sessionKey: "s", type: "project", title: "!!", content: "..." });
+  assert.equal(result.action, "created", "只开检测不拦写入");
+  assert.equal(rowCount(store), 1);
+  const rows = admissionRows(store, "s");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].metadata.decision, "allow", "仅告警档的决策仍是放行");
+  assert.deepEqual(rows[0].metadata.deny, { reason: "noise", enforced: false });
+  // 「deny 非空但 decision=allow」就是仅告警档的指纹，不必再读配置才能解释这一行。
+});
+
+test("硬拒：enabled + enforce → 不落库、返回 reason、审计行标 enforced", () => {
+  const { store, service } = level1Store({ enabled: true, enforce: true });
+  const result = service.saveWithDedupe({ _sessionKey: "s", type: "project", title: "   ", content: "" });
+  assert.equal(result.action, "denied");
+  assert.equal(result.reason, "blank");
+  assert.equal(result.memory, null, "被拒的写入没有行可返回");
+  assert.equal(rowCount(store), 0, "store.save 在拒绝时根本没有被调用");
+
+  const rows = admissionRows(store, "s");
+  assert.equal(rows.length, 1, "拒绝面必须留审计（验收第 2 条：可解释、不静默丢弃）");
+  assert.equal(rows[0].related_memory_ids.length, 0, "没有产生任何行，不能挂一个不存在的 id");
+  assert.equal(rows[0].metadata.decision, "deny");
+  assert.deepEqual(rows[0].metadata.deny, { reason: "blank", enforced: true });
+
+  // 标题有内容就不是空写入：标题有信息（去重键就是它），归一化后非空不该被拒。
+  const titled = service.saveWithDedupe({ _sessionKey: "s2", type: "project", title: "标题", content: "" });
+  assert.equal(titled.action, "created", "title 有内容 = 有信息，不能判成 blank");
+});
+
+test("被拦下的写入不推进话题基准（它没进库，不能成为下一次 g2 的基准）", () => {
+  const { store, service } = level1Store({
+    enabled: true, enforce: true, sensitiveScan: referenceScan, now: () => 1_000_000
+  });
+  // 用密钥类而不是空白类来测这件事：空白/噪声行**不可能**带话题锚（锚是 `#254` /
+  // 路径这类含数字或字母的串，normalizeForHash 之后仍非空，所以它在第 1 级根本不
+  // 会命中）——这条回归只有在 sensitive 那一档才可复现，而密钥行通常也写着上下文。
+  const denied = service.saveWithDedupe({
+    _sessionKey: "s",
+    type: "project",
+    title: "见 #254",
+    content: `token 是 ${SAMPLE_VALUES.githubPat}`
+  });
+  assert.equal(denied.action, "denied");
+  assert.equal(denied.deny.kind, "github_token");
+  // 同一话题再来一条正常写入：如果被拒那条推进了基准，这里就会凭空多出一个 g2。
+  service.saveWithDedupe({ _sessionKey: "s", type: "project", title: "记录", content: "#254 的正文" });
+  const g2 = admissionRows(store, "s").filter((r) => r.metadata.g2);
+  assert.equal(g2.length, 0, "拒绝行不能造出一条不存在的时间线");
+  assert.equal(rowCount(store), 1, "只有第二条真的落库了");
+});
+
+test("硬拒在 pinned 豁免之前：写着空内容的 constraint 一样被拒", () => {
+  // pinned 豁免的是**预算与冷却**（constraint / preference 是逐字保真池，不该被会话
+  // 预算拦），不是「这条能不能落库」。顺序反了就会出现「pinned 行绕过第 1 级」。
+  const { store, service } = level1Store({ enabled: true, enforce: true });
+  const result = service.saveWithDedupe({ _sessionKey: "s", type: "constraint", title: "...", content: "" });
+  assert.equal(result.action, "denied");
+  assert.equal(result.reason, "noise");
+  assert.equal(rowCount(store), 0);
+  assert.equal(admissionRows(store, "s")[0].metadata.deny.reason, "noise");
+});
+
+test("sensitiveScan 注入：正样本一条都不漏放（密钥 + PII）", () => {
+  const { store, service } = level1Store({ enabled: true, enforce: true, sensitiveScan: referenceScan });
+  for (const sample of POSITIVE_SAMPLES) {
+    const result = service.saveWithDedupe({
+      _sessionKey: `sess-${sample.id}`,
+      type: "project",
+      title: sample.title,
+      content: sample.content
+    });
+    assert.equal(result.action, "denied", `${sample.id} 被漏放（${sample.why}）`);
+    assert.equal(result.reason, "sensitive", `${sample.id} 的 reason 该是 sensitive`);
+    const deny = admissionRows(store, `sess-${sample.id}`)[0].metadata.deny;
+    assert.equal(deny.kind, sample.kind, `${sample.id} 的 kind 要落进审计，enforce 前的分布才可按类看`);
+    assert.equal(deny.enforced, true);
+  }
+  assert.equal(rowCount(store), 0, "正样本一条都不该落库");
+});
+
+test("sensitiveScan 注入：负样本一条都不误杀（含敏感词但没有值）", () => {
+  const { store, service } = level1Store({ enabled: true, enforce: true, sensitiveScan: referenceScan });
+  for (const sample of NEGATIVE_SAMPLES) {
+    const result = service.saveWithDedupe({
+      _sessionKey: `sess-${sample.id}`,
+      type: "project",
+      title: sample.title,
+      content: sample.content
+    });
+    assert.equal(result.action, "created", `${sample.id} 被误杀（${sample.why}）`);
+  }
+  assert.equal(rowCount(store), NEGATIVE_SAMPLES.length, "负样本应当全部落库");
+  // 负样本一条 deny 面都不该有——误杀面是这条闸门唯一会伤人的地方。
+  for (const sample of NEGATIVE_SAMPLES) {
+    for (const row of admissionRows(store, `sess-${sample.id}`)) {
+      assert.equal(row.metadata.deny, undefined, `${sample.id} 不该带任何拒绝面`);
+    }
+  }
+});
+
+test("sensitiveScan 抛错按「未命中」处理：判据故障不能让写入变成不可用", () => {
+  const { store, service } = level1Store({
+    enabled: true,
+    enforce: true,
+    sensitiveScan() { throw new Error("scanner boom"); }
+  });
+  const result = service.saveWithDedupe({ _sessionKey: "s", type: "project", title: "正常", content: "正常正文" });
+  assert.equal(result.action, "created", "扫描器坏了必须放行，不能把所有写入拦死");
+  assert.equal(rowCount(store), 1);
+});
+
+test("命中且 enforce 时不发候选集查询（决策已定，白花成本）", () => {
+  const { store, service } = level1Store({ enabled: true, enforce: true });
+  // 先落一条同内容（走正常开关），再做一次同内容写入：若还查候选集，就会带上 dup。
+  store.save({ type: "project", title: "已存在", content: "已存在的正文" });
+  const result = service.saveWithDedupe({ _sessionKey: "s", type: "project", title: "...", content: "" });
+  assert.equal(result.action, "denied");
+  const rows = admissionRows(store, "s");
+  assert.equal(rows.length, 1, "只该有拒绝那一行");
+  assert.equal(rows[0].metadata.dup, undefined, "拒绝路径不查候选集");
+});
+
+test("接线：被拒时 memory_save 返回 action=denied 与可行动的 reason", async () => {
+  const store = createStore(":memory:");
+  const writeAdmission = createWriteAdmission({
+    store,
+    config: { writeAdmission: { enabled: true, enforce: true } }
+  });
+  const service = createService({ store, mirror: null, config: {}, writeAdmission });
+  const registered = [];
+  createTools({ tools: { register(def) { registered.push(def); return () => {}; } } }, service, {}, null);
+  const save = registered.find((t) => t.name === "memory_save");
+
+  const denied = await save.execute(
+    { type: "project", title: "...", content: "" },
+    { agent: { session: { id: "sess-deny" } } }
+  );
+  assert.equal(denied.action, "denied");
+  assert.equal(denied.reason, "noise");
+  assert.equal(denied.id, undefined, "没有落库就不该编一个 id 出来");
+  assert.equal(store.countLlmAudits({ sessionKey: "sess-deny" }), 1, "工具层拒绝也要留审计");
+
+  // 正常写入不受影响，返回形状与既有调用方一致
+  const ok = await save.execute(
+    { type: "project", title: "正常标题", content: "正常正文内容" },
+    { agent: { session: { id: "sess-deny" } } }
+  );
+  assert.equal(ok.action, "created");
+  assert.ok(ok.id, "正常路径仍然返回 id");
+});
+

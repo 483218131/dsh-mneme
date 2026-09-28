@@ -272,10 +272,16 @@ export const apply = (ctx, config) => {
     documentIndex.remove();
   }
 
-  // 写入准入实例：本批次只做计量（决策恒放行、写审计行），所以不需要新开关——它
-  // 不改变任何写入行为，也不新增拦截分支；既有的 llmAudit.enabled 关掉时它同样
-  // 不写（那个开关连审计行的启动期清理一起关掉）。第二阶段把拦截打开时才按仓库
-  // 惯例引入 opt-in 默认关的配置键，届时只改这一个实例的构造与 service 的调用点。
+  // 写入准入实例（#254）。两个开关 writeAdmission.enabled / .enforce 都默认关；
+  // 关时它的返回与只计量那一阶段逐字段一致，写入路径完全不碰。既有的
+  // llmAudit.enabled 关掉时它同样既不判也不写（那个开关连审计行的启动期清理一起
+  // 关掉，在无保留期的表里按写入频次增长是不能接受的）。
+  //
+  // sensitiveScan 是密钥 / PII 那一类判据的注入点。按 #254 验收第 4 条它是 #164 A2
+  // 的判据来源（A2 记在维护者排期里），所以本批不实现它，只把接口形状定在这里——
+  // 接上时只改这一行：
+  //   createWriteAdmission({ ..., sensitiveScan: createSensitiveScan({ config: cfg }) })
+  // 缺省 null 时第 1 级只跑空白 / 噪声两类判据，其余一切照旧。
   const writeAdmission = createWriteAdmission({ store, config: cfg, logger: ctx.logger });
   const service = createService({ store, mirror, config: cfg, logger: ctx.logger, documentIndex, writeAdmission });
 
