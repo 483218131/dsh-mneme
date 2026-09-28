@@ -1268,6 +1268,11 @@ export function createService({ store, mirror, config, onWrite, logger, document
       tags: memory.tags ?? [],
       importance: memory.importance ?? 3,
       source: memory.source ?? "manual",
+      // epistemic_status 必须显式透传：省略时 store 会回退到内容标记推断
+      // （中文正则），英文/无标记内容一律落 subjective——E2 四臂实验当场抓到
+      // （trustEpistemicWeighting 的重排对 saveWithDedupe 写入的记忆整体空转，
+      // R+ 臂与 A 臂注入序逐条相同）。undefined 保持推断行为，显式值优先。
+      epistemic_status: memory.epistemic_status,
       ...(memory.evidence !== undefined ? { evidence: memory.evidence } : {}),
       // v0.8.0 A1：scope 标注透传（store 端归一化，未标注落 NULL）。
       // v0.8.1 底座：来源（auto/explicit）与决策时间随行透传。
