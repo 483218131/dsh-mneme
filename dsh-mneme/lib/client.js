@@ -466,6 +466,13 @@ window.__ModuleLoader__.load({
         "memory.features.memoryQualityFilter.enabled.hint": "低价值记忆自动归档，注入按质量降权",
         "memory.features.llmAudit.enabled": "后台调用审计",
         "memory.features.llmAudit.enabled.hint": "记录巩固/总结的后台模型调用与 token 消耗",
+        // #254：写入准入两层。检测关时整条路径不碰；检测开、拦截关 = 仅告警 +
+        // 留审计；两个都开才真拦。文案要写清「只留审计」与「真拦下」的区别，
+        // 否则操作者会以为打开检测就已经在拦。
+        "memory.features.writeAdmission.enabled": "写入准入判定",
+        "memory.features.writeAdmission.enabled.hint": "写入前判空白/噪声，命中留审计（不拦）",
+        "memory.features.writeAdmission.enforce": "写入准入拦截",
+        "memory.features.writeAdmission.enforce.hint": "真拦下命中的写入；关闭时只留审计不拦",
         "memory.features.bm25SearchEnabled": "BM25 关键词检索",
         "memory.features.bm25SearchEnabled.hint": "传统关键词打分检索，与向量召回互补",
         "memory.features.conflictFreezeEnabled": "冲突冻结",
@@ -890,6 +897,12 @@ window.__ModuleLoader__.load({
         "memory.features.memoryQualityFilter.enabled.hint": "Archive low-value memories automatically; injection downranks by quality",
         "memory.features.llmAudit.enabled": "Background call audit",
         "memory.features.llmAudit.enabled.hint": "Log background model calls and token usage from consolidation / summaries",
+        // #254 — two layers: enabled runs the check (audit only), enforce actually
+        // blocks. The hints must keep that difference explicit.
+        "memory.features.writeAdmission.enabled": "Write admission checks",
+        "memory.features.writeAdmission.enabled.hint": "Flag blank / noise writes before storing, with an audit row (never blocks)",
+        "memory.features.writeAdmission.enforce": "Write admission enforcement",
+        "memory.features.writeAdmission.enforce.hint": "Actually reject flagged writes; off keeps the audit row only",
         "memory.features.bm25SearchEnabled": "BM25 keyword search",
         "memory.features.bm25SearchEnabled.hint": "Classic keyword scoring, complementary to vector recall",
         "memory.features.conflictFreezeEnabled": "Conflict freezing",
@@ -2072,7 +2085,7 @@ window.__ModuleLoader__.load({
     // test/inject-parent-gate.test.js 钉住。
     const FEATURE_CHILDREN = { autoInject: ["injectGuidanceEnabled", "continuityRescueEnabled"] };
     const FEATURE_GROUPS = [
-      { key: "group.core", items: ["autoInject", "autoSummarize", "hotMemoryEnabled", "memoryQualityFilter.enabled", "llmAudit.enabled"] },
+      { key: "group.core", items: ["autoInject", "autoSummarize", "hotMemoryEnabled", "memoryQualityFilter.enabled", "llmAudit.enabled", "writeAdmission.enabled", "writeAdmission.enforce"] },
       { key: "group.enhance", items: ["entityExtractionEnabled", "codingRetrospect", "rerankEnabled", "resilientModelDownload", "searchSemanticDedup", "bm25SearchEnabled", "heatEnabled", "documentMemoryEnabled"] },
       { key: "group.dream", items: ["autoDream", "sleepModeEnabled"] },
       // v0.8.0 A4（issue #17）：作用域隔离组——标注总开关 + 严格硬过滤。

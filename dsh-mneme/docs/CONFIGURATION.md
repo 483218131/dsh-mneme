@@ -35,6 +35,17 @@
 | `llmAudit.enabled` | `true` | 后台 LLM 调用全量落 `llm_audit_logs`（tokens / 时长 / 状态 / 触发源） | 覆盖 autoDream / autoSummarize / sleep / entityExtract 与写入准入测量点；关 = 一行不写 |
 | `llmAudit.retentionDays` | `90` | 审计表滚动清理保留天数（≤3650） | 启动时清理旧行 |
 
+## 写入准入（#254）
+
+写入前判定「这条该不该进库」，与 `memoryQualityFilter` 的分工是**时点**不是判据：那个是写入后打分归档（扣分可以错，只影响排序与归档），这个是写入前判定（硬拒不能错）。两个键都默认关，分层是为了把「先观察」和「开始拦」分成两次上线。
+
+| 键 | 默认 | 作用 | 开启后果 / 冲突 |
+|---|---|---|---|
+| `writeAdmission.enabled` | `false` | 跑第 1 级确定性判据：空白 / 纯噪声 + 密钥 / PII（判据来源是 #164 A2，经 `sensitiveScan` 注入） | 关 = 不判定、不拒绝，`evaluate` 返回与只计量阶段逐字段一致。命中 → 审计行带 `metadata.deny` |
+| `writeAdmission.enforce` | `false` | 命中时真的拒绝（`store.save` 之前返回） | 关 = 仅告警：判据照跑、审计照留、写入不拦（读审计时「`deny` 非空且 `decision=allow`」即这一档的指纹）。被拒写入不落库、不通知、不排嵌入，`memory_save` 返回 `action:"denied"` + `reason` |
+
+第 1 级的判据面刻意收窄：**去重键命中不进第 1 级**（归 write-update 放行——同步近重复门跑在异步矛盾检测之前会把本该被裁决的矛盾直接拒掉），G1/G2 阈值也只是计量。两个键都走 feature_flags 白名单（面板可启停）。
+
 ## 蒸馏（会话 → 记忆）
 
 | 键 | 默认 | 作用 | 开启后果 / 冲突 |

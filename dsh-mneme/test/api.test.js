@@ -667,8 +667,9 @@ test("GET /api/dsh-mneme/features returns empty overrides and effective config d
   // v0.8.5 新增 disableMemorySearch/disableMemoryArchive，
   // 本地嵌入池化新增 localEmbedPooling，issue #315 新增 summarizeReasoningEffort，
   // issue #239 第 4 项镜像到巩固新增 dreamPeakHours/dreamPeakMaxDeferMinutes，
-  // issue #292 新增 autoDreamFailureBackoff）
-  assert.equal(Object.keys(data.effective).length, 59 + 3 + 2 + 1 + 2 + 2 + 2 + 1 + 1 + 1 + 2 + 1);
+  // issue #292 新增 autoDreamFailureBackoff、
+  // issue #254 新增 writeAdmission.enabled/writeAdmission.enforce）
+  assert.equal(Object.keys(data.effective).length, 59 + 3 + 2 + 1 + 2 + 2 + 2 + 1 + 1 + 1 + 2 + 1 + 2);
   assert.equal(data.effective.dreamSkipInvalid, true);
   assert.equal(data.effective.allowCrossTypeMerge, false);
   assert.equal(data.effective.dreamMinIntervalMinutes, 0);
@@ -687,6 +688,9 @@ test("GET /api/dsh-mneme/features returns empty overrides and effective config d
   assert.equal(data.effective.reflectionFailureTracking, true);
   assert.equal(data.effective["memoryQualityFilter.enabled"], true);
   assert.equal(data.effective["llmAudit.enabled"], true);
+  // #254：写入准入两个键都默认关（默认路径零行为变化），面板可逐项启停。
+  assert.equal(data.effective["writeAdmission.enabled"], false);
+  assert.equal(data.effective["writeAdmission.enforce"], false);
   // 新增字符串 / URL / 枚举键
   assert.equal(data.effective.localEmbedModel, "Xenova/bge-small-zh-v1.5");
   assert.equal(data.effective.ollamaBaseUrl, "http://localhost:11434");
@@ -735,6 +739,12 @@ test("PUT /api/dsh-mneme/features round-trips nested, string, url and enum keys"
   const patch = {
     "memoryQualityFilter.enabled": false,
     "llmAudit.enabled": false,
+    // #254：新点号键必须同时进 settings 白名单**和** api.js 的 NESTED_FLAG_PATHS。
+    // 只加白名单时 configFlagValue("writeAdmission.enabled") 取的是 cfg 顶层的
+    // 同名字符串（不存在）→ effective 静默少键、PUT 存了也读不回来，且面板无感。
+    // 这里往返一次就是钉这件事的（计数锁只钉数量，钉不住值）。
+    "writeAdmission.enabled": true,
+    "writeAdmission.enforce": true,
     embedProvider: "local",
     ollamaBaseUrl: "http://127.0.0.1:11434",
     dreamProvider: "  siliconflow  ",
@@ -747,6 +757,8 @@ test("PUT /api/dsh-mneme/features round-trips nested, string, url and enum keys"
   assert.deepEqual(data.overrides, {
     "memoryQualityFilter.enabled": false,
     "llmAudit.enabled": false,
+    "writeAdmission.enabled": true,
+    "writeAdmission.enforce": true,
     embedProvider: "local",
     ollamaBaseUrl: "http://127.0.0.1:11434",
     dreamProvider: "siliconflow",
@@ -755,6 +767,8 @@ test("PUT /api/dsh-mneme/features round-trips nested, string, url and enum keys"
   // 嵌套键的覆盖值压过 bundle 配置的对象子字段
   assert.equal(data.effective["memoryQualityFilter.enabled"], false);
   assert.equal(data.effective["llmAudit.enabled"], false);
+  assert.equal(data.effective["writeAdmission.enabled"], true);
+  assert.equal(data.effective["writeAdmission.enforce"], true);
   assert.equal(data.effective.embedProvider, "local");
   assert.equal(data.effective.ollamaBaseUrl, "http://127.0.0.1:11434");
   assert.equal(data.effective.dreamProvider, "siliconflow");

@@ -149,11 +149,17 @@ export function createTools(ctx, service, config, embedder) {
           type: "object",
           additionalProperties: false,
           properties: {
-            action: { type: "string", required: true, enum: ["created", "merged"] },
-            id: { type: "string", required: true }
+            action: { type: "string", required: true, enum: ["created", "merged", "denied"] },
+            // denied 时压根没有行可指，所以 id 缺省而不是空串：空串会让「写成功但
+            // id 为空」与「根本没写」在读回执时长得一样，与 #254 验收第 2 条
+            // （被拒写入可解释、不静默丢弃）相悖。
+            id: { type: "string", description: "Row id; absent when action=denied." },
+            reason: { type: "string", description: "Rejection reason when action=denied: blank | noise | sensitive." }
           }
         },
-        render: (_args, value) => TEXT_OUTPUT(`memory ${value.action}: ${value.id}`)
+        render: (_args, value) => TEXT_OUTPUT(value.action === "denied"
+          ? `memory save rejected (${value.reason ?? "denied"}): nothing was written`
+          : `memory ${value.action}: ${value.id}`)
       },
       async execute(args, exec) {
         // scope 标注（v0.8.1 底座，issue #170）：默认由会话身份解析（载体自动
@@ -172,10 +178,10 @@ export function createTools(ctx, service, config, embedder) {
         const workspaceLabel = args.workspace_scope !== undefined
           ? { value: normalizeExplicitScope(args.workspace_scope), source: "explicit" }
           : autoStamping && scope ? { value: scope.workspace_scope, source: "auto" } : null;
-        const { action, memory } = service.saveWithDedupe({
-          // #254 写入准入（第一阶段只计量）的计数单位：会话键作为瞬时字段随写入
-          // 传递（与 _mergeInto / _overwrite 同款约定，不落库）。缺会话身份的宿主
-          // 返回 null = 这次写入不进预算。
+        const result = service.saveWithDedupe({
+          // #254 写入准入的计数单位：会话键作为瞬时字段随写入传递（与 _mergeInto /
+          // _overwrite 同款约定，不落库）。缺会话身份的宿主返回 null = 这次写入不进
+          // 预算；系统写入（dream / summarize / organize）从不带这个字段。
           _sessionKey: sessionKeyOf(exec),
           type: args.type,
           title: args.title,
@@ -188,7 +194,10 @@ export function createTools(ctx, service, config, embedder) {
           ...(args.sensitivity !== undefined ? { sensitivity: args.sensitivity } : {}),
           ...(args.occurred_at !== undefined ? { occurred_at: args.occurred_at } : {})
         });
-        return { action, id: memory.id };
+        // #254 第 1 级硬拒：工具层是模型唯一能看到这次失败的地方，必须显式回一句
+        // 可行动的拒绝理由。静默返回成功会让模型以为记住了，然后永远不再重写。
+        if (result.action === "denied") return { action: "denied", reason: result.reason };
+        return { action: result.action, id: result.memory.id };
       }
     }),
 

@@ -100,7 +100,12 @@ const FEATURE_FLAG_BOOLEANS = [
   // 子字段。kv 按点号键平铺存（"memoryQualityFilter.enabled": false），index.js
   // 合并时展开回嵌套对象，api.js 的 effective 从对象子字段取值。
   "memoryQualityFilter.enabled",
-  "llmAudit.enabled"
+  "llmAudit.enabled",
+  // Issue #254：写入准入（第 1 级确定性拒绝）。两个键分层——enabled 跑判据、
+  // enforce 真拦；都默认关。同上，点号键平铺存、合并时展开回
+  // writeAdmission 对象。
+  "writeAdmission.enabled",
+  "writeAdmission.enforce"
 ];
 // 整数开关的闭区间，与 config.js 里 z.natural().min().max() 对齐。
 const FEATURE_FLAG_INT_RANGES = {

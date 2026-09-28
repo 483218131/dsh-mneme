@@ -1250,9 +1250,12 @@ export function createService({ store, mirror, config, onWrite, logger, document
       scheduleEmbed(result);
       return { action: "merged", memory: result };
     }
-    // #254 写入准入（第一阶段只计量）：决策恒 allow、不拦写入，只把两个闸门的
-    // 测量点算出来。放在 store.save 之前——第二阶段要在这里拦下写入，接缝先摆好。
-    // 计量是旁路：任何一环失败只 warn，绝不反噬写入（与质量打分同款容错）。
+    // #254 写入准入：决策形状由 write-admission.js 一次定死（阶段一定死、之后只加
+    // 分支），这里只做两件事——先问决策，再在 enforce 命中时**在 store.save 之前**
+    // 返回。放在 store.save 之前是这条闸门的意义所在：写进去再删等于没拦，而且中间
+    // 那一瞬的注入/检索面已经暴露了。
+    // 计量是旁路，拒绝不是：evaluate 抛异常按「不判定」处理（宁可漏拦也不能让判据
+    // 故障把写入变成不可用），record 抛异常同样只 warn（审计失败不能反噬写入）。
     let admission = null;
     if (writeAdmission) {
       try {
@@ -1260,6 +1263,23 @@ export function createService({ store, mirror, config, onWrite, logger, document
       } catch (e) {
         try { logger?.warn?.(`[dsh-mneme] write admission evaluate failed: ${String(e)}`); } catch { /* 不反噬 */ }
       }
+    }
+    // 第 1 级硬拒（enforce 打开且判据命中）：这次写入不落库、不通知、不排嵌入、
+    // 不抽实体。审计行仍然要落——拒绝面是这条闸门唯一可解释性的来源（验收第 2 条
+    // 「被拒写入有审计与明确原因、可解释不静默丢弃」）。memoryId 传 null：这次写入
+    // 没有产生任何行，related_memory_ids 必须空着，挂一个不存在的 id 就是造虚账。
+    // reason 随返回值透出，工具层据此给模型一句可行动的拒绝理由。
+    if (admission?.decision === "deny") {
+      try {
+        writeAdmission.record({
+          sessionKey: memory._sessionKey,
+          verdict: admission,
+          memoryId: null
+        });
+      } catch (e) {
+        try { logger?.warn?.(`[dsh-mneme] write admission record failed: ${String(e)}`); } catch { /* 不反噬 */ }
+      }
+      return { action: "denied", reason: admission.deny?.reason ?? "denied", deny: admission.deny ?? null, memory: null };
     }
     const created = store.save({
       type: memory.type,
