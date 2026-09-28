@@ -38,6 +38,10 @@
 
 ## [Unreleased]
 
+## 🐛 修复
+
+- **saveWithDedupe 透传显式 epistemic_status（trustEpistemicWeighting 写入通路缺口）**：创建路径此前丢弃显式字段，store 回退内容标记推断（中文正则）——英文/无标记内容一律落 subjective，EPISTEMIC_WEIGHTS 对整池均匀 ×0.7，`trustEpistemicWeighting` 的重排对工具主路径写入的记忆**整体空转**（v0.4.5 起消费者在、写入通路断；patch 路径 store.update 本来就通）。E 系列四臂实验现场抓到（重排臂与对照臂注入序逐条相同）。修复后 undefined 保持推断行为（存量零变化），显式值优先（契约同 resolveEpistemicStatus）；回归测试锁「observation 加权前后分数不变——字段丢失则全体缩放当场红」。
+
 ## [0.8.8] - 2026-09-27
 
 ## 🆕 新增
@@ -189,6 +193,7 @@
 - **能力说明第 5 条写全 `memory_forget` 的副作用面，`memory_save` 尾句收短（#249 文案精确性）**：原文只写「`memory_forget` 只停注入」，比工具实况窄——它实际让条目从注入、检索结果与列表三处消失，写窄会让模型低估其影响面；改为与 `memory_archive`（从列表 / 检索 / 注入 / 巩固四处隐藏）同口径，回归测试锁完整短语在场。
 - **运行时完整性判据从未生效：状态词对不上，而且结论根本没读（issue #268）**：`verifyPayload` 只认 `integrity.status === "sha512-matched"`，而下载通道在 `mneme-runtime.json` 里记的是 `{status: "verified", checked, detail}`（`src/runtime/download.js`，自 #133 起）——这份结论一喂进来就恒判 `ok:false`，接线即系统性判失败；更根本的是两个生产调用方（`memory_runtime` 的 verify 分支、`scripts/mneme-runtime.mjs` 的 `runVerify`）都只传 `cacheDir`，**这一层在生产路径上从未运行过**：清单里明写的 mismatch 也被静默放过（红测试证实）。附带第二处形状违约：`loader.js` 把清单里的**对象**直接填进 `describeLocalRuntime` 里声明为 `string|null` 的 `integrity` 字段，经免鉴权的 `/api/dsh-mneme/semantic` 外发，CLI `status` 还会把它打印成 `[object Object]`。修法收成一处：新增 `layout.js` 的 `recordedIntegrity()` 归一清单字段的两种形态（对象 / 缺失），判据与投影都只调它——`verifyPayload` 在调用方未显式传结论时读 `describePayload` 已解析的清单，判据同时认 `verified` 与 `sha512-matched`，并把显式 `unverified` 与「没传」同判（原先一个 `ok:true`、一个 `ok:false`）；不一致的结论（含清单里记下的 mismatch）照样判失败。
 
+
 - **睡眠冲突/模式阶段的输出预算可配（issue #257）**：`src/dream/sleep.js` 冲突消解与模式发现两处 `maxTokens: 2048` 硬编码提为 `sleepMaxTokens`（默认 8192，schema + 整数白名单成对落位，面板可调）。实测依据（报告者 llama.cpp 环境）：默认档 24 对裁决需 2097 token，恰好压在 2048 边界（53 次运行 48 败 5 胜的「间歇性失败」指纹）；`sleepActionSet: full` 六分支实测需 6967（3.4 倍越界）——该档位自 #126 引入起从未跑通过。流式计费按实际用量，调大不增加成本。
 
 - **审计记账改读 `chunk.usage`，token 不再恒为 0（issue #242）**：dsh-llm 的 StreamChunk 契约把用量嵌在 `{type:"usage", usage:TokenUsage}`（TokenUsage = inputTokens / outputTokens / …），chunk 顶层没有 token 字段——dream / summarize 的审计读取把整个 chunk 当用量对象，input/output 恒为 undefined，审计行落 0（实测 7 天 49 次 success 调用 token 全 0，面板「LLM 消耗」长期显示 0）。改读 `chunk.usage ?? chunk`，`?? chunk` 兜底兼容用量平铺在顶层的替身（嵌套 + 平铺双形状回归测试）。
@@ -199,6 +204,8 @@
 - **依赖告警清零（GitHub code-scanning 四条 open）**：`@huggingface/transformers` 4.2.0 → **4.3.0**（其 sharp 依赖声明升至 `^0.35.4`，消掉 sharp 的两条 high——path 处理与 DoS），`package.json` overrides 的 `adm-zip` 0.6.0 → **0.6.1**（消掉 adm-zip 的 high + medium 各一条；两者均处 devDependency 链——本地嵌入运行时构建面，npm 用户装不到）。连带项：runtime-manifest 闭包在 sharp 0.35 下新走到无 `os` 约束的 `@img/sharp-wasm32` 及 freebsd/webcontainers 两个 WASM 回退包（Node 构建从不 import），按 onnxruntime-web 先例加入 `scripts/build-runtime-manifest.mjs` 的 EXCLUDED 并重生成清单；`test/runtime-manifest.test.js` 的 payloadId 断言由硬编码版本号改为取生成器输出本身（锁格式不锁版本，升级不再碎）。`npm audit`（含 dev 与 --omit=dev 双口径）0 vulnerabilities；全量测试 1243/1242 pass/0 fail/1 skip。
 
 - **全工具矩阵的「DTO 键集 ⊆ output schema」系统性断言（issue #195）**：#184（memory_get 内联 schema 漏声明 v0.8.1 的 scope 来源三键 → 任何被标注过的行都过不了 in-process 校验）此前只有单点回归护住 `memory_get` 一个工具，换一个工具、换一个键，同类事故可以原样重演。新增 `test/tools-dto-schema-matrix.test.js`，四层断言各管一段：① 9 个工具每个可安全触达分支的**真实 execute 返回值**过生产同款校验器 `validateJsonSchemaValue`（不写手抄期望值）；② DTO 唯一产地 `toApiList` 在全形态（极简 / 敏感度 / 事件时间 / 单维与全量 scope 标注）下的输出 ⊆ `MEMORY_ITEM_SCHEMA`，并**反向**要求声明里的每个键都被至少一种形态真实产出（死声明会在下次增键时暴露）；③ 全部工具 schema 的结构不变量（闭合、required ⊆ properties、每项带 type——否则前两层会因校验器形同虚设而静默失效）；④ 负例锁：注入未声明键**必须**报错。护栏自证：两次变异测试（删共享 schema 一个键 / 给 memory_get 塞手抄小副本）分别让 2 条与 3 条断言转红。`memory_runtime` 的 provision（联网下载）与 verify 命中载荷（真实加载模型）不在单测内驱动，由 ③ 兜底声明合规。
+
+- **supersede 旧值回归集（anti-update 探针，E6/#280 链）**：`scripts/benchmark-recall.js` 的 TEST_CASES 支持可选 `forbidden` 字段——forbidden id 出现在 top-K 即记 `forbiddenHit`，legacy/fused 与三融合配方全配置判定，CLI 报告加 LEAK 标记；seed 复刻 applySupersede 的落库状态（loser `archived=1` + 正文 superseded-by 注记，无专属取代列）。新增 `test/recall-anti-update.test.js` 6 例，把三件事钉成回归锁：四路默认检索对归档行是**排除**不是降权（谁把排除改成降权立刻红）、取代是归档不是删除（行还在、未遗忘、注记在）、`includeArchived` 显式口子仍在（排除发生在检索层而非行消失）。依据 StatemenBench anti-update probes。测试 1198 → **1204**。
 
 ## 🏗️ 工程
 

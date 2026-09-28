@@ -52,6 +52,11 @@ const SEED = [
 // Standard query set: each case is a query plus the ids that MUST appear in
 // the top-K for the case to count as a hit. Covers the three recall paths —
 // multi-term lexical (BM25's home turf), identifier lookup, and semantic.
+// Optional per case: `forbidden` — ids that must NOT appear in the top-K.
+// Anti-update probes (E6, #280 链；StatemenBench anti-update probes)：锁的
+// 回归类是「supersede 后旧值复现」——被取代旧条靠 archived=1 从四路检索里
+// **排除**（不是降权）。未来谁把任一默认检索路径改成 archived 宽容的降权、
+// 或把归档行重新放回候选池，forbiddenHit 就会 >0，这里先红。
 export const TEST_CASES = [
   { query: "rust 异步", expected: ["mem_async_pattern", "mem_rust_switch"], note: "scattered terms — BM25 territory" },
   { query: "ZFS-4421 checksum", expected: ["mem_zfs_bug"], note: "identifier + keyword" },
@@ -67,7 +72,12 @@ export const TEST_CASES = [
   // leading token with a cross-topic memory that must rank below it) and an
   // exact-token case that leans on the BM25 path.
   { query: "zfs 磁盘 替换", expected: ["mem_zfs_bug"], note: "shared-token distractor" },
-  { query: "tokio spawn channel", expected: ["mem_async_pattern"], note: "exact async tokens" }
+  { query: "tokio spawn channel", expected: ["mem_async_pattern"], note: "exact async tokens" },
+  // Anti-update probes（配 seedService 里的 supersede pair）：第二条 query 的
+  // 措辞只与被取代的旧值（Go 选型）重叠——归档旧条若经任一默认路径复现，
+  // forbiddenHit > 0；同时新值必须照常命中（取代后话题有活答案）。
+  { query: "编译模块 语言 选型", expected: ["mem_rust_switch"], forbidden: ["mem_rust_switch_old"], note: "anti-update: winner must answer the topic" },
+  { query: "Go 部署 简单", expected: ["mem_rust_switch"], forbidden: ["mem_rust_switch_old"], note: "stale-value bait: wording matches only the superseded value" }
 ];
 
 export function seedService(overrides = {}) {
@@ -95,6 +105,15 @@ export function seedService(overrides = {}) {
     const row = store.save({ id: m.id, type: m.type, title: m.title, content: m.content, tags: m.tags, importance: m.importance, source: "seed" });
     store.setEmbedding(row.id, hashVec(`${m.title} ${m.content}`));
   }
+  // Supersede pair（anti-update 探针的种子）：复刻 dream/decisions.js
+  // applySupersede 留下的确切落库状态——没有独立的取代列，取代关系完全由
+  // loser 的 archived=1 + 正文 (superseded by: …) 注记表达。winner 就是
+  // 上面的 mem_rust_switch 种子行，让「编译语言」话题始终有活答案，
+  // 归档的 Go 旧决策必须保持不可见。
+  const loserContent = "项目编译模块使用 Go 语言，选型理由是部署简单\n\n(superseded by: 语言迁移决策)";
+  const loser = store.save({ id: "mem_rust_switch_old", type: "decision", title: "编译模块语言（旧）", content: loserContent, importance: 4, tags: ["rust"], source: "seed" });
+  store.setEmbedding(loser.id, hashVec(`编译模块语言（旧） ${loserContent}`));
+  store.setArchived(loser.id, true);
   return service;
 }
 
@@ -109,18 +128,31 @@ export async function runBenchmark({ topK = 5, mode = "auto" } = {}) {
     const rows = [];
     let hits = 0;
     let mrrSum = 0;
+    let leaks = 0;
     for (const tc of TEST_CASES) {
       const results = await service.searchMemories(tc.query, { mode, topK, useRerank: false });
       const ids = results.map((r) => r.id);
       const metrics = service.computeRetrievalMetrics(ids, tc.expected);
       if (metrics.recall === 1) hits++;
       mrrSum += metrics.mrr;
-      rows.push({ query: tc.query, note: tc.note, expected: tc.expected, got: ids, ...metrics });
+      // forbidden 命中数：anti-update 探针的判定（见 TEST_CASES 头注释）。
+      const forbiddenHit = (tc.forbidden ?? []).filter((id) => ids.includes(id)).length;
+      if (forbiddenHit > 0) leaks++;
+      rows.push({
+        query: tc.query,
+        note: tc.note,
+        expected: tc.expected,
+        ...(tc.forbidden ? { forbidden: tc.forbidden } : {}),
+        forbiddenHit,
+        got: ids,
+        ...metrics
+      });
     }
     runs.push({
       config: cfg.name,
       recallAtK: +(hits / TEST_CASES.length).toFixed(3),
       avgMrr: +(mrrSum / TEST_CASES.length).toFixed(3),
+      forbiddenHits: leaks,
       rows
     });
   }
@@ -141,18 +173,30 @@ export async function runFusionBenchmark({ topK = 5, mode = "auto" } = {}) {
     const rows = [];
     let hits = 0;
     let mrrSum = 0;
+    let leaks = 0;
     for (const tc of TEST_CASES) {
       const results = await service.searchMemories(tc.query, { mode, topK, useRerank: false });
       const ids = results.map((r) => r.id);
       const metrics = service.computeRetrievalMetrics(ids, tc.expected);
       if (metrics.recall === 1) hits++;
       mrrSum += metrics.mrr;
-      rows.push({ query: tc.query, note: tc.note, expected: tc.expected, got: ids, ...metrics });
+      const forbiddenHit = (tc.forbidden ?? []).filter((id) => ids.includes(id)).length;
+      if (forbiddenHit > 0) leaks++;
+      rows.push({
+        query: tc.query,
+        note: tc.note,
+        expected: tc.expected,
+        ...(tc.forbidden ? { forbidden: tc.forbidden } : {}),
+        forbiddenHit,
+        got: ids,
+        ...metrics
+      });
     }
     runs.push({
       config: recipe,
       recallAtK: +(hits / TEST_CASES.length).toFixed(3),
       avgMrr: +(mrrSum / TEST_CASES.length).toFixed(3),
+      forbiddenHits: leaks,
       rows
     });
   }
@@ -164,10 +208,13 @@ function printFusionReport(report) {
     console.log(`\n=== ${run.config} (topK=${report.topK}, mode=${report.mode}) ===`);
     for (const r of run.rows) {
       const ok = r.recall === 1 ? "PASS" : "MISS";
-      console.log(`  [${ok}] "${r.query}" (${r.note}) recall=${r.recall} mrr=${r.mrr}`);
+      const leak = r.forbiddenHit > 0 ? " LEAK" : "";
+      console.log(`  [${ok}${leak}] "${r.query}" (${r.note}) recall=${r.recall} mrr=${r.mrr}`);
       if (r.recall < 1) console.log(`         expected ⊇ ${r.expected.join(", ")}  got: ${r.got.join(", ") || "—"}`);
+      if (r.forbiddenHit > 0) console.log(`         forbidden hit ×${r.forbiddenHit}: ${r.got.filter((id) => r.forbidden.includes(id)).join(", ")}`);
     }
-    console.log(`  → Recall@${report.topK}: ${(run.recallAtK * 100).toFixed(1)}%   avg MRR: ${run.avgMrr}`);
+    console.log(`  → Recall@${report.topK}: ${(run.recallAtK * 100).toFixed(1)}%   avg MRR: ${run.avgMrr}` +
+      (run.forbiddenHits > 0 ? `   forbiddenHits: ${run.forbiddenHits}` : ""));
   }
   const summary = report.runs.map((r) => `${r.config}=${(r.recallAtK * 100).toFixed(1)}%`).join("  ");
   console.log(`\n融合配方 A/B (Recall@${report.topK}, ${report.mode}): ${summary}`);
@@ -178,10 +225,13 @@ function printReport(report) {
     console.log(`\n=== ${run.config} (topK=${report.topK}, mode=${report.mode}) ===`);
     for (const r of run.rows) {
       const ok = r.recall === 1 ? "PASS" : "MISS";
-      console.log(`  [${ok}] "${r.query}" (${r.note}) recall=${r.recall} mrr=${r.mrr}`);
+      const leak = r.forbiddenHit > 0 ? " LEAK" : "";
+      console.log(`  [${ok}${leak}] "${r.query}" (${r.note}) recall=${r.recall} mrr=${r.mrr}`);
       if (r.recall < 1) console.log(`         expected ⊇ ${r.expected.join(", ")}  got: ${r.got.join(", ") || "—"}`);
+      if (r.forbiddenHit > 0) console.log(`         forbidden hit ×${r.forbiddenHit}: ${r.got.filter((id) => r.forbidden.includes(id)).join(", ")}`);
     }
-    console.log(`  → Recall@${report.topK}: ${(run.recallAtK * 100).toFixed(1)}%   avg MRR: ${run.avgMrr}`);
+    console.log(`  → Recall@${report.topK}: ${(run.recallAtK * 100).toFixed(1)}%   avg MRR: ${run.avgMrr}` +
+      (run.forbiddenHits > 0 ? `   forbiddenHits: ${run.forbiddenHits}` : ""));
   }
   const [legacy, fused] = report.runs;
   const lift = ((fused.recallAtK - legacy.recallAtK) * 100).toFixed(1);
