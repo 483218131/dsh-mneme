@@ -1,10 +1,12 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { createScopeResolver, normalizeExplicitScope } from "./scope.js";
+import { createScopeResolver, normalizeExplicitScope, sessionKeyOf } from "./scope.js";
 import { describeLocalRuntime, resolveRuntimeEntry } from "./runtime/loader.js";
 import { defaultRuntimeDir } from "./runtime/layout.js";
 import { hostModulesDir, loadRuntimeManifest, provisionRuntime } from "./runtime/provision.js";
 import { matchesPlatform } from "./runtime/closure.js";
 import { verifyPayload } from "./runtime/verify.js";
+import { TOOL_GUIDE, CONTINUITY_TOOL_RULE } from "./guide.js";
+import { injectChildEnabled } from "./config.js";
 
 const TEXT_OUTPUT = (text) => [{ type: "text", text }];
 // Per-registry tool-name registry: guards against duplicate registration on
@@ -35,6 +37,8 @@ const MEMORY_ITEM_SCHEMA = {
     scope_decided_at: { type: "string" },
     sensitivity: { type: "string" },
     occurred_at: { type: "string" },
+    // #230：document 指针行的文件定位——「全文按需读」的入口；普通行缺省。
+    doc_path: { type: "string" },
     created_at: { type: "string", required: true },
     updated_at: { type: "string", required: true }
   }
@@ -81,6 +85,21 @@ export function createTools(ctx, service, config, embedder) {
   // flag 关闭时恒返回 null——写入不标注，检索不加权，行为与 A1 前完全一致。
   // logger 透传：registry 反查失败时 warnOnce 才有出口（否则静默降级无观测）。
   const resolveSessionScope = createScopeResolver({ ctx, config, logger: ctx.logger });
+  // #249 能力说明（injectGuidanceEnabled）：开启时给「何时用」最有歧义的两个
+  // 工具补一句判断指引。工具描述常驻、不进每轮上下文，这个位子零注入成本；
+  // 关闭时描述逐字节不变，也不动其他工具的文案。
+  // 它是注入父开关的子项（#249 第二批）：`autoInject` 关掉时这里同样不生效——
+  // 工具描述是这个子项唯一住在注入器之外的落点，不在闸门内就漏了。
+  // #249 N3 降级路径（continuityRescueEnabled）：宿主若不提供可挂钩的压缩前时机，
+  // 双落点里的注入那一半就没有触发者，这时把规则交给 agent 自判（见 CONTINUITY_TOOL_RULE）。
+  // 与能力说明各自独立：任一开关关闭时描述逐字节不变。
+  // 本批不做宿主能力探测（没有可靠的探测口），所以子开关打开时这条规则常驻，与自动双落点并存。
+  const withToolGuide = (name, description) => {
+    let text = description;
+    if (injectChildEnabled(config, "injectGuidanceEnabled") && TOOL_GUIDE[name]) text += TOOL_GUIDE[name];
+    if (injectChildEnabled(config, "continuityRescueEnabled") && CONTINUITY_TOOL_RULE[name]) text += CONTINUITY_TOOL_RULE[name];
+    return text;
+  };
 
   // 复核项 4（issue #170）：strictScope 下他 scope（explicit）的行对工具侧按
   // 「不存在」处理——update/delete 与 memory_get 同款无存在性泄漏。strictScope
@@ -104,11 +123,16 @@ export function createTools(ctx, service, config, embedder) {
   const tools = [
     defineTool({
       name: "memory_save",
-      description:
+      description: withToolGuide(
+        "memory_save",
         "Persist one memory entry for future sessions (user preferences, project state, decisions). " +
-        "Call this when the user states a durable preference, a project decision is made, or a lesson is learned. " +
-        "Merges into an existing entry of the same type when the title matches.",
+          "Call this when the user states a durable preference, a project decision is made, or a lesson is learned. " +
+          "Merges into an existing entry of the same type when the title matches."
+      ),
       parameters: {
+        // document 不在此列（#230）：document 行只能经 memory_register_document
+        // 铸造（注册校验 + doc_path + evidence），防止 memory_save 造出无指针
+        // 无回链的伪行。
         type: { type: "string", required: true, enum: ["preference", "project", "decision", "history", "rejected_solution", "pitfall", "constraint"], description: "preference=user profile; project=project knowledge/state; decision=key decision; history=conversation summary; rejected_solution=rejected/abandoned implementation approach; pitfall=debugging lesson (symptom+root cause+fix); constraint=engineering constraint" },
         title: { type: "string", required: true, description: "Short unique title" },
         content: { type: "string", required: true, description: "Memory body" },
@@ -149,6 +173,10 @@ export function createTools(ctx, service, config, embedder) {
           ? { value: normalizeExplicitScope(args.workspace_scope), source: "explicit" }
           : autoStamping && scope ? { value: scope.workspace_scope, source: "auto" } : null;
         const { action, memory } = service.saveWithDedupe({
+          // #254 写入准入（第一阶段只计量）的计数单位：会话键作为瞬时字段随写入
+          // 传递（与 _mergeInto / _overwrite 同款约定，不落库）。缺会话身份的宿主
+          // 返回 null = 这次写入不进预算。
+          _sessionKey: sessionKeyOf(exec),
           type: args.type,
           title: args.title,
           content: args.content,
@@ -166,7 +194,10 @@ export function createTools(ctx, service, config, embedder) {
 
     defineTool({
       name: "memory_search",
-      description: "Search the cross-session memory store. Use when you need past context: how a problem was solved, user preferences, project decisions. Substring-matches title/content/tags, and augments results with semantic (vector) recall + optional rerank when an embeddings provider is configured. Returns matching entries with source and timestamps.",
+      description: withToolGuide(
+        "memory_search",
+        "Search the cross-session memory store for past context (solved problems, user preferences, project decisions). IMPORTANT: relevant cross-session memories are already injected into your context every turn — only call this when the injected memory block does NOT contain what you need, or you need to look something specific up. Substring-matches title/content/tags, and augments results with semantic (vector) recall + optional rerank when an embeddings provider is configured. Returns matching entries with source and timestamps."
+      ),
       // A2 检索接线：occurred 时间窗 + 会话 scope 加成（见 execute）。
       parameters: {
         query: { type: "string", required: true, description: "Search text; substring match over title/content/tags" },
@@ -224,7 +255,7 @@ export function createTools(ctx, service, config, embedder) {
       name: "memory_list",
       description: "List memory entries by type, high-importance first, then newest, paginated. Set include_archived=true to also list archived (hidden) entries so they can be located and restored.",
       parameters: {
-        type: { type: "string", enum: ["preference", "project", "decision", "history", "rejected_solution", "pitfall", "constraint"], description: "Filter by type; omit for all" },
+        type: { type: "string", enum: ["preference", "project", "decision", "history", "rejected_solution", "pitfall", "constraint", "document"], description: "Filter by type; omit for all. 'document' (#230) = agent-registered document pointer rows" },
         limit: { type: "integer", description: "Page size (default 50)" },
         offset: { type: "integer", description: "Page offset (default 0)" },
         include_archived: { type: "boolean", description: "Include archived (hidden) entries so they can be found and restored (default false)" },
@@ -287,7 +318,9 @@ export function createTools(ctx, service, config, embedder) {
         },
         render: (_args, value) => {
           const m = value.memory;
-          return TEXT_OUTPUT(`${m.title}\nID: ${m.id} | type: ${m.type} | importance: ${m.importance}${MEMORY_PROVENANCE(m)}\n\n${m.content}`);
+          // #230：document 指针行把文件路径亮在首行——「全文按需读」从这里拿路径。
+          const doc = m.doc_path ? ` | doc: ${m.doc_path}` : "";
+          return TEXT_OUTPUT(`${m.title}\nID: ${m.id} | type: ${m.type} | importance: ${m.importance}${doc}${MEMORY_PROVENANCE(m)}\n\n${m.content}`);
         }
       },
       async execute(args) {
@@ -311,6 +344,8 @@ export function createTools(ctx, service, config, embedder) {
         id: { type: "string", required: true, description: "Memory id" },
         title: { type: "string" },
         content: { type: "string" },
+        // document 不在此列（#230）：type 不许改入 document——既有 document 行
+        // 的摘要修复（只改 content/title）不受影响。
         type: { type: "string", enum: ["preference", "project", "decision", "history", "rejected_solution", "pitfall", "constraint"] },
         tags: { type: "array", items: { type: "string" } },
         importance: { type: "integer", description: "1-5" },
@@ -415,7 +450,8 @@ export function createTools(ctx, service, config, embedder) {
       description:
         "Archive a memory (hide it from active lists, search, injection and dream consolidation) or restore it. " +
         "Archived entries stay in storage and are recoverable: pass archived=false to restore, and use memory_list with " +
-        "include_archived=true to find archived entries.",
+        "include_archived=true to find archived entries. " +
+        "Only archive when the user asks, or an entry is clearly stale/no longer relevant — do not archive proactively mid-session to tidy up.",
       parameters: {
         id: { type: "string", required: true, description: "Memory id" },
         archived: { type: "boolean", description: "Archive (true, default) or restore (false) the entry" }
@@ -443,6 +479,112 @@ export function createTools(ctx, service, config, embedder) {
         }
         const memory = service.setArchived(args.id, args.archived ?? true);
         return { memory: { id: memory.id, archived: memory.archived } };
+      }
+    }),
+
+    // #230（#164 设计稿评审线）：document 型记忆注册——agent 产长文档的指针
+    // 行铸造口。写入权分离：全文归 agent（管线对文件零读零写零改），库里只
+    // 存摘要 + doc_path + evidence 三样；C2 比对去重、supersede 记账在
+    // service.registerDocument（src/document.js）内完成。判断指引：调研报告/
+    // 设计稿/长整理产物「存外档」用本工具；原子事实（偏好/决策/教训）仍走
+    // memory_save；tag 与章节名建议用英文（跨语言稳定键），摘要正文可多语言。
+    defineTool({
+      name: "memory_register_document",
+      description:
+        "Register an agent-authored document (research report, design doc, long digest) into memory as a pointer row. " +
+        "Write-ownership split: the full text stays agent-owned on disk — the pipeline never reads or rewrites it; the DB " +
+        "stores only the summary + doc_path + evidence. Validates the file exists (absolute path, non-empty regular file), " +
+        "intersects evidence with real memory ids (all-fabricated evidence is rejected; unknown ids are dropped and the row " +
+        "is tagged evidence_degraded), and dedupes: re-registering the same path or title supersedes the old row (the old " +
+        "file is never touched; content_history stays traceable), while a merely near-duplicate summary of a different " +
+        "document row is rejected — update that row instead. On success the absorbed atomic evidence rows leave the active " +
+        "face in the same transaction (recoverable, nothing deleted); constraint/preference rows and other " +
+        "document/summary rows are never auto-archived, and keep_evidence_active: true opts out. Ids this same document " +
+        "absorbed on an earlier version still count as its evidence, so re-registering a new version is not read as " +
+        "fabricated evidence. Use for 'where is the conclusion doc for this project?' " +
+        "lookups; atomic facts still go to memory_save.",
+      parameters: {
+        path: { type: "string", required: true, description: "Absolute path of the document file (~ is expanded); must already exist as a non-empty regular file. The full text stays agent-owned — this pipeline never touches it." },
+        title: { type: "string", required: true, description: "Short unique title (English recommended: it is the cross-language stable dedupe/supersede key)" },
+        summary: { type: "string", required: true, description: "One-paragraph summary stored in the DB and used for injection (any language)" },
+        tags: { type: "array", items: { type: "string" }, description: "Optional tags (English recommended)" },
+        importance: { type: "integer", description: "1-5 (default 3); the summary row injects at the next-priority tier within documentInjectBudget when importance >= threshold" },
+        evidence: { type: "array", items: { type: "string" }, description: "Memory ids this document is grounded in (atomic facts, not other pointer rows); each is verified against the store — fabricated evidence is rejected, unknown/archived ids are dropped and the row is tagged evidence_degraded, except ids this same document absorbed on an earlier version, which stay its evidence. On success the absorbed atomic rows leave the active face unless keep_evidence_active is true." },
+        keep_evidence_active: { type: "boolean", description: "Opt out of archiving the evidence rows absorbed by this document. Default false: after a successful registration the absorbed atomic rows leave the active face (recoverable, nothing deleted; constraint/preference rows and other document/summary rows are never auto-archived)." },
+        source: { type: "string", description: "Optional provenance" },
+        sensitivity: { type: "string", description: "Optional sensitivity label (free-form, e.g. personal). Part of the supersede matching key — same path/title with a different sensitivity stays a separate document." },
+        agent_scope: { type: "string", description: "Optional explicit agent-scope declaration (issue #170): 'global' or '*' makes this document visible to every agent; any other value narrows it to that label. Overrides the automatic carrier label for this write; honored even when automatic scope labeling is disabled." },
+        workspace_scope: { type: "string", description: "Optional explicit workspace-scope declaration (issue #170): 'global' or '*' makes this document visible in every workspace; any other value narrows it to that label. Overrides the automatic carrier label for this write; honored even when automatic scope labeling is disabled." }
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            action: { type: "string", required: true, enum: ["created", "superseded"] },
+            id: { type: "string", required: true },
+            superseded_id: { type: "string" },
+            evidence_kept: { type: "integer", required: true },
+            evidence_dropped: { type: "integer", required: true },
+            evidence_archived: { type: "integer", required: true },
+            degraded: { type: "boolean", required: true }
+          }
+        },
+        render: (_args, value) => {
+          const sup = value.superseded_id ? ` (supersedes ${value.superseded_id})` : "";
+          const ev = ` | evidence: ${value.evidence_kept} kept, ${value.evidence_dropped} dropped, ${value.evidence_archived} archived${value.degraded ? " [degraded]" : ""}`;
+          return TEXT_OUTPUT(`document ${value.action}: ${value.id}${sup}${ev}`);
+        }
+      },
+      async execute(args, exec) {
+        // scope 标注与 memory_save 同款（#170）：默认会话身份自动标注，显式
+        // 参数逐维覆盖。校验/去重/supersede 全在 service.registerDocument。
+        const scope = resolveSessionScope(exec);
+        const autoStamping = config?.scopeEnabled === true;
+        const agentLabel = args.agent_scope !== undefined
+          ? { value: normalizeExplicitScope(args.agent_scope), source: "explicit" }
+          : autoStamping && scope ? { value: scope.agent_scope, source: "auto" } : null;
+        const workspaceLabel = args.workspace_scope !== undefined
+          ? { value: normalizeExplicitScope(args.workspace_scope), source: "explicit" }
+          : autoStamping && scope ? { value: scope.workspace_scope, source: "auto" } : null;
+        // strictScope（#170 复核项 4 同款无存在性泄漏）：他 scope 的 evidence id
+        // 按「不存在」处理——注册器用全局 getById 求交，看不见的行在这里先标出，
+        // 与 unknown/archived 同落 dropped，不进持久化 evidence（不得为跨 scope
+        // id 建立引用）。
+        const hiddenEvidence = [];
+        if (config?.strictScope === true && scope && Array.isArray(args.evidence)) {
+          for (const raw of args.evidence) {
+            const id = String(raw ?? "").trim();
+            if (!id) continue;
+            const row = service.getById(id);
+            if (row && !service.isVisibleInScope(row, scope)) hiddenEvidence.push(id);
+          }
+        }
+        const result = await service.registerDocument({
+          path: args.path,
+          title: args.title,
+          summary: args.summary,
+          tags: args.tags ?? [],
+          ...(args.importance !== undefined ? { importance: args.importance } : {}),
+          evidence: args.evidence ?? [],
+          source: args.source ?? "tool",
+          ...(args.sensitivity !== undefined ? { sensitivity: args.sensitivity } : {}),
+          ...(agentLabel ? { agent_scope: agentLabel.value, agent_scope_source: agentLabel.source } : {}),
+          ...(workspaceLabel ? { workspace_scope: workspaceLabel.value, workspace_scope_source: workspaceLabel.source } : {})
+        }, {
+          hiddenEvidenceIds: hiddenEvidence,
+          // 默认开着归档（#275 拍板 5）；agent 显式要保留活跃面时走 keep_evidence_active。
+          archiveEvidence: args.keep_evidence_active !== true
+        });
+        return {
+          action: result.action,
+          id: result.memory.id,
+          ...(result.superseded ? { superseded_id: result.superseded.id } : {}),
+          evidence_kept: result.evidence_kept,
+          evidence_dropped: result.evidence_dropped,
+          evidence_archived: result.evidence_archived,
+          degraded: result.degraded
+        };
       }
     }),
 
@@ -561,8 +703,20 @@ export function createTools(ctx, service, config, embedder) {
     })
   ];
 
+  // Tool-exposure gate (v0.8.5): 跨会话记忆已自动注入，memory_search /
+  // memory_archive 在慢/轻量模型上是多余往返，面板开关可直接隐藏工具——
+  // 模型看不到就不会调，比在描述里劝它少调用更可靠。注意：live patch reload
+  // 下已注册的工具不会被宿主反注册，排除只对全新会话生效。
+  const hiddenTools = new Set();
+  if (config?.disableMemorySearch === true) hiddenTools.add("memory_search");
+  if (config?.disableMemoryArchive === true) hiddenTools.add("memory_archive");
+
   for (const tool of tools) {
-          if (registeredTools.has(tool.name)) {
+    if (hiddenTools.has(tool.name)) {
+      ctx.logger?.info?.(`[dsh-mneme] tool "${tool.name}" hidden by config (disableMemorySearch/disableMemoryArchive)`);
+      continue;
+    }
+    if (registeredTools.has(tool.name)) {
         ctx.logger?.warn?.(`[dsh-mneme] tool "${tool.name}" already registered, skipping duplicate`);
         continue;
       }

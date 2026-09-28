@@ -77,6 +77,40 @@ export const Config = z.object({
   // maxInjectedItems 上限——只做**单向收缩**，绝不越过用户配置的上限；判据只看
   // 查询本身，不做额外检索（先探针检索等于白付一次 fuseRecall）。
   injectUncertaintyAdaptive: z.boolean().default(false),
+  // #249（第一批；第二批归位为注入子开关）：能力说明——「怎么用记忆」的判断
+  // 指引。落两个零注入成本的位：①`memory_search` / `memory_save` 的工具描述补
+  // 一句判断指引（工具描述是常驻文本，不进每轮上下文）；②一段 order 150 的
+  // 系统提示段（一次性、同会话内不随轮次变化，因此不作废前缀缓存），只讲总则
+  // （优先序、何时查、何时写、何时 no-op）。默认开＝基础档：#249 §10 的判据是
+  // 「只修正既有位、不引入新注入时机／新表面／额外 LLM 调用」的子项随父开关
+  // 生效——「agent 不知道何时该查、何时该写」是已实测的缺口，把它默认关着是反的。
+  // 父开关 `autoInject` 关闭时它不生效（闸门见 injectChildEnabled）；用户显式写进
+  // feature_flags 的值永远优先于这里的默认值。
+  injectGuidanceEnabled: z.boolean().default(true),
+  // #249 N3（压缩边缘双落点）：上下文即将大幅精简前抢救「正在做什么」。默认关。
+  // 触发靠宿主自己的压缩事件（`compaction/start|summary|end`，都在事件白名单里），
+  // 不自定一套阈值参数——「压缩边缘」由宿主定义，我们再校准一份只会与之漂移。
+  // 为什么是「新时机 + 新表面」因而默认关：它往对话里**追加消息**（新的注入表面，
+  // 参照实现里最容易累积成一堆历史的那类），并多写一张提案表。按 §10 判据，引入
+  // 新时机/新表面/新成本的子项独立成键、默认关；只修正既有块的（基础内容分池、
+  // 库可见性行）才随父开关默认开。`pinnedInjectBudget` 与它同批，但属前者之外：
+  // 那是既有块内的预算，不是新表面。
+  // 双落点是硬要求，不能只留一半：宿主的压缩摘要器**只看对话里的内容**，只落库不
+  // 注入，等于在摘要重建里什么都没留下；只注入不落库，则压缩一过就随旧消息一起
+  // 消失。两者都做，且落库先于注入（注入失败不该丢提案）。
+  // 祖先：`autoInject`（父关则本项不生效，闸门见 injectChildEnabled）。轻量档默认
+  // 置关（见 LIGHT_MODE_OFF）：轻量档多一份注入物是反的，与 injectGuidanceEnabled
+  // 同一取舍。注意预设只是默认值而非强制——装配时用户显式开关在它之后展开，勾了就赢
+  // （合并顺序见 index.js 装配处）。
+  continuityRescueEnabled: z.boolean().default(false),
+  // #249（第一批）：B1 pin 池预算——约束/偏好类注入条目的独立小上限。约束与
+  // 偏好被静默降级是本议题的立项核心（同类知识与情景日志同池同速率摘要，实测
+  // 一轮压缩后仅保 53%、五轮 10%），故这两类不进相关性竞争、不参与跨轮轮换、
+  // 逐字保真（仅受超大条目的硬顶保护，截断仍带提示）并排在块内排序之前。
+  // 独立预算的意义：pin 不占 maxInjectedItems 名额，不会把当前任务需要的情景
+  // 候选挤出预算（另一种「批量塞历史」）。0（默认）= 关闭，注入块构成与既有
+  // 行为逐字节一致；超出预算的条数在块内如实标注未展示条数，绝不静默。
+  pinnedInjectBudget: z.natural().min(0).max(5).default(0),
   // 编码记忆蒸馏（codingRetrospect，opt-in，默认关）。开启时，turn/end 蒸馏
   // 额外提取三类编码专属记忆：rejected_solution（被否决方案）/ pitfall（踩坑）/
   // constraint（工程约束）。蒸馏上下文为整轮完整对话（用户输入 → 助手思考/回答
@@ -111,6 +145,31 @@ export const Config = z.object({
   // 起算，失败/degraded 的 run 也占用间隔；间隔内的触发请求静默跳过，下一次
   // 写入事件会重新评估。
   dreamMinIntervalMinutes: z.natural().min(0).max(10080).default(0),
+  // Issue #292（#135 派生）：autoDream 连续失败退避（opt-in，默认关 = 行为与
+  // 现状逐字节一致）。开启后调度器对连续失败做指数退避：有效最小间隔 =
+  // dreamMinIntervalMinutes × 2^连续失败数（成功一次清零恢复），封顶 30 分钟。
+  // #89 的最小间隔闸失败 run 也占用，但间隔恒定——恒定失败的模型（#135 空体
+  // 面）会按固定节奏连发刷爆配额；退避把下次重试按失败次数指数推远。基数取
+  // dreamMinIntervalMinutes：基数为 0 时无闸可翻倍，本键不自己产生间隔（先配
+  // dreamMinIntervalMinutes 再开本键）。与 dreamPeakHours / dreamMinIntervalMinutes
+  // 同族（节流阀，不新增任何 LLM 调用），故不进 LIGHT_MODE_OFF。
+  autoDreamFailureBackoff: z.boolean().default(false),
+  // Issue #239（第 4 项，错峰队列）镜像到巩固：高峰期不做梦。与
+  // summarizePeakHours 同一份时段语法（复用 src/summarize.js 的 parsePeakSpec /
+  // isInPeakWindow / nextOffPeakAt，不另写解析器）：逗号分隔、可带星期前缀、支持
+  // 跨零点。空串 = 关闭，行为与现状逐字节一致。
+  //   "09:00-18:00"                      每天 09:00-18:00
+  //   "mon-fri 08:00-12:00,14:00-18:00"  工作日两段（按高峰计费的供应商即此形态）
+  // 为什么巩固比蒸馏更该有这道闸：单次巩固的输入是整窗快照（dreamMaxSnapshotSize
+  // 条），实测一次 run 的 LLM 时长可达数分钟量级，撞上高峰时既贵又慢；而它由写入
+  // 事件触发、没有天然的「等到空闲再跑」路径。命中高峰时：不调 LLM、不刷新
+  // baseline（阈值继续累积，留到非高峰一次性巩固），登记一行 status='skipped' /
+  // error_message='peak-hours' 审计，并按下面的上限择时补跑。任一写法非法则整串
+  // 按「未配置」处理——排程是省钱手段，绝不该因为写错格式把巩固停掉。
+  dreamPeakHours: z.string().default(""),
+  // 高峰顺延上限（分钟，0 = 不设上限）：到点仍处高峰就照常跑，避免整天高峰把巩固
+  // 饿死。默认 120，与 summarizePeakMaxDeferMinutes 对齐。仅在时段串非空时生效。
+  dreamPeakMaxDeferMinutes: z.natural().min(0).max(1440).default(120),
   // 巩固模型路由（settings panel「巩固模型」/ dreamProvider+dreamModel）：
   // dream 的记忆沉淀专用 LLM 路由，显式配置优先于 agent 默认模型（config-first，
   // Issue #25）。模型分类声明：
@@ -186,6 +245,23 @@ export const Config = z.object({
   dreamNarrativeEnabled: z.boolean().default(false),
   // 成簇门槛：共享同一 tag 的记忆 ≥ 此值才合成叙述条。
   dreamNarrativeMinCluster: z.natural().min(2).max(20).default(3),
+  // document 型记忆（#164/#230，opt-in）：agent 产长文档的指针行——注册校验
+  // （文件存在 + 路径合法 + evidence 求交）、摘要 + doc_path 落库、C2 比对
+  // 去重、supersede 记账。全文归 agent，管线零触碰；默认关=行为与此前一致；
+  // lightMode 强制关闭。
+  documentMemoryEnabled: z.boolean().default(false),
+  // document 摘要行的注入预算（#230 拍板）：次优先档内最多注入的 document
+  // 行数，超预算跳过由后续候选补位。只约束注入，不约束检索。
+  documentInjectBudget: z.natural().min(1).max(5).default(2),
+  // document 的 managed 落盘目录（#296 第二批）：空串 = 跟随 memoryDir 的
+  // `<memoryDir>/documents/`。`~` / `~/` / `~\` 展开到 home，绝对路径原样用，相对
+  // 路径落在 memoryDir 下（这是本键自己的规则：memoryDir 的相对路径是原样留着的
+  // cwd 语义，两者刻意不同；`~user` 形式两边都不展开）。目录由 mneme 建，里面的
+  // `index.md`
+  // 整文件机器所有。这个目录**之外**的文件只登记指针行，正文一个字节都不碰
+  // （= #230 的「管线对正文零读零写」）；与 memoryDir 一样是路径配置，不是
+  // 行为开关，故不进 settings.js 的 feature flags 白名单、也不上面板。
+  documentDir: z.string().default(""),
   // 隐式 keep（v0.4.4）：LLM 未提及的 snapshot 记忆自动补 {action:"keep"}，
   // 避免"未覆盖即全拒"白白浪费整轮 run。设为 false 时保留旧的严格校验
   // （未覆盖即拒绝整单）。
@@ -226,6 +302,18 @@ export const Config = z.object({
   localEmbedDimension: z.natural().default(512),
   localEmbedDevice: z.union([z.const("cpu"), z.const("gpu")]).default("cpu"),
   localEmbedBatchSize: z.natural().min(1).max(64).default(8),
+  // 本地嵌入的池化方式（**bug 修复，不是新能力**）：BGE 系是按 CLS 池化训练的——
+  // 模型自带的 `1_Pooling/config.json` 明确写着 `pooling_mode_cls_token: true` /
+  // `pooling_mode_mean_tokens: false`，官方 README 也是「select the last hidden state of
+  // the first token」+ L2 normalize；而 transformers.js 的 `feature-extraction` 默认 mean。
+  // ⇒ 此前本地嵌入对 BGE 系一直用错池化：**不报错、只是向量系统性偏差**，检索质量静默受损。
+  // 'auto' = 按模型族判定（BGE → cls，其余 → mean，未受影响的模型行为不变）；也可显式钉住。
+  // ⚠️ 池化决定向量空间，改它会改变 modelHash（见 local-embedder.js），既有索引会被判失配并重建。
+  localEmbedPooling: z.union([
+    z.const("auto"),
+    z.const("cls"),
+    z.const("mean")
+  ]).default("auto"),
 
   // Ollama embedder.
   ollamaBaseUrl: z.string().default("http://localhost:11434"),
@@ -429,6 +517,23 @@ export const Config = z.object({
     z.const("high"),
     z.const("none")
   ]).description("同 dreamReasoningEffort：sleep 各阶段 LLM 的推理档位，未配置 = 自动取模型支持的最低档；显式 'none' = 不发送字段、用服务商自带默认。"),
+  // Pass-through reasoning effort for the distill (summarize) LLM call
+  // (issue #315). Mirrors entityExtractionReasoning rather than dream: the
+  // default 'none' omits the field entirely (provider default), so current
+  // behavior is unchanged until the user opts in — no auto-lowest resolution
+  // here, distill failures are retried at the window level anyway. off/low/
+  // medium/high are forwarded verbatim; a provider that rejects the effort
+  // retries once without it (withEffortFallback), so opting in is safe to
+  // experiment with. The failure being addressed is the #9 shape on the
+  // distill path: a thinking model drains the output budget on reasoning and
+  // the summary comes back empty/truncated.
+  summarizeReasoningEffort: z.union([
+    z.const("off"),
+    z.const("low"),
+    z.const("medium"),
+    z.const("high"),
+    z.const("none")
+  ]).default("none").description("蒸馏（会话总结提炼）LLM 的推理档位：默认 'none' = 不发送字段、用服务商自带默认；off/low/medium/high 原样传递，被模型拒收时自动去掉字段重试一次（与巩固/睡眠同款降级，#315）。思考型模型建议 off/low，避免推理烧光输出预算。"),
   // Issue #257：sleep 冲突/模式两阶段的输出预算（原硬编码 2048）。实测默认档
   // 每对裁决约 90 token、24 对 2097——2048 恰好压在边界（53 次运行 48 败）；
   // full 档六分支实测约 290 token/对、24 对 6967，2048 必然截断。默认 8192
@@ -466,11 +571,18 @@ export const Config = z.object({
   }).default({}),
 
   // --- LLM audit trail (Bug8) ------------------------------------------------
-  // Records every background LLM call (autoDream consolidation + summary,
-  // autoSummarize compression) into llm_audit_logs: tokens, duration, status
-  // and which trigger produced it. Failures are recorded as status=error and
-  // never block the feature. retentionDays bounds the table: older rows are
-  // purged on boot.
+  // Records every background LLM call into llm_audit_logs: tokens, duration,
+  // status and which trigger produced it. Failures are recorded as
+  // status='error' and never block the feature. retentionDays bounds the table:
+  // older rows are purged on boot.
+  //
+  // Covered trigger_source values: autoDream (consolidation + summary),
+  // autoSummarize (compression), sleep (conflict + pattern) and entityExtract
+  // (issue #250 — the last two were structurally missing the hook, not a
+  // deliberate narrowing). entityExtract runs on every memory write, so row
+  // growth scales with write volume; retentionDays caps the ceiling but not the
+  // rate. If that turns out too fast, sample by operation_type or give it a
+  // separate retention — do not add a second gate: this flag is the single one.
   llmAudit: z.object({
     enabled: z.boolean().default(true),
     retentionDays: z.natural().min(1).max(3650).default(90)
@@ -528,6 +640,17 @@ export const Config = z.object({
   // recall_runs 滚动清理保留天数。
   recallRetentionDays: z.natural().min(1).max(3650).default(90),
 
+  // --- tool exposure: 慢模型/轻量模型的工具往返节流（v0.8.5）----------------
+  // 跨会话记忆已由 inject.js 每轮自动注入系统提示词，memory_search 只用于
+  // 「注入里没有、需要深挖」的补充检索；memory_archive 是隐藏/恢复条目的整理
+  // 操作，正常会话里很少需要。轻量模型对「何时该用工具」判断弱，容易每轮
+  // 顺手调一遍——每次工具调用都是一次串行往返（生成参数→执行→回填→再生成），
+  // 在慢模型上会被放大成明显卡顿。这两个开关允许直接隐藏对应工具（默认全
+  // 开=行为不变），隐藏后模型根本看不到它，也就不会调。也走 feature_flags
+  // 白名单，面板可启停=线上回滚开关。
+  disableMemorySearch: z.boolean().default(false),
+  disableMemoryArchive: z.boolean().default(false),
+
   // --- scope: v0.8.0 A1 存储层（issue #17）--------------------------------
   // 总开关默认关：关闭时写入不标注 scope、去重维持 (type, title) 现状，行为
   // 逐字节不变。开启后 memory_save 写入 agent_scope（session header 的
@@ -555,6 +678,9 @@ const LIGHT_MODE_OFF = [
   "rerankEnabled",
   "autoReindexOnBoot",
   "hybridInject",
+  // #249 第二批：能力说明在轻量档保持关闭——它是工具描述与提示段上的额外常驻
+  // 文本，轻量档（小模型 / 小上下文）不该因默认值翻转而多付这份提示成本。
+  "injectGuidanceEnabled",
   "searchSemanticDedup",
   "selectiveInjectEnabled",
   "bm25SearchEnabled",
@@ -562,8 +688,15 @@ const LIGHT_MODE_OFF = [
   "entityRecallEnabled",
   // 轻量模式不开叙述条（额外 LLM 调用；#164 对齐，opt-in）。
   "dreamNarrativeEnabled",
+  // 轻量模式不开 document 指针行（#230，opt-in：注册/注入/检索增强全随闸）。
+  "documentMemoryEnabled",
   // 轻量模式不开热计算（heat 属于重型增强；关掉后 sleep 降级也退回纯时间分层）。
-  "heatEnabled"
+  "heatEnabled",
+  // #249 N3：轻量档默认不开压缩边缘双落点——它往对话里追加消息（新的注入表面），
+  // 轻量档（小模型 / 小上下文）最不该再多一份注入物。这是预设给的默认值、不是强制：
+  // 用户显式勾选仍然赢（合并顺序「用户开关 > 轻量预设 > bundle 配置」，同
+  // injectGuidanceEnabled）。
+  "continuityRescueEnabled"
 ];
 
 /**
@@ -577,4 +710,36 @@ export function applyLightModePreset(cfg) {
   const preset = { ...cfg, lightMode: true };
   for (const key of LIGHT_MODE_OFF) preset[key] = false;
   return preset;
+}
+
+/**
+ * #249 第二批：注入形态的父／子开关。父 = `autoInject`（既有的挂载总闸，默认
+ * 开）。子项按 #249 §10 的判据分档——看它是否引入**新的注入时机／新的注入
+ * 表面／额外成本**：
+ *
+ * - 只修正既有每轮块内的位（能力说明）→ 随父开关生效，键的默认值给开；
+ * - 需要新时机或新表面（N2 回合结束提醒、N3 压缩边缘）→ 独立开关、默认关，
+ *   实现时挂到这张表下（今天还没有这两个键，故表里只有能力说明一项）。
+ *
+ * 语义：**父关 = 子项一律不生效，但子项的持久值原样保留**（父关是「不生效」，
+ * 不是「重置用户配置」）。用户显式写进 kv 的值也不因父关被改写。
+ *
+ * 闸门放在消费点而不是合并后的 cfg 上：压 cfg 会让 `/features` 的 effective
+ * 失去「子项自己勾着、父关时当前不生效」这个状态，面板就显示不出来。跨文件
+ * 契约见 test/inject-parent-gate.test.js（含面板侧关系的漂移检查）。
+ *
+ * 表里只放**顶层扁平键**：点号键（如 `memoryQualityFilter.enabled`）在合并后的
+ * cfg 里是嵌套对象，`cfg?.["a.b"]` 取不到，挂进来会恒判不生效且不报错。N2/N3
+ * 是扁平键，不受这条限制。
+ */
+export const INJECT_CHILD_FLAGS = Object.freeze({
+  autoInject: Object.freeze(["injectGuidanceEnabled", "continuityRescueEnabled"])
+});
+
+/** 子开关的运行时生效值：父开关显式关（false）时恒不生效。 */
+export function injectChildEnabled(cfg, key) {
+  for (const [parent, children] of Object.entries(INJECT_CHILD_FLAGS)) {
+    if (children.includes(key) && cfg?.[parent] === false) return false;
+  }
+  return cfg?.[key] === true;
 }

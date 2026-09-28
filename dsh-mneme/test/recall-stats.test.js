@@ -121,3 +121,69 @@ test("windowDays/exemptDays 越界回默认；扫描超上限标 truncated", () 
   assert.equal(total, 2, "窗口总数不截断 → truncated = total > rows.length");
   store.close();
 });
+
+// ============================ 第五指标（#275）：归档净增速率 + 可压掉行数
+
+test("归档净增速率：按 updated_at 取归档时刻，窗外归档只进总数不进净增", () => {
+  const { store, service } = setup();
+  const fresh = service.saveWithDedupe({ type: "history", title: "刚归档", content: "x", importance: 3 }).memory;
+  const old = service.saveWithDedupe({ type: "history", title: "早归档", content: "y", importance: 3 }).memory;
+  service.saveWithDedupe({ type: "history", title: "活跃件", content: "z", importance: 3 });
+  store.setArchived(fresh.id, true);
+  store.setArchived(old.id, true);
+  // 归档时刻 = 最后一次写（setArchived 刷 updated_at）：把这行推到窗口外
+  store.db.prepare("UPDATE memories SET updated_at = ? WHERE id = ?")
+    .run(new Date(Date.now() - 100 * 86400000).toISOString(), old.id);
+
+  const stats = service.recallStats({ windowDays: 30, exemptDays: 0 });
+  assert.equal(stats.archive.total, 2, "归档区现有行数（活跃件不算）");
+  assert.equal(stats.archive.addedInWindow, 1, "窗外那次归档不算本窗口净增");
+  assert.equal(stats.archive.perDay, Math.round((1 / 30) * 100) / 100);
+  store.close();
+});
+
+test("可压掉行数：同 type 同 scope 的内容哈希精确重复（跨 scope / 活跃行都不算）", () => {
+  const { store, service } = setup();
+  // 标题只差大小写、正文只差标点与空白 → 归一化后同哈希（#254 的口径）
+  const a = store.save({ type: "history", title: "Task A", content: "line1.\n\nline2" });
+  const b = store.save({ type: "history", title: "task a", content: "line1 line2" });
+  const otherScope = store.save({ type: "history", title: "Task A", content: "line1 line2", agent_scope: "other" });
+  store.save({ type: "history", title: "Task A", content: "line1 line2" });
+  for (const id of [a.id, b.id, otherScope.id]) store.setArchived(id, true);
+
+  const stats = service.recallStats({ windowDays: 30, exemptDays: 0 });
+  assert.equal(stats.archive.compressible.groups, 1, "跨 scope 不互判（与去重候选集同一把尺）");
+  assert.equal(stats.archive.compressible.rows, 1, "每组留一行，多出来的才叫可压掉");
+  assert.equal(stats.archive.total, 3, "跨 scope 行照进总数，只是不参与可压掉");
+  assert.equal(stats.archive.addedInWindow, 3, "三行都是本窗口内归档的");
+  store.close();
+});
+
+test("可压掉行数：向量口径不可用时的兜底——指标不依赖 embedding", () => {
+  // 回归点：回收动作会清掉归档行向量（clearArchivedEmbeddings），若指标建在向量近
+  // 重复上，回收一跑它就归零。这里清完向量后指标必须不变。
+  const { store, service } = setup();
+  const a = store.save({ type: "history", title: "同题", content: "同一件事" });
+  const b = store.save({ type: "history", title: "同题", content: "同一件事" });
+  store.setArchived(a.id, true);
+  store.setArchived(b.id, true);
+  assert.equal(service.recallStats({ windowDays: 30, exemptDays: 0 }).archive.compressible.rows, 1);
+
+  store.clearArchivedEmbeddings();
+  assert.equal(
+    service.recallStats({ windowDays: 30, exemptDays: 0 }).archive.compressible.rows,
+    1,
+    "清向量不影响可压掉行数"
+  );
+  store.close();
+});
+
+test("没有归档行时给 0，不返回 null / NaN", () => {
+  const { store, service } = setup();
+  service.saveWithDedupe({ type: "project", title: "只有活跃", content: "x", importance: 3 });
+  const stats = service.recallStats({ windowDays: 30, exemptDays: 0 });
+  assert.deepEqual(stats.archive, {
+    total: 0, addedInWindow: 0, perDay: 0, compressible: { rows: 0, groups: 0 }
+  });
+  store.close();
+});

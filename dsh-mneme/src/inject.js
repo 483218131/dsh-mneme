@@ -1,7 +1,20 @@
 import { createScopeResolver } from "./scope.js";
 import { createHotMemory } from "./hot-memory.js";
 import { STR, langOf } from "./lang.js";
+import { MEMORY_GUIDE_SECTION } from "./guide.js";
 import { adaptiveInjectBudget } from "./search/adaptive.js";
+import { injectChildEnabled } from "./config.js";
+
+// Issue #179：注入预览的数据底座。systemPrompt 渲染是同步回调，面板只能事后
+// 拉取，所以在这里旁路缓存「最近一帧组装」——快照就是本次渲染用过的同一份
+// candidates/hotText/body，不重新检索、不二次组装，零额外开销。模块级单例：
+// 注入器全局唯一（index.js 仅在 autoInject 开启时注册一个），面板经 api.js 的
+// 只读 getter 读取；autoInject 关闭时注入器不存在，快照保持 null——「预览
+// 不可用」本身就是「注入关闭」的诚实呈现。
+let injectionSnapshot = null;
+export function getInjectionSnapshot() {
+  return injectionSnapshot;
+}
 
 // Best-effort extraction of the current user's latest message text from the
 // live session, for semantic-first injection (Bug4). The system-prompt
@@ -144,13 +157,18 @@ export function createInjector(ctx, service, settings, config) {
   // stale 1500) and an entry that would exceed it collapses to its title only.
   const maxContent = config.injectContentMaxChars ?? 300;
   const MAX_BLOCK = Math.max(1500, maxContent + 600);
+  // #249 第一批：pin 条目的正文硬顶。逐字保真不等于无界——单条上限取
+  // injectContentMaxChars 与 2000 的较大者，默认档下约束/偏好不会因常规截断
+  // 失真，同时给「一条超长约束每轮吃满常驻段」留一道闸（超顶仍带截断提示）。
+  const PINNED_CONTENT_MAX = Math.max(maxContent, 2000);
 
-  // Compressed injection (v0.5.0 2.1): a sleep-demoted row already carries its
-  // summary in `content` with the original parked in `_full_content` — inject
-  // the summary verbatim instead of re-truncating the (already short) text.
-  // Regular long rows keep the hard truncate.
+  // Compressed injection (v0.5.0 2.1): a sleep-demoted row carries its summary in
+  // `content` with the original parked in `_full_content` — inject the summary
+  // verbatim instead of re-truncating the (already short) text. 但「降级过」不等于
+  // 「天然够短」：原先那条 `_full_content` 早返回的唯一效果就是**跳过 maxLength**
+  // （两条分支取的都是 m.content），于是 pin 的硬顶在这一路上形同不存在（#266 评审）。
+  // 现在只有一条截断路径：超限照旧带提示，原文永远可通过 memory_get 取回。
   function injectMemory(m, maxLength = maxContent) {
-    if (m?._full_content) return String(m.content ?? "");
     const text = String(m?.content ?? "");
     if (text.length <= maxLength) return text;
     return `${text.slice(0, maxLength)}…${STR.truncatedHint[language](maxLength, text.length, m.id)}`;
@@ -193,25 +211,40 @@ export function createInjector(ctx, service, settings, config) {
     return escapePromptVars(STR.hotHeader[language](rounds.length, body));
   }
 
-  function render(candidates) {
+  function render(candidates, pinnedStats = null) {
     if (!candidates.length) return "";
     const header = STR.memoryHeader[language];
     const lines = [header];
     let budget = MAX_BLOCK - header.length;
-    for (const m of candidates) {
+    // #249 第一批：pin 池（约束/偏好）排在块头且不参与块的塌缩预算——「与情景
+    // 日志抢同一份预算后被降级」正是本议题要修的结构缺陷。单条仍有硬顶
+    // （PINNED_CONTENT_MAX），超出照旧带截断提示，不静默。
+    const pinnedCount = Math.max(0, Math.min(candidates.length, pinnedStats?.shown ?? 0));
+    for (let i = 0; i < candidates.length; i++) {
+      const m = candidates[i];
+      const pinned = i < pinnedCount;
       // Epistemic trust (v0.4.5): when enabled, measured observations are
       // flagged so the agent can weigh them above guesses/opinions.
       const verified = config.trustEpistemicWeighting === true && m.epistemic_status === "observation"
         ? STR.verified[language]
         : "";
       const title = STR.entryTitle[language](m.title, m.importance);
-      const content = injectMemory(m);
+      const content = injectMemory(m, pinned ? PINNED_CONTENT_MAX : maxContent);
       const full = STR.entryLine[language](m.type, verified, title, content);
-      if (budget - full.length >= 0) {
+      if (pinned) {
+        // pin 不扣块预算（上面那条设计注释的落地）：pin 一条就够击穿 MAX_BLOCK
+        // （PINNED_CONTENT_MAX 2000 > MAX_BLOCK 1500），照扣会把 budget 压成负数，
+        // 同一轮随后的普通候选全部退化成标题行——正是本议题要修的结构缺陷。
+        lines.push(full);
+      } else if (budget - full.length >= 0) {
         lines.push(full);
         budget -= full.length;
       } else {
         lines.push(`- [${m.type}] ${verified}${title}`);
+      }
+      if (pinned && i === pinnedCount - 1) {
+        const hidden = Math.max(0, pinnedStats?.suppressed ?? 0);
+        if (hidden > 0) lines.push(STR.pinnedOverflow[language](hidden));
       }
     }
     return escapePromptVars(lines.join("\n"));
@@ -251,7 +284,20 @@ export function createInjector(ctx, service, settings, config) {
     return escapePromptVars(lines.join("\n"));
   }
 
+  // #249 能力说明的系统提示段。order 150 = 插件指引段的既有惯例
+  // （ACP 的 ACP_SYSTEM_PROMPT 与 mnemon 的 routing 段都在 150）。文本是常量、
+  // 同会话内不随轮次变化，故不影响其后的前缀缓存，也不逐轮复读。宿主若不提供
+  // section seam 就静默跳过——#249 §3 的口径是「只用现成 seam，拿不到位的语义
+  // 降级处理」：能力说明仍落在工具描述上，不算失败。
+  // 走父／子闸门（#249 第二批）：注入器本身只在 `autoInject` 开时挂载，这里是
+  // 第二道、也是同一个判据的显式落点——两处消费点共用 injectChildEnabled，
+  // 不在各自的地方重写「父关则子不生效」。
+  const guideSection = injectChildEnabled(config, "injectGuidanceEnabled") && typeof ctx.systemPrompt?.section === "function"
+    ? ctx.systemPrompt.section({ name: "memory-guide", order: 150, text: MEMORY_GUIDE_SECTION })
+    : null;
+
   const disposers = [
+    ...(guideSection ? [guideSection] : []),
     ctx.systemPrompt.context({
       name: "memory",
       order: 90,
@@ -277,16 +323,42 @@ export function createInjector(ctx, service, settings, config) {
         const maxItems = config.injectUncertaintyAdaptive === true
           ? adaptiveInjectBudget(query, baseMaxItems)
           : baseMaxItems;
-        const candidates = service.injectCandidates({ query, queryVector, maxItems, threshold, scope, rotate, rotateWindow: rotationTurns });
-        recordInjection(sessionId, query, candidates);
+        // #249 第一批：pin 池统计走可选出参，不动 injectCandidates 的数组契约。
+        const pinnedStats = {};
+        const candidates = service.injectCandidates({ query, queryVector, maxItems, threshold, scope, rotate, rotateWindow: rotationTurns, pinnedStats });
+        // #249：pin 条目不进轮换历史——它们每轮固定前置，记进去只会占满轮换
+        // 窗口、挤掉情景候选的新鲜度（验收：pin 不参与跨轮轮换）。
+        recordInjection(sessionId, query, pinnedStats.shown > 0 ? candidates.slice(pinnedStats.shown) : candidates);
         // Hot memory (v0.5.0 1.3) leads the single memory block: the agent
         // sees the short-term rounds first, then the cross-session recall —
         // the documented injection order 1→2. Folding it here (instead of a
         // separate context) keeps the prompt assembly stable at two blocks.
         const hotText = renderHotContext(ctx);
-        const body = render(candidates);
-        if (!hotText) return body;
-        return body ? `${hotText}\n\n${body}` : hotText;
+        const body = render(candidates, pinnedStats);
+        const finalBody = !hotText ? body : body ? `${hotText}\n\n${body}` : hotText;
+        // Issue #179：旁路缓存一帧——面板「注入预览」卡据此展示构成与体积。
+        // chars 为条目内容的截断后近似值（与 render 同一函数计长），totalChars
+        // 是本次实际返回块的精确长度。maxItems 反映自适应收缩后的生效值。
+        injectionSnapshot = {
+          at: Date.now(),
+          sessionId,
+          query: query || "",
+          maxItems,
+          threshold,
+          adaptive: config.injectUncertaintyAdaptive === true,
+          scoped: scope && (scope.agent_scope || scope.workspace_scope) ? scope : null,
+          rotated: rotate ? rotate.size : 0,
+          hotChars: hotText.length,
+          entries: candidates.map((m) => ({
+            id: m.id,
+            type: m.type,
+            title: m.title,
+            importance: m.importance,
+            chars: injectMemory(m).length
+          })),
+          totalChars: finalBody.length
+        };
+        return finalBody;
       }
     }),
     ctx.systemPrompt.context({
@@ -299,6 +371,7 @@ export function createInjector(ctx, service, settings, config) {
   return () => {
     queryVectorCache.clear();
     rotationHistory.clear();
+    injectionSnapshot = null; // 注入器卸载即失效：快照不得跨生命周期存留
     for (const dispose of disposers) {
       if (typeof dispose === "function") dispose();
     }

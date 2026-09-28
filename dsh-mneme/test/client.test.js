@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const clientSource = readFileSync(join(root, "lib/client.js"), "utf8");
@@ -23,6 +24,15 @@ test("client bundle registers under the package name", () => {
 test("client bundle is lib-only with no src counterpart", () => {
   assert.equal(existsSync(join(root, "src/client.js")), false, "src/ must not contain client.js");
   assert.equal(existsSync(join(root, "lib/client.js")), true, "lib/client.js must exist");
+});
+
+// 归档侧第五指标（#275）自己按「归档区为空就整段省略」门控，但整卡还有一道 hasData 门：
+// 那道门只认召回回执与活跃僵尸行时，「全归档 + 窗口内无回执」的库会直接 return null，
+// 指标永远不显示（自动评审 #312 指出的回归）。这里锁死 hasData 必须把 archive.total 计进来。
+test("status card: hasData counts the archive metric", () => {
+  const m = clientSource.match(/const hasData =[^;]+;/);
+  assert.ok(m, "the status card must declare hasData");
+  assert.match(m[0], /d\.archive\?\.total/, "hasData must count archive.total, not just runs/active rows");
 });
 
 // The memory entry lives at the sidebar foot, not in the settings modal: the
@@ -208,8 +218,8 @@ test("entry tracks native class, inherits native sizing, and lifts the toolbar d
     "the entry must use the native button width, which reserves its horizontal margins"
   );
   assert.ok(
-    clientSource.includes(".mneme-topentry{display:flex;flex-direction:column}"),
-    "the entry wrapper must stretch the native button within a column flex layout"
+    clientSource.includes(".mneme-topentry{display:flex;flex-direction:column;position:relative}"),
+    "the entry wrapper must stretch the native button within a column flex layout (position:relative hosts the #177 badge)"
   );
   assert.equal(
     clientSource.includes(".mneme-topentry-native .mneme-topentry-label{flex:1;min-width:0;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"),
@@ -224,9 +234,12 @@ test("entry tracks native class, inherits native sizing, and lifts the toolbar d
 
 // Importance renders as Lucide star glyphs (the morphicons-paired data set;
 // the runtime cannot require the ESM-only morphicons engine, so the path
-// ships inline like the other stroke icons), not raw ★ text. Only the
-// drawer's edit-mode <option> labels keep the text form — SVG cannot render
-// inside <option>.
+// ships inline like the other stroke icons). Raw text stars are fully
+// retired: the drawer's edit-mode <option> select used to keep "★".repeat
+// labels (SVG cannot render inside <option>) — it is now the SVG star
+// button row, and the inline indicators (importance chips / entity meta /
+// inject preview) share the same StarGlyph, so every star in the panel has
+// one shape. (用户反馈：文本 ★ 过尖、与卡片 SVG 星不统一。)
 test("importance renders as star glyphs, not raw text stars", () => {
   assert.ok(
     clientSource.includes("STAR_PATH_D"),
@@ -237,9 +250,9 @@ test("importance renders as star glyphs, not raw text stars", () => {
     "the star-row component must exist"
   );
   assert.equal(
-    (clientSource.match(/"★"\.repeat/g) || []).length,
-    1,
-    "only the drawer edit <option> labels may keep the ★ text form"
+    (clientSource.match(/★/g) || []).length,
+    0,
+    "no raw text star may remain anywhere — every star renders through the shared SVG path"
   );
   assert.ok(
     /h\(ImportanceStars, \{ className: "mneme-dmetaval"/.test(clientSource),
@@ -248,6 +261,14 @@ test("importance renders as star glyphs, not raw text stars", () => {
   assert.ok(
     /h\(ImportanceStars, \{ value: m\.importance/.test(clientSource),
     "the card foot must render the star row"
+  );
+  assert.ok(
+    /className: "mneme-staredit"/.test(clientSource),
+    "the drawer edit importance must be the SVG star button row, not a text-star <select>"
+  );
+  assert.ok(
+    /h\(StarGlyph, \{ size: 11 \}\)/.test(clientSource),
+    "inline star indicators must go through the shared StarGlyph"
   );
 });
 
@@ -311,6 +332,35 @@ test("graph toggle uses a node-graph glyph, not the share icon", () => {
     clientSource.includes("GraphNodesIcon"),
     "the custom node-graph icon must back the graph toggle"
   );
+});
+
+// #287 跨代图标守卫：primitives 在 0.1.7 把归档图标从「像素后缀」改名成「字重后缀」
+// （IconArchiveOutline20 → …OutlineRegular / …OutlineMedium），旧名不留别名，而
+// peerDependencies 仍同时覆盖 0.1.6 与 0.1.7 两代宿主。只认某一代的名字，另一代就会
+// 把 undefined 交给 h()，落成 slot entry 里的 React #130（该 entry 整块崩），因此必须
+// 探测两代名字、并在全缺时降级为不渲染图标。
+test("#287: archive glyph probes both naming generations and degrades to no glyph", () => {
+  assert.ok(
+    /primitives\.IconArchiveOutline20\s*\?\?\s*primitives\.IconArchiveOutlineRegular\s*\?\?\s*primitives\.IconArchiveOutlineMedium/.test(clientSource),
+    "the glyph must probe the 0.1.6 pixel name before the 0.1.7 weight names"
+  );
+  assert.equal(
+    /h\(IconArchiveOutline20/.test(clientSource),
+    false,
+    "the raw constant must never reach h() — on a host lacking that name it renders undefined (React #130)"
+  );
+  assert.ok(
+    /const renderArchiveIcon = \(props\) => \(IconArchive \? h\(IconArchive, props\) : null\)/.test(clientSource),
+    "the glyph must render through a null-guarded helper so a missing icon degrades to nothing"
+  );
+  for (const site of [
+    "renderArchiveIcon({ size: 15 })",              // 浮层标题栏
+    "renderArchiveIcon({ size: wide ? 16 : 18 })",  // 侧栏 trigger
+    "renderArchiveIcon({ size: wide ? 15 : 18 })",  // portal 到宿主原生侧栏的入口
+    "renderArchiveIcon({ size })"                   // better-sidebar tab 图标
+  ]) {
+    assert.ok(clientSource.includes(site), `every render site must go through the helper: ${site}`);
+  }
 });
 
 // 方案 A：查询收敛。状态页只做仪表盘（小页预览 + 服务端 total + 查看全部），
@@ -665,7 +715,7 @@ test("settings feedback card: prefilled issue + mailto + browse, version from /i
   );
   // 2. GitHub 新建 issue：issues/new?title=&body= 预填环境信息（当前仓库无模板）
   assert.ok(
-    clientSource.includes("https://github.com/modusensus/dsh-mneme/issues/new?title="),
+    clientSource.includes("https://github.com/slow-stack/mneme/issues/new?title="),
     "the issue link must prefill title+body on issues/new"
   );
   assert.ok(
@@ -679,7 +729,7 @@ test("settings feedback card: prefilled issue + mailto + browse, version from /i
   );
   // 4. 浏览已知问题：跳仓库 issues 列表页（去重前置步骤）
   assert.ok(
-    clientSource.includes('href: "https://github.com/modusensus/dsh-mneme/issues"'),
+    clientSource.includes('href: "https://github.com/slow-stack/mneme/issues"'),
     "the browse link must open the repo issues list"
   );
   // 5. 双语 i18n
@@ -797,4 +847,123 @@ test("conflict queue ships a central review surface on the status tab", () => {
   assert.ok(clientSource.includes('"/api/dsh-mneme/conflicts"'), "queue must fetch the conflicts endpoint");
   assert.ok(clientSource.includes('"/api/dsh-mneme/conflicts/resolve"'), "queue must call the resolve endpoint");
   assert.ok(clientSource.includes("h(ConflictsQueue, { t })"), "status tab must render the queue");
+});
+
+// --- issue #178 批次一：无障碍（aria-live 网络 / 语义标题 / 焦点管理 / 图摘要） ---
+
+// 面板瞬时反馈（保存/裁决/刷新/复制）不能只靠纯视觉 span：announce() 单例
+// polite live region 是唯一的播报通道，所有接线点都必须走它。
+test("a11y: announce() live region exists and every transient feedback routes through it", () => {
+  assert.ok(clientSource.includes('function announce(text)'), "module-level announce() must exist");
+  assert.ok(clientSource.includes('"aria-live"'), "live region must set aria-live");
+  assert.ok(clientSource.includes('"role", "status"'), "live region must carry role=status");
+  // 接线点：功能开关保存、画像、向量、token、模式、extapi 保存+复制、
+  // 记忆编辑保存、队列刷新、裁决完成 —— 至少 9 处。
+  const wired = (clientSource.match(/\bannounce\(t\(/g) || []).length;
+  assert.ok(wired >= 9, `announce() wiring points expected >= 9, got ${wired}`);
+});
+
+// 状态卡标题原来是 div，读屏无法按标题导航；统一 h3（CSS margin 归零防回归）。
+test("a11y: status card titles are real headings", () => {
+  assert.ok(clientSource.includes('h("h3", { className: "mneme-xcolhead" }'), "StatusCard title must be an h3");
+  const css = clientSource.match(/\.mneme-xcolhead\{[^}]*\}/);
+  assert.ok(css && css[0].includes("margin:0"), "h3 default margin must be neutralized in CSS");
+});
+
+// 弹层焦点管理：Tab 圈在面板内，关闭后焦点还给触发元素（两个 opener 都要标记）。
+test("a11y: overlay focus trap and focus restore are wired", () => {
+  const openers = (clientSource.match(/"data-mneme-overlay-opener"/g) || []).length;
+  assert.equal(openers, 2, "both overlay entry buttons must carry the opener marker");
+  assert.ok(clientSource.includes('querySelectorAll(\'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])\')'),
+    "overlay must enumerate focusables for the Tab cycle");
+  assert.ok(/querySelector\('\[data-mneme-overlay-opener\]'\)/.test(clientSource), "closing must restore focus to the opener");
+});
+
+// 冲突裁决按钮「保留 A/B」在同文案多卡片下不可区分，必须带条目标题的 aria-label。
+test("a11y: conflict keep buttons carry item-title aria-labels", () => {
+  const labels = (clientSource.match(/"aria-label": `\$\{t\("memory\.status\.conflictQueue\.keep/g) || []).length;
+  assert.equal(labels, 2, "keepA/keepB buttons must both set aria-label");
+});
+
+// ego 关系图对读屏是一块不可达 SVG，必须 role=img + 计数摘要（键中英各一）。
+test("a11y: entity graph svg exposes a count summary", () => {
+  assert.ok(clientSource.includes('role: "img"'), "graph svg must be role=img");
+  for (const key of ["memory.graph.summary"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// --- issue #177：冲突队列交互与视觉重做 ---
+
+// 相似度进度条：只从「相似度 X / similarity X」锚定短语回收数字（防把年份当
+// 相似度），A/B 卡片带侧色类，冻结徽章替代预裁决阶段的「已归档」徽章。
+test("conflict queue: similarity bar, side colors and frozen badge", () => {
+  assert.ok(clientSource.includes("similarityOf(it.reason)"), "reason must be parsed for similarity");
+  assert.ok(clientSource.includes("/(?:相似度|similarity)\\s*([01](?:\\.\\d+)?)/i"), "parse must anchor on the similarity phrase");
+  for (const key of ["memory.status.conflictQueue.similarity", "memory.status.conflictQueue.frozenBadge"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  assert.ok(clientSource.includes('"mneme-conflict-side--a"'), "side A must carry the A color class");
+  assert.ok(clientSource.includes('"mneme-conflict-side--b"'), "side B must carry the B color class");
+  assert.ok(!/s\.archived && h\("span", \{ className: "mneme-badge mneme-badge--archived"/.test(clientSource),
+    "the pre-ruling archived badge must be replaced by the frozen badge");
+  assert.ok(clientSource.includes("mneme-badge--frozen"), "frozen badge class must exist");
+});
+
+// 词级 diff：LCS 对齐是纯函数，锁它的存在、上限护栏与渲染接线（无损性由
+// difftest 独立验证，此处只锁形状）。
+test("conflict queue: word diff is wired with size guards", () => {
+  assert.ok(clientSource.includes("function wordDiff(aText, bText)"), "wordDiff must exist");
+  assert.ok(clientSource.includes("mneme-conflict-mark--del"), "del highlight class must exist");
+  assert.ok(clientSource.includes("mneme-conflict-mark--ins"), "ins highlight class must exist");
+  assert.ok(clientSource.includes("n > 800 || m > 800"), "DP must bail on oversized inputs");
+});
+
+// 空态教育卡：0 冲突时也渲染（原来整块 return null），解释冻结是什么。
+test("conflict queue: empty-state explainer card", () => {
+  assert.ok(!/if \(!items \|\| items\.length === 0\) return null;/.test(clientSource),
+    "empty queue must render the explainer instead of nothing");
+  for (const key of ["memory.status.conflictQueue.emptyTitle", "memory.status.conflictQueue.emptyBody"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// 状态卡待处理高亮 + 侧边栏入口 badge（挂 portal 与回退两个按钮）。
+test("conflict queue: actionable status card and sidebar entry badge", () => {
+  assert.ok(clientSource.includes('"mneme-conflict-jump"'), "pending>0 card must carry the highlight class");
+  assert.ok(clientSource.includes("mneme-statuscard--actionable"), "highlight CSS must exist");
+  assert.ok((clientSource.match(/h\(ConflictBadge, \{ pending \}\)/g) || []).length === 2,
+    "badge must be wired into both entry buttons");
+  assert.ok((clientSource.match(/= useConflictBadgeCount\(t\)/g) || []).length === 2,
+    "both entry components must subscribe to the badge count");
+  assert.ok(clientSource.includes('"/api/dsh-mneme/dream-status"'), "badge must reuse the dream-status endpoint");
+});
+
+// --- issue #179：注入预览（状态页卡片 + /inject-preview 端点透传的旁路快照） ---
+test("a11y+preview: inject preview card is wired on the status tab", () => {
+  assert.ok(clientSource.includes('"/api/dsh-mneme/inject-preview"'), "card must fetch the preview endpoint");
+  assert.ok(clientSource.includes("h(InjectPreviewCard, { t })"), "status grid must render the preview card");
+  for (const key of [
+    "memory.status.injectPreview",
+    "memory.status.injectPreviewNone",
+    "memory.status.injectPreview.chars",
+    "memory.status.injectPreview.empty"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+// 面板 bundle 在本文件里只被当**文本**读（上面的断言全是正则/字符串包含），
+// 而仓库的 CI 里没有任何一步**解析**它：于是重复声明这类语法错误能一路绿灯进
+// 主干，后果却是整个面板加载失败（__ModuleLoader__ 拿到的模块一执行就抛
+// SyntaxError）。lib/client.js 无 src 对应物、不参与 sync，也就没有别的闸门
+// 覆盖它——这里补一道解析闸（PR #320 rebase 时真实踩到：与上游新增的
+// summarizeSub 撞名，node --check 报 "Identifier 'summarizeSub' has already
+// been declared"，而当时 CI 全绿）。
+test("client bundle parses: 面板产物必须是合法 JS（无重复声明等语法错误）", () => {
+  const result = spawnSync(process.execPath, ["--check", join(root, "lib/client.js")], { encoding: "utf8" });
+  assert.equal(result.status, 0, `lib/client.js 解析失败：\n${result.stderr || result.stdout}`);
 });

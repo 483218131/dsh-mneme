@@ -2,10 +2,15 @@ import { validateDecisions, applyDecisions } from "./dream/decisions.js";
 import { clusterMemories, findPotentialConflicts, cosineSimilarity } from "./dream/clustering.js";
 import { clusterByTag, intersectEvidence } from "./dream/narratives.js";
 import { scopeKeyOf } from "./scope.js";
+// Issue #239（第 4 项）镜像到巩固：错峰时段解析与「最近的高峰结束时刻」从独立的
+// 零依赖模块 peak-hours.js 取（该模块从 summarize.js 抽出，PR #320 review）——
+// 不另写一份解析器，两份实现漂移会让「同一个时段串在两处行为不同」，那比没有
+// 这个功能更糟。此前直接 import summarize.js，#316 后 summarize 反向依赖 dream
+// （withEffortFallback 复用），会成真循环，故抽模块。
+import { isInPeakWindow, nextOffPeakAt } from "./peak-hours.js";
 import { createHash, randomUUID } from "node:crypto";
 import { STR, langOf } from "./lang.js";
 export { validateDecisions, applyDecisions, withEffortFallback, describeStreamFailure, resolveDreamEffort, resolveRoute };
-
 
 // Extract the first JSON array from LLM output, tolerating markdown fences,
 // leading/trailing prose, and common wrapper noise. Returns an array or null.
@@ -342,6 +347,9 @@ async function runAuditedLlm(ctx, service, config, spec, body) {
  * accepted → reasoning capped; rejected → provider default (old behavior),
  * logged so the rejection is observable.
  */
+// Issue #315：effort 拒收判别式的单一来源。summarize 的流失败以 aborted 结果
+// 返回，需在折叠成 undefined 前用同一甄别（各处手写会漂移）。
+export const EFFORT_REJECT_RE = /reasoning[\s_]*effort|UNSUPPORTED_REASONING_EFFORT/i;
 async function withEffortFallback(ctx, effort, attempt, fallback, getStreamError) {
   if (!effort || effort === "none") return attempt();
   try {
@@ -352,17 +360,20 @@ async function withEffortFallback(ctx, effort, attempt, fallback, getStreamError
       // on the chunk's failure reason here or the retry below is dead code
       // for the stream path.
       const reason = String(getStreamError?.() ?? "");
-      if (/reasoning[\s_]*effort|UNSUPPORTED_REASONING_EFFORT/i.test(reason)) {
+      if (EFFORT_REJECT_RE.test(reason)) {
         ctx.logger?.warn?.(`dsh-mneme dream: reasoningEffort "${effort}" rejected via stream (${reason}); retrying without it`);
         return fallback();
       }
     }
     return result;
   } catch (error) {
+    // dispose/取消中止直接放行，绝不能被误判成 effort 拒收而触发 fallback
+    //（取消后重打一次不带 effort 的调用是浪费，且可能掩盖真实的取消意图）。
+    if (error?.name === "AbortError") throw error;
     const message = String(error?.message ?? error);
     // matches both "reasoning effort" (natural language) and the bare
     // "UNSUPPORTED_REASONING_EFFORT" error code (underscore).
-    if (!/reasoning[\s_]*effort/i.test(message)) throw error;
+    if (!EFFORT_REJECT_RE.test(message)) throw error;
     ctx.logger?.warn?.(`dsh-mneme dream: reasoningEffort "${effort}" rejected (${message}); retrying without it`);
     return fallback();
   }
@@ -387,7 +398,7 @@ async function reEmbedMemory(semantic, memory, logger) {
  * 任何失败降级为 0 条，绝不反噬 dream 主流程。
  */
 async function generateNarratives({ ctx, service, config, route, language, effort, semantic, logger }) {
-  const inputs = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary");
+  const inputs = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary" && m.type !== "document");
   const clusters = clusterByTag(inputs, { minCluster: config.dreamNarrativeMinCluster ?? 3 });
   if (!clusters.length) return 0;
 
@@ -411,8 +422,8 @@ async function generateNarratives({ ctx, service, config, route, language, effor
       maxTokens: config.dreamMaxTokens ?? 2048,
       ...(withEffort && effort ? { reasoningEffort: effort } : {}),
       messages: [
-        { role: "system", content: [{ type: "text", text: STR.prompts.narrative[language] }], source: { kind: "plugin", plugin: "dsh-mneme" } },
-        { role: "user", content: [{ type: "text", text: listing }], source: { kind: "plugin", plugin: "dsh-mneme" } }
+        { role: "system", content: [{ type: "text", text: STR.prompts.narrative[language] }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } },
+        { role: "user", content: [{ type: "text", text: listing }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } }
       ]
     }, reportUsage, (reason) => { streamFailure = describeStreamFailure(reason); }));
   };
@@ -745,18 +756,43 @@ export async function maintainIndexAfterDream(decisions, service, semantic) {
   if (embedder.modelHash) vectorIndex.markModel?.(embedder.modelHash, embedder.dimension);
 }
 
-export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChars = 5000, delayMs = 2000, minIntervalMs = 0, logger, semantic = null }) {
+// Issue #292：连续失败退避的间隔封顶（30 分钟）。封顶只拦指数「增长」，不把
+// 用户配得比这更大的 dreamMinIntervalMinutes 基数压小（见 effectiveMinIntervalMs）。
+const FAILURE_BACKOFF_CAP_MS = 30 * 60 * 1000;
+
+export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChars = 5000, delayMs = 2000, minIntervalMs = 0, failureBackoff = false, logger, semantic = null, lastRunAtSeed = 0, peakHours = "", peakMaxDeferMinutes = 120, auditPeakSkip = null, now = () => Date.now(), setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout }) {
   let pendingTimer = null;
+  // Issue #239（第 4 项）镜像到巩固：高峰顺延定时器。与 pendingTimer 分开——两者
+  // 语义不同（一个是「马上要跑」，一个是「等出高峰再跑」），合成一个变量会让
+  // maybeSchedule 的守卫在顺延期间把新的写入触发误当成「已有待跑」而吞掉。
+  let deferTimer = null;
   let running = false;
   let disposed = false;
   let baseline = { count: 0, chars: 0 };
   let inFlight = null;
   // Issue #89（请求 2）：上一次实际开跑时刻。失败/degraded 的 run 也占用
   // 最小间隔——节流的目的正是防止失败调用连发；间隔内的触发静默跳过。
-  let lastRunAt = 0;
+  // lastRunAtSeed：调用方从 dream_runs 审计表读出的上次开跑时刻——
+  // 内存变量进程重启即归零，闸门对新实例放行 → 重启后立刻连发（#89 根因）。
+  let lastRunAt = lastRunAtSeed;
+  // Issue #292（#135 派生）：同会话内连续失败计数。失败（onRun 抛错或返回
+  // ok:false）+1，成功清零；无返回结果的 run（no-op 桩）视为完成且无失败，
+  // 不动计数。纯内存变量、宿主重启归零——跨重启的冷却由 lastRunAtSeed（#291）
+  // 持久化负责，两者不重叠。
+  let consecutiveFailures = 0;
+
+  // Issue #292：有效最小间隔 = 基数 × 2^连续失败数，封顶 30 分钟。退避关闭或
+  // 尚无失败时逐字节返回基数（默认关 = 行为与现状一致）。基数 0 无闸可翻倍
+  // （本键不自己产生间隔）；封顶取 max(基数, cap)，指数再大也不会把用户配的
+  // 大基数压小。2^N 溢出成 Infinity 由 Math.min 兜到 cap，无需另设上限位数。
+  function effectiveMinIntervalMs() {
+    if (!failureBackoff || consecutiveFailures <= 0) return minIntervalMs;
+    const cap = Math.max(minIntervalMs, FAILURE_BACKOFF_CAP_MS);
+    return Math.min(minIntervalMs * 2 ** consecutiveFailures, cap);
+  }
 
   function shouldTrigger(service) {
-    const memories = service.all().filter((m) => !m.archived && m.type !== "summary");
+    const memories = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
     const count = memories.length;
     const chars = totalChars(memories);
     const overBase = count >= baseline.count + thresholdCount || chars >= baseline.chars + thresholdChars;
@@ -765,51 +801,115 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
   }
 
   function maybeSchedule(service) {
-    if (disposed || running || pendingTimer) return false;
-    // Issue #89（请求 2）：最小触发间隔闸门。
-    if (minIntervalMs > 0 && Date.now() - lastRunAt < minIntervalMs) return false;
+    if (disposed || running || pendingTimer || deferTimer) return false;
+    // Issue #89（请求 2）：最小触发间隔闸门。#292 退避开启时改用指数放大的
+    // 有效间隔：连续失败越多，下次放行越晚（恒定失败的模型不再按固定节奏连发，
+    // 只会越打越稀）。失败 run 本就占用间隔（lastRunAt 在开跑时刷新，见 #89），
+    // 这里放大的是同一道闸，不新增任何状态面。间隔内的触发静默跳过：没有调用
+    // 发生，也就没有可审计的对象（与 #89 口径一致，不写审计行）。
+    if (minIntervalMs > 0 && now() - lastRunAt < effectiveMinIntervalMs()) return false;
     const { trigger, count, chars } = shouldTrigger(service);
     if (!trigger) return false;
-    pendingTimer = setTimeout(() => {
+    // Issue #239（第 4 项，错峰队列）镜像到巩固：命中高峰就不调模型。与蒸馏的差别
+    // 在于巩固是**全局单实例**（蒸馏按会话各挂一个定时器），所以这里只需要一个
+    // deferTimer，且不需要 deferredRuns 那套按会话去重。
+    // baseline 刻意不刷新：阈值继续累积，留到非高峰一次性巩固（一次大 run 比多次
+    // 小 run 省）。审计只登记一行 skip——「为什么不再做梦了」必须对用户可观测。
+    if (isInPeakWindow(new Date(now()), peakHours)) {
+      try {
+        auditPeakSkip?.({ count, chars });
+      } catch (error) {
+        // 记账是 best-effort：写审计行失败只 warn，绝不反噬调度本身。
+        logger?.warn?.(`dsh-mneme dream: peak-hours audit failed: ${String(error)}`);
+      }
+      scheduleDeferredRun(service);
+      return false;
+    }
+    pendingTimer = setTimeoutFn(() => {
       pendingTimer = null;
-      running = true;
-      lastRunAt = Date.now();
-      // Defer the onRun invocation so a synchronous throw cannot escape the
-      // timer callback (which would crash the process) and skip the teardown.
-      // Errors are logged, never swallowed silently. inFlight lets dispose()
-      // await the running consolidation before the caller closes the store.
-      inFlight = Promise.resolve()
-        .then(() => (onRun ? onRun() : Promise.resolve({ ok: true, skipped: true })))
-        .then((result) => {
-          // Refresh the baseline only for a successful run (design §5.3: an
-          // LLM failure must not move the baseline, so the next write can
-          // immediately re-trigger a retry). A `{ok:false}` result or a throw
-          // keeps the old baseline. A run that reports nothing is treated as
-          // completed without failure (no-op hooks / minimal test doubles).
-          if (result && result.ok) {
-            try {
-              baseline = shouldTrigger(service);
-            } catch (error) {
-              // Store closed mid-flight: keep the last known baseline.
-              logger?.warn?.(`dsh-mneme dream: baseline refresh failed: ${String(error)}`);
-            }
-          }
-        })
-        .catch((error) => {
-          logger?.warn?.(`dsh-mneme dream: run failed: ${error?.message ?? error}`);
-          // Failed runs do not refresh the baseline.
-        })
-        .finally(() => {
-          running = false;
-          inFlight = null;
-        });
+      startRun(service);
     }, delayMs);
     return true;
   }
 
+  /**
+   * Issue #239：高峰内择时补跑——挂到「距当前最近的一个高峰结束时刻」，被
+   * peakMaxDeferMinutes 截断时到点照跑（bypassPeak），长高峰不会把巩固饿死。
+   * 定时器 unref：不阻止宿主退出。重复触发不叠加（deferTimer 已在 maybeSchedule
+   * 的守卫里，这里再判一次以防从其它路径进来）。
+   */
+  function scheduleDeferredRun(service) {
+    if (disposed || deferTimer) return;
+    const at = nextOffPeakAt(new Date(now()), peakHours);
+    if (!at) return;
+    const maxDeferMs = (peakMaxDeferMinutes ?? 0) * 60000;
+    let delay = Math.max(0, at.getTime() - now());
+    const capped = maxDeferMs > 0 && delay > maxDeferMs;
+    if (capped) delay = maxDeferMs;
+    deferTimer = setTimeoutFn(() => {
+      deferTimer = null;
+      if (disposed) return;
+      // 截断放行时仍在高峰：不再重新顺延（否则长高峰里会无限顺延，等于把巩固
+      // 关掉）。直接开跑，与蒸馏的 bypassPeak 同口径。
+      if (!capped && isInPeakWindow(new Date(now()), peakHours)) {
+        // 理论上到点已出高峰；时钟跳变/时段串被改小可能落回高峰内，此时再顺延一次。
+        scheduleDeferredRun(service);
+        return;
+      }
+      logger?.info?.(`dsh-mneme dream: peak-hours deferred run firing (capped=${capped}, delayMs=${delay})`);
+      startRun(service);
+    }, delay);
+    deferTimer.unref?.();
+  }
+
+  /**
+   * 真正开跑。抽出来是因为两条路径都要用：写入触发的正常路径，与高峰顺延后的
+   * 补跑路径。onRun 的调用刻意放在 Promise 里——同步抛出的异常若逃出 timer 回调
+   * 会直接崩掉进程并跳过收尾。inFlight 让 dispose() 能等完这一轮再关库。
+   */
+  function startRun(service) {
+    running = true;
+    lastRunAt = now();
+    inFlight = Promise.resolve()
+      .then(() => (onRun ? onRun() : Promise.resolve({ ok: true, skipped: true })))
+      .then((result) => {
+        // Refresh the baseline only for a successful run (design §5.3: an
+        // LLM failure must not move the baseline, so the next write can
+        // immediately re-trigger a retry). A `{ok:false}` result or a throw
+        // keeps the old baseline. A run that reports nothing is treated as
+        // completed without failure (no-op hooks / minimal test doubles).
+        if (result && result.ok) {
+          consecutiveFailures = 0; // Issue #292：成功清零，下次触发回到基数间隔
+          try {
+            baseline = shouldTrigger(service);
+          } catch (error) {
+            // Store closed mid-flight: keep the last known baseline.
+            logger?.warn?.(`dsh-mneme dream: baseline refresh failed: ${String(error)}`);
+          }
+        } else if (result) {
+          // Issue #292：ok:false（LLM 失败 / 空体 / 整单拒绝）计入连败；degraded
+          // 的 run 走 ok:true（LLM 本身成功了，只是决策被部分应用）→ 算成功、清零。
+          // 退避关闭时该计数没有消费者，行为与此前逐字节一致。
+          consecutiveFailures += 1;
+        }
+        // result 为空（no-op 桩 / 最小测试替身）＝完成且无失败：基线与连败计数都不动。
+      })
+      .catch((error) => {
+        logger?.warn?.(`dsh-mneme dream: run failed: ${error?.message ?? error}`);
+        // Failed runs do not refresh the baseline.
+        consecutiveFailures += 1; // Issue #292：抛错同样计入连败
+      })
+      .finally(() => {
+        running = false;
+        inFlight = null;
+      });
+  }
+
   async function dispose() {
     disposed = true;
-    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+    if (pendingTimer) { clearTimeoutFn(pendingTimer); pendingTimer = null; }
+    // Issue #239：高峰顺延定时器同样要清，否则进程关闭后仍会触发一次巩固。
+    if (deferTimer) { clearTimeoutFn(deferTimer); deferTimer = null; }
     // An in-flight run is left to complete naturally (its LLM calls are
     // already paid for and aborting would discard the work). Await it so the
     // caller can close the store only after every write has landed.
@@ -819,8 +919,10 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
   async function runDream(ctx, service, config) {
     const language = langOf(config);
     const logger = ctx.logger;
-    let memories = service.all().filter((m) => !m.archived && m.type !== "summary");
+    let memories = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
     if (memories.length === 0) return { ok: true, applied: 0, skipped: true, summary: false };
+    // Issue #89：开跑时刻既喂给审计行（created_at），也是调度器闸门的时间基准。
+    const dreamStartedAt = Date.now();
     // v0.4.4 滑动窗口：只 consolidation 最近 dreamMaxSnapshotSize 条记忆，
     // 窗口外的旧记忆不进 snapshot（大记忆量下全量快照会撑爆 LLM 输入，配合
     // 隐式 keep 让 run 始终可收敛）。按 updated_at 倒序取前 maxSize 条。
@@ -887,6 +989,9 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
       try {
         service.saveDreamRun({
           id: runId,
+          // Issue #89：审计行记开跑时刻而非完成时刻——lastDreamRunAt 以它做
+          // 重启后的间隔种子，落完成时刻会让 run 耗时白白计入下一轮最小间隔。
+          created_at: new Date(dreamStartedAt).toISOString(),
           status,
           error: result.error,
           provider: route?.provider,
@@ -995,8 +1100,8 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
       maxTokens: config.dreamMaxTokens ?? 4096,
       ...(withEffort && effort ? { reasoningEffort: effort } : {}),
       messages: [
-        { role: "system", content: [{ type: "text", text: consolidationPrompt }], source: { kind: "plugin", plugin: "dsh-mneme" } },
-        { role: "user", content: [{ type: "text", text: listText }], source: { kind: "plugin", plugin: "dsh-mneme" } }
+        { role: "system", content: [{ type: "text", text: consolidationPrompt }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } },
+        { role: "user", content: [{ type: "text", text: listText }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } }
       ]
     }, reportUsage, (reason) => { streamFailure = describeStreamFailure(reason); }));
     };
@@ -1230,8 +1335,8 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
       maxTokens: config.dreamMaxTokens ?? 2048,
       ...(withEffort && effort ? { reasoningEffort: effort } : {}),
       messages: [
-        { role: "system", content: [{ type: "text", text: STR.prompts.dreamSummary[language] }], source: { kind: "plugin", plugin: "dsh-mneme" } },
-        { role: "user", content: [{ type: "text", text: summaryInputs.map((m) => `- ${m.title}: ${m.content}`).join("\n") }], source: { kind: "plugin", plugin: "dsh-mneme" } }
+        { role: "system", content: [{ type: "text", text: STR.prompts.dreamSummary[language] }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } },
+        { role: "user", content: [{ type: "text", text: summaryInputs.map((m) => `- ${m.title}: ${m.content}`).join("\n") }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } }
       ]
     }, reportUsage, (reason) => { summaryStreamFailure = describeStreamFailure(reason); }));
     };
@@ -1244,7 +1349,8 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
     // 模型时 120k token 当场 CONTEXT_WINDOW_EXCEEDED（#258 实测），且随库增长
     // 渐进恶化。倒序排序与 consolidate 窗口同款（updated_at desc, id tiebreak），
     // 保留最新的；0 = 关闭上限（回归全库行为，调用方自担 ctx）。
-    const summaryAll = service.all().filter((m) => !m.archived && m.type !== "summary");
+    // #230：document 指针行不进总览（与 dream/sleep 五个候选池的同款排除）。
+    const summaryAll = service.all().filter((m) => !m.archived && m.type !== "summary" && m.type !== "document");
     const summaryMaxInputs = Number.isInteger(config.dreamSummaryMaxInputs) ? config.dreamSummaryMaxInputs : 0;
     const summaryInputs = summaryMaxInputs > 0 && summaryAll.length > summaryMaxInputs
       ? [...summaryAll]
@@ -1257,6 +1363,7 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
         })
         .slice(0, summaryMaxInputs)
       : summaryAll;
+
     const summaryScope = STR.summaryScope[language](
       summaryInputs.length,
       runId.slice(0, 8),

@@ -233,3 +233,21 @@ test("production search never writes recall_evals, even with the switch on", asy
   assert.deepEqual(store.listRecallEvals(), [], "recall_evals stays untouched by production search");
   store.close();
 });
+
+// ---------------------------------------------------------------- per-source signals in receipt
+
+test("recall receipt: candidates carry per-source signals for offline fusion-weight profiling", async () => {
+  const { store, service } = setup({});
+  const captured = [];
+  service.setRecallRecorder((recall) => captured.push(recall));
+  saveMemory(service, "量子计算入门", "叠加态");
+  const rows = await service.searchMemories("量子", { mode: "hybrid", recordRecall: true });
+  assert.ok(rows.length >= 1, "search returned results");
+  assert.equal(captured.length, 1, "exactly one receipt");
+  for (const c of captured[0].candidates) {
+    assert.ok(c.signals && typeof c.signals === "object", "every candidate carries a signals object");
+    assert.ok("keyword" in c.signals, "raw keyword score present (pre-fusion, unweighted)");
+    assert.ok(!("final" in c.signals), "raw signals only — the fused score already lives in c.score");
+  }
+  store.close();
+});

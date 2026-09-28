@@ -1,5 +1,9 @@
 import { BlockAssembler, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { STR, langOf } from "./lang.js";
+// Issue #315：蒸馏链路的 effort 降级复用巩固侧的 withEffortFallback（拒绝
+// 重试一次不带 effort 字段）与 describeStreamFailure（流失败原因归一）——
+// 三条链路同一降级语义，不另造第二份实现。
+import { withEffortFallback, describeStreamFailure, EFFORT_REJECT_RE } from "./dream.js";
 
 // 编码记忆蒸馏 prompt（codingRetrospect 开启时启用）：在通用记忆之外，额外提取
 // 三类编码专属记忆，专治重复踩坑 / 遗忘被否决方案 / 丢失工程约束。字段仍沿用
@@ -216,7 +220,7 @@ function collectMessages(session, maxChars = 8000, language = "zh", afterSeq, th
   }, undefined);
   return {
     messages: lines.length
-      ? [createUserMessage({ content: [{ type: "text", text: trimTranscript(lines.join("\n"), maxChars) }], source: { kind: "plugin", plugin: "dsh-mneme" } })]
+      ? [createUserMessage({ content: [{ type: "text", text: trimTranscript(lines.join("\n"), maxChars) }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } })]
       : [],
     hasEvents: events.length > 0,
     lastSeq
@@ -256,117 +260,14 @@ function enqueueDistill(task, intervalMs = 0) {
   return run;
 }
 
-// Issue #239（第 4 项，错峰队列）：高峰时段解析与判定。纯函数、可单测——排程判断
-// 不绑死真实时钟，测试才能确定性地覆盖跨零点、多段、星期过滤与非法写法。
-// spec 语法：`[<星期> ]<时段>[,<时段>...]`，星期前缀可省（省 = 每天）：
-//   "09:00-18:00"                        每天 09:00-18:00
-//   "mon-fri 08:00-12:00,14:00-18:00"    工作日两段（ISO 1=周一…7=周日，也认 mon..sun）
-//   "sat,sun 23:00-06:00"                周末跨零点段
-// 时间取宿主本地时区。任一写法非法 → 整串视为未配置（返回 null）：排程是省钱手段，
-// 绝不该因为写错格式把蒸馏停掉。
-const DAY_NAMES = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 7 };
-
-function parseDayToken(token) {
-  const days = new Set();
-  const normalize = (value) => (/^\d$/.test(value) ? Number(value) : DAY_NAMES[value] ?? null);
-  for (const piece of token.split(",")) {
-    const matched = /^([a-z]{3}|\d)(?:-([a-z]{3}|\d))?$/.exec(piece.trim().toLowerCase());
-    if (!matched) return null;
-    const from = normalize(matched[1]);
-    const to = matched[2] === undefined ? from : normalize(matched[2]);
-    if (from === null || to === null || from < 1 || from > 7 || to < 1 || to > 7) return null;
-    // 支持跨周环绕（fri-mon）：从 from 起逐天推进到 to，最多绕一圈。
-    for (let day = from; ; day = (day % 7) + 1) {
-      days.add(day);
-      if (day === to) break;
-    }
-  }
-  return days.size > 0 ? [...days].sort((a, b) => a - b) : null;
-}
-
-/** JS 的 getDay() 是 0=周日…6=周六；这里统一成 ISO（1=周一…7=周日）。 */
-function isoDay(date) {
-  const day = date.getDay();
-  return day === 0 ? 7 : day;
-}
-
-export function parsePeakSpec(spec) {
-  if (typeof spec !== "string" || spec.trim() === "") return null;
-  let rest = spec.trim();
-  let days = null;
-  // 星期前缀 = 第一个空白之前的部分，但**头段含冒号就不是前缀**（那是时段本身，
-  // 例如 "09:00-12:00, 14:00-18:00" 里的逗号空格）。前缀解析失败一律按未配置处理，
-  // 不做猜测——宁可不省，也不能误停。
-  const sep = rest.search(/\s/);
-  if (sep > 0) {
-    const head = rest.slice(0, sep);
-    if (!head.includes(":")) {
-      days = parseDayToken(head);
-      if (days === null) return null;
-      rest = rest.slice(sep).trim();
-    }
-  }
-  const windows = [];
-  for (const part of rest.split(",")) {
-    const matched = /^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$/.exec(part);
-    if (!matched) return null;
-    const [sh, sm, eh, em] = [Number(matched[1]), Number(matched[2]), Number(matched[3]), Number(matched[4])];
-    if (sh > 23 || eh > 23 || sm > 59 || em > 59) return null;
-    const start = sh * 60 + sm;
-    const end = eh * 60 + em;
-    if (start === end) return null;
-    windows.push({ start, end });
-  }
-  return windows.length > 0 ? { days, windows } : null;
-}
-
-/**
- * 该时刻是否落在高峰内。跨零点段（start > end）按「窗口所属的那一天」认星期：
- * `mon-fri 23:00-06:00` 的周六 02:00 属于周五开的那个窗口，仍算高峰。
- */
-export function isInPeakWindow(date, spec) {
-  const parsed = parsePeakSpec(spec);
-  if (!parsed) return false;
-  const minutes = date.getHours() * 60 + date.getMinutes();
-  const today = isoDay(date);
-  const yesterday = today === 1 ? 7 : today - 1;
-  const allowed = (day) => !parsed.days || parsed.days.includes(day);
-  return parsed.windows.some(({ start, end }) => {
-    if (start < end) return minutes >= start && minutes < end && allowed(today);
-    return (minutes >= start && allowed(today)) || (minutes < end && allowed(yesterday));
-  });
-}
-
-/**
- * 高峰内则返回「距当前最近的一个高峰结束时刻」（择时补跑用），否则 null。
- * 落在多个时段重叠处时取最早结束的那个——早跑不亏，晚跑才亏。
- */
-export function nextOffPeakAt(date, spec) {
-  const parsed = parsePeakSpec(spec);
-  if (!parsed) return null;
-  const minutes = date.getHours() * 60 + date.getMinutes();
-  const today = isoDay(date);
-  const yesterday = today === 1 ? 7 : today - 1;
-  const allowed = (day) => !parsed.days || parsed.days.includes(day);
-  let bestDelta = null;
-  const consider = (delta) => {
-    if (bestDelta === null || delta < bestDelta) bestDelta = delta;
-  };
-  for (const { start, end } of parsed.windows) {
-    if (start < end) {
-      if (minutes >= start && minutes < end && allowed(today)) consider(end - minutes);
-      continue;
-    }
-    if (minutes >= start && allowed(today)) consider((1440 - minutes) + end);
-    else if (minutes < end && allowed(yesterday)) consider(end - minutes);
-  }
-  if (bestDelta === null) return null;
-  const at = new Date(date.getTime());
-  at.setSeconds(0, 0);
-  at.setMinutes(at.getMinutes() + bestDelta);
-  return at;
-}
-
+// Issue #239（第 4 项，错峰队列）：高峰时段解析与判定已抽到独立零依赖模块
+// src/peak-hours.js（PR #320 review：#316 后 summarize 反向依赖 dream，dream 镜像
+// 错峰再 import 本文件会成真循环；时段调度本就不是蒸馏私有语义）。这里 re-export
+// 兼容既有调用方与测试（test/summarize.test.js 从本文件 import），零改动。
+// 注意 re-export 不引入本地作用域——本文件 331/387 行仍调用这两个函数，
+// import + re-export 两行都要。
+import { parsePeakSpec, isInPeakWindow, nextOffPeakAt } from "./peak-hours.js";
+export { parsePeakSpec, isInPeakWindow, nextOffPeakAt };
 export function createSummarizer(ctx, service, config, deps = {}) {
   if (!config.autoSummarize) return { dispose: () => {} };
 
@@ -403,6 +304,24 @@ export function createSummarizer(ctx, service, config, deps = {}) {
     } catch (auditError) {
       ctx.logger?.warn?.(`dsh-mneme: llm audit write failed: ${String(auditError)}`);
     }
+  }
+
+  function persistCursor(sessionId, nextSeq) {
+    if (!Number.isFinite(nextSeq)) return;
+    if (typeof service.setDistillCursor !== "function") {
+      // 第三方宿主拿旧版 service 构造时没有持久化游标能力：降级为内存游标
+      // （#274 之前的行为），本进程内不重复蒸馏，重启后窗口重放由
+      // saveWithDedupe 三元组兜底。方法存在但抛错仍向上传播——那是
+      // 「写失败须回滚」的恰一次语义，不能吞（见 summarize.test.js 回滚用例）。
+      ctx.logger?.warn?.("dsh-mneme: service.setDistillCursor unavailable, distill cursor falls back to in-memory");
+      return;
+    }
+    service.setDistillCursor(sessionId, nextSeq);
+  }
+
+  function commitCursor(sessionId, nextSeq) {
+    persistCursor(sessionId, nextSeq);
+    if (Number.isFinite(nextSeq)) lastDistilledSeq.set(sessionId, nextSeq);
   }
 
   /**
@@ -500,7 +419,10 @@ export function createSummarizer(ctx, service, config, deps = {}) {
     let abortedRun = false;
     try {
       if (!route) return;
-      const previousSeq = lastDistilledSeq.get(session.id);
+      const persistedCursor = typeof service.getDistillCursor === "function"
+        ? service.getDistillCursor(session.id)
+        : undefined;
+      const previousSeq = persistedCursor?.last_seq ?? lastDistilledSeq.get(session.id);
       const triggerSeq = eventSeq(triggerEvent);
       // 只读取上次成功游标之后、当前 turn/end 之前的事件。旧版 snapshotEvents
       // 即使忽略范围参数，collectMessages 仍会按事件 seq 二次过滤。
@@ -519,7 +441,7 @@ export function createSummarizer(ctx, service, config, deps = {}) {
       if (!collected.messages.length) {
         // 没有可蒸馏的公开文本也算成功消费当前事件窗口，避免每个 turn/end
         // 都重新扫描同一批无内容事件；没有 seq 时则不提交不可验证的游标。
-        if (Number.isFinite(nextSeq)) lastDistilledSeq.set(session.id, nextSeq);
+        commitCursor(session.id, nextSeq);
         return;
       }
       const messages = collected.messages;
@@ -536,7 +458,7 @@ export function createSummarizer(ctx, service, config, deps = {}) {
           0
         );
         if (distillChars < minWindowChars) {
-          if (Number.isFinite(nextSeq)) lastDistilledSeq.set(session.id, nextSeq);
+          commitCursor(session.id, nextSeq);
           writeAudit({
             timestamp: new Date().toISOString(),
             model_id: route ? `${route.provider}:${route.model}` : "unknown",
@@ -563,12 +485,17 @@ export function createSummarizer(ctx, service, config, deps = {}) {
         };
       }
 
+      // Issue #315：蒸馏思考强度。'none'/未配置都不发送字段（服务商默认生效，
+      // 行为与历史版本一致）；off/low/medium/high 原样传递。
+      const summarizeEffort = config.summarizeReasoningEffort;
+      const withEffort = typeof summarizeEffort === "string" && summarizeEffort !== "none";
+
       const options = {
         provider: route.provider,
         model: route.model,
         purpose: "summarization",
         messages: [
-          { role: "system", content: [{ type: "text", text: config.codingRetrospect ? STR.prompts.codingSummary[langOf(config)] : STR.prompts.summary[langOf(config)] }], source: { kind: "plugin", plugin: "dsh-mneme" } },
+          { role: "system", content: [{ type: "text", text: config.codingRetrospect ? STR.prompts.codingSummary[langOf(config)] : STR.prompts.summary[langOf(config)] }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } },
           ...messages
         ],
         signal: controller.signal
@@ -576,15 +503,30 @@ export function createSummarizer(ctx, service, config, deps = {}) {
       // 智能调速器：整段蒸馏 LLM 调用进全局串行队列，按间隔分批放行；429 时
       // 指数退避自动重试，全程对用户透明，不把 429 错误码直接抛出去。
       const intervalMs = config.distillRateLimitIntervalMs ?? 1000;
-      const { text, assembledText, aborted } = await enqueueDistill(async () => {
+      // Issue #315：流式失败原因暂存槽。蒸馏的流失败以 aborted 结果而非 throw
+      // 返回，withEffortFallback 靠它甄别「effort 被拒收」型 aborted（dream 侧
+      // runNarratives 的 streamFailure 同款模式）。
+      let streamFailure = "";
+      const runDistill = (withEffort) => {
+        streamFailure = "";
+        return enqueueDistill(async () => {
         const retries = config.distillRateLimitRetries ?? 3;
         const baseDelayMs = config.distillRateLimitBaseDelayMs ?? 1000;
+        // 每次尝试独立拼 effort 字段：降级重试（withEffort=false）必须真的
+        // 不带 reasoningEffort，不能复用带字段的同一 options 对象。
+        const callOptions = withEffort && summarizeEffort
+          ? { ...options, reasoningEffort: summarizeEffort }
+          : options;
         for (let attempt = 0; ; attempt++) {
+          // 每次尝试重置审计状态：effort 拒收/429 的失败 attempt 会把 status 置
+          // error，若后续重试成功，审计必须记录最终成功而不是残留第一次的失败
+          // （否则「摘要成功但审计报失败」，污染 llm_audit_logs 统计）。
+          if (audit) audit.status = "success";
           const assembler = new BlockAssembler();
           let text = "";
           let aborted = false;
           try {
-            for await (const chunk of ctx.llm.stream(options)) {
+            for await (const chunk of ctx.llm.stream(callOptions)) {
               if (STREAM_CHUNK_TYPES.has(chunk.type)) assembler.push(toProtocolChunk(chunk));
               if (chunk.type === "text-delta") {
                 text += chunk.text ?? chunk.delta ?? "";
@@ -606,6 +548,9 @@ export function createSummarizer(ctx, service, config, deps = {}) {
                   if (isRateLimited(chunk.reason ?? chunk)) {
                     throw Object.assign(new Error("rate limited"), { status: 429 });
                   }
+                  // Issue #315：把失败原因原样留给外层的 effort 甄别
+                  // （withEffortFallback 只认「effort 被拒收」型失败）。
+                  streamFailure = describeStreamFailure(chunk.reason ?? chunk);
                   if (audit) {
                     audit.status = "error";
                     audit.errorMessage = `llm stream ${reasonKind}`;
@@ -645,6 +590,21 @@ export function createSummarizer(ctx, service, config, deps = {}) {
           }
         }
       }, intervalMs);
+      };
+      // Issue #315：effort 被拒收时自动去掉字段重试一次（dream/sleep/entity
+      // 同一降级策略，withEffortFallback 共享）。蒸馏的流失败以 aborted 结果
+      // 而非 throw/undefined 返回，因此甄别在这里做：effort 型失败折叠成
+      // undefined，让 withEffortFallback 走 streamFailure 甄别分支触发重试；
+      // 非 effort 的 aborted 原样返回，仍走既有的 abortedRun 路径。
+      const result = await withEffortFallback(
+        ctx,
+        summarizeEffort,
+        () => runDistill(withEffort).then((r) =>
+          (r?.aborted && EFFORT_REJECT_RE.test(streamFailure)) ? undefined : r),
+        () => runDistill(false),
+        () => streamFailure
+      );
+      const { text, assembledText, aborted } = result ?? { text: "", assembledText: "", aborted: true };
       if (aborted) {
         abortedRun = true;
         return;
@@ -712,7 +672,11 @@ export function createSummarizer(ctx, service, config, deps = {}) {
               ...(dup ? { _mergeInto: dup.memory.id } : {})
             });
           }
+          persistCursor(session.id, nextSeq);
         });
+      } else {
+        // 空数组是合法成功：没有记忆写入，但本次事件窗口仍然应被持久消费。
+        persistCursor(session.id, nextSeq);
       }
       if (audit && (capped > 0 || deduped > 0)) {
         audit.metadata = {
@@ -724,6 +688,12 @@ export function createSummarizer(ctx, service, config, deps = {}) {
       // 记忆写入和解析都成功后才提交窗口；流失败、中止、解析失败或写入异常
       // 都会在此之前退出，从而保留窗口供下一次重试。
       if (Number.isFinite(nextSeq)) lastDistilledSeq.set(session.id, nextSeq);
+    } catch (error) {
+      if (audit) {
+        audit.status = "error";
+        audit.errorMessage = String(error?.message ?? error);
+      }
+      throw error;
     } finally {
       // Issue #127：aborted（会话关闭 / 插件 dispose）不占间隔，避免误伤该会话的
       // 下一次蒸馏；其余情况（含失败）的打点保留，与 dreamMinIntervalMinutes 一致。

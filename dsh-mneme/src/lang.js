@@ -75,6 +75,12 @@ export const STR = {
     zh: (max, len, id) => `〔已截断：上限 ${max}，原 ${len} 字符；全文用 memory_get "${id}" 查看〕`,
     en: (max, len, id) => `[truncated: limit ${max}, original ${len} chars; memory_get "${id}" for full text]`
   },
+  // Issue #249（第一批）：pin 池超预算时的如实标注——分层不等于丢弃，也不允许
+  // 静默省略未展示条数（agent 才知道库里的约束不止这几条，需按需 memory_search）。
+  pinnedOverflow: {
+    zh: (n) => `〔约束/偏好类另有 ${n} 条未展示〕`,
+    en: (n) => `[${n} more constraint/preference entries not shown]`
+  },
   userSettingsHeader: {
     zh: "[用户设置] 来自 dsh-mneme 的用户画像与规则：",
     en: "[User settings] Profile and rules from dsh-mneme:"
@@ -190,12 +196,23 @@ export const STR = {
 
   // --- mirror.js：镜像文件标签（渲染随实例语言；解析两种语言都认） ----------------
   mirrorLabel: {
-    zh: { type: "类型", importance: "重要性", tags: "标签", updated: "更新时间", source: "来源" },
-    en: { type: "Type", importance: "Importance", tags: "Tags", updated: "Updated", source: "Source" }
+    zh: { type: "类型", importance: "重要性", tags: "标签", updated: "更新时间", source: "来源", scope: "作用域", sensitivity: "敏感度" },
+    en: { type: "Type", importance: "Importance", tags: "Tags", updated: "Updated", source: "Source", scope: "Scope", sensitivity: "Sensitivity" }
   },
   mirrorHeader: {
-    zh: (name) => `# ${name} — dsh-mneme 镜像\n\n<!-- 手工编辑此文件会被合并回记忆库（人工优先）。 -->\n\n`,
-    en: (name) => `# ${name} — dsh-mneme mirror\n\n<!-- Manual edits to this file are merged back into the memory store (human edits win). -->\n\n`
+    zh: (name) => `# ${name} — dsh-mneme 镜像\n\n<!-- 条目标题与正文可编辑，会被合并回记忆库（人工优先）；文件头与条目元数据行由机器维护，改动会在下次同步时被覆盖。 -->\n\n`,
+    en: (name) => `# ${name} — dsh-mneme mirror\n\n<!-- Entry titles and bodies are editable and merged back into the memory store (human edits win); the file header and entry metadata lines are machine-owned and get overwritten on the next sync. -->\n\n`
+  },
+  // document 的镜像只有指针行（#296 第二批）：没有可编辑的正文，手工改动一律被
+  // 下次同步覆盖——所以不能复用上面那句「可编辑、会被合并回记忆库」。
+  mirrorReadonlyHeader: {
+    zh: (name) => `# ${name} — dsh-mneme 只读视图\n\n<!-- 只含指针行：id + 标题 + 摘要首句 + 文件路径，不含正文。正文在路径指向的文件里，批注请写进记忆库；本文件由机器维护，手工改动会在下次同步时被覆盖。 -->\n\n`,
+    en: (name) => `# ${name} — dsh-mneme read-only view\n\n<!-- Pointer rows only: id + title + first sentence of the summary + file path, never the full text. The document itself lives at that path, annotations belong in the memory store, and this file is machine-owned: hand edits are overwritten on the next sync. -->\n\n`
+  },
+  // documentDir 的 index.md（#296 第二批）：整文件机器所有、可从库重建。
+  documentIndexHeader: {
+    zh: () => "# document 索引 — dsh-mneme\n\n<!-- 整文件机器所有，可从记忆库随时重建（所以这里不写生成时间）；要批注请写进记忆库（memory_save）。managed = 文件在 documentDir 内。 -->\n\n",
+    en: () => "# document index — dsh-mneme\n\n<!-- Machine-owned as a whole and rebuildable from the memory store at any time (which is why it carries no generation timestamp). Annotations belong in the memory store (memory_save). managed = the file sits inside documentDir. -->\n\n"
   },
 
   prompts: PROMPTS

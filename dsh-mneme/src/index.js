@@ -1,20 +1,27 @@
 import { createStore } from "./store.js";
 import { createMirror, TYPE_FILE } from "./mirror.js";
+import { createDocumentIndex } from "./document-index.js";
+import { resolveDocumentDir } from "./document.js";
 import { createService } from "./service.js";
+// #254 写入准入（第一阶段只计量，不拦截）：见 src/write-admission.js 的文件头。
+import { createWriteAdmission } from "./write-admission.js";
 import { createTools } from "./tools.js";
 import { createInjector } from "./inject.js";
+import { createContinuityRescue } from "./continuity.js";
 import { createSummarizer } from "./summarize.js";
 import { createDreamScheduler } from "./dream.js";
 import { createSleepScheduler, runSleep } from "./dream/sleep.js";
 import { createApi } from "./api.js";
 import { createStandaloneApi } from "./api-standalone.js";
+// #275 存储生命周期第一批：无损回收（手动入口，不挂启动路径）。
+import { createMaintenance } from "./maintenance.js";
 import { createSettings } from "./settings.js";
 import { createCommandManager } from "./commands.js";
 import { createEmbedder } from "./embedding.js";
 import { createEmbedderByProvider } from "./local-embedder.js";
 import { LocalReranker } from "./reranker.js";
 import { createVectorIndex } from "./vector-index.js";
-import { Config, applyLightModePreset } from "./config.js";
+import { Config, applyLightModePreset, injectChildEnabled } from "./config.js";
 import { langOf } from "./lang.js";
 import { extractEntities } from "./entities/extractor.js";
 import { mkdirSync } from "node:fs";
@@ -43,7 +50,15 @@ export { Config };
 // unit-testable; the extractor only ever sees a callLLM(messages, options)
 // => Promise<string>. The route always carries a real provider/model (dsh-llm
 // GenerateOptions requires both) — never a bare stream.
-export function createEntityStreamAdapter({ llm, agentDefaultModel, logger }) {
+//
+// Issue #250: it also accounts for itself. Entity extraction is the background
+// LLM path that runs on every memory write, yet it never reached
+// llm_audit_logs — the adapter only ever held an llm handle, so it had no way
+// to call service.saveLlmAudit. It now takes service (+ config for the shared
+// llmAudit.enabled gate) and writes one row per stream attempt, matching the
+// contract of runAuditedLlm in dream.js: a rejected effort attempt records its
+// own error row and the retry records its own success row.
+export function createEntityStreamAdapter({ llm, agentDefaultModel, logger, service, config }) {
   return async function streamEntityText(messages, options = {}) {
     let route = {};
     if (options.provider) route.provider = options.provider;
@@ -58,8 +73,38 @@ export function createEntityStreamAdapter({ llm, agentDefaultModel, logger }) {
       } catch { /* fall through to whatever route we already have */ }
     }
     const effort = options.reasoningEffort;
+    // 没有解析出 provider/model 就没有可归属的模型——与 dream 的 resolveRoute
+    // 无路由早退同口径，那种情况不写审计行。
+    const modelId = route.provider && route.model ? `${route.provider}:${route.model}` : "";
     const tryStream = (withEffort) => {
       let text = "";
+      let inputTokens = 0;
+      let outputTokens = 0;
+      const startedAt = Date.now();
+      const timestamp = new Date(startedAt).toISOString();
+      // 记账是 best-effort：写审计行失败只 warn，绝不反噬抽取本身（CONTRIBUTING
+      // 的 fail-safe 硬约定）。
+      const writeAudit = (status, errorMessage) => {
+        if (config?.llmAudit?.enabled === false || !modelId || typeof service?.saveLlmAudit !== "function") return;
+        try {
+          service.saveLlmAudit({
+            timestamp,
+            trigger_source: "entityExtract",
+            operation_type: "entity_extract",
+            model_id: modelId,
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            total_tokens: inputTokens + outputTokens,
+            cost_usd: 0,
+            duration_ms: Date.now() - startedAt,
+            status,
+            error_message: errorMessage,
+            related_memory_ids: []
+          });
+        } catch (auditError) {
+          logger?.warn?.(`dsh-mneme: entity extraction llm audit write failed: ${String(auditError)}`);
+        }
+      };
       return (async () => {
         for await (const chunk of llm.stream({
           ...route,
@@ -68,11 +113,26 @@ export function createEntityStreamAdapter({ llm, agentDefaultModel, logger }) {
           messages
         })) {
           if (chunk.type === "text-delta" && typeof chunk.text === "string") text += chunk.text;
-          if (chunk.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) return undefined;
+          // DSH 的 StreamChunk 契约把用量嵌在 chunk.usage（TokenUsage）；兼容直接
+          // 平铺在 chunk 上的旧形态。归一放在这里，下面只需认平铺形状——与
+          // dream.js 的 streamText 同一处理。
+          if (chunk.type === "usage") {
+            const u = chunk.usage ?? chunk;
+            const i = u.input_tokens ?? u.inputTokens ?? u.prompt_tokens ?? u.promptTokens;
+            const o = u.output_tokens ?? u.outputTokens ?? u.completion_tokens ?? u.completionTokens;
+            if (Number.isFinite(i)) inputTokens = i;
+            if (Number.isFinite(o)) outputTokens = o;
+          }
+          if (chunk.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) {
+            writeAudit("error", "llm stream aborted or errored");
+            return undefined;
+          }
         }
+        writeAudit("success", null);
         return text;
       })().catch((err) => {
         logger?.warn?.(`[dsh-mneme] entity extraction llm stream failed: ${String(err)}`);
+        writeAudit("error", String(err?.message ?? err));
         return undefined;
       });
     };
@@ -140,15 +200,6 @@ export const apply = (ctx, config) => {
   try {
     store.deleteOldFailures(new Date(Date.now() - 90 * 86400000).toISOString());
   } catch { /* non-fatal */ }
-  // Bug8: enforce llm_audit_logs retention on boot (config.llmAudit.retentionDays,
-  // default 90). Best-effort like the failure prune — the audit trail is
-  // bookkeeping and a failed purge must never block plugin boot.
-  try {
-    if (rawCfg.llmAudit?.enabled !== false) {
-      const retentionMs = Number.isInteger(rawCfg.llmAudit?.retentionDays) ? rawCfg.llmAudit.retentionDays : 90;
-      store.deleteOldLlmAudits(new Date(Date.now() - retentionMs * 86400000).toISOString());
-    }
-  } catch { /* non-fatal */ }
 
   // User-configurable settings (profile, rules, panel mode, standalone API
   // token) share the same SQLite file in dedicated tables, isolated from
@@ -187,10 +238,46 @@ export const apply = (ctx, config) => {
     cfg[objKey] = { ...(cfg[objKey] ?? {}), ...sub };
   }
 
+  // Bug8 的启动期清理放在装配之后：面板把 llmAudit.* 写进 kv、经 nestedFlags 合进
+  // cfg，而写入侧（dream / summarize / 写入准入）读的都是装配后的 cfg——清理若读
+  // rawCfg，面板改了保留期它不认，更糟的是「开不开审计」与写入侧可能取到不同的值
+  // （raw 说关 → 不清理，cfg 说开 → 照写，审计表就无保留期地长）。保留期默认 90 天、
+  // 失败只 warn，与失败表清理同款：账本清理绝不许挡住插件启动。
+  try {
+    if (cfg.llmAudit?.enabled !== false) {
+      const retentionMs = Number.isInteger(cfg.llmAudit?.retentionDays) ? cfg.llmAudit.retentionDays : 90;
+      store.deleteOldLlmAudits(new Date(Date.now() - retentionMs * 86400000).toISOString());
+    }
+  } catch { /* non-fatal */ }
+
   // 记忆语言（memory.language）：本实例逐层传入 inject / summarize / dream /
   // sleep / mirror，多实例（如 agent preset 内挂载）互不影响。
   const mirror = createMirror(memoryDir, langOf(cfg));
-  const service = createService({ store, mirror, config: cfg, logger: ctx.logger });
+
+  // #296 第二批：managed 文档目录。解析与 memoryDir 同一套（空 = 跟随 memoryDir 的
+  // <memoryDir>/documents/，~ 展开，相对路径落在 memoryDir 下）。索引对象总是建：
+  // 闸关时它只承担「清掉陈旧 index.md」这一件事，与 documents.md 在闸关时被镜像删
+  // 掉同一口径。建目录与写索引失败都只 warn，不阻断插件加载（它们是机器产物）。
+  const documentDir = resolveDocumentDir(memoryDir, cfg.documentDir);
+  const documentIndex = createDocumentIndex(documentDir, langOf(cfg));
+  if (cfg.documentMemoryEnabled === true) {
+    const ensured = documentIndex.ensure();
+    if (!ensured.ok) {
+      ctx.logger?.warn?.(`[dsh-mneme] documentDir is not writable: ${documentDir}: ${ensured.error}`);
+    }
+    // 启动即渲染一次：索引不该等到第一次业务写才存在（删掉它之后重启也能自愈）。
+    const synced = documentIndex.sync(store.list({ type: "document", limit: null }));
+    if (!synced.ok) ctx.logger?.warn?.(`[dsh-mneme] document index sync failed: ${synced.error}`);
+  } else {
+    documentIndex.remove();
+  }
+
+  // 写入准入实例：本批次只做计量（决策恒放行、写审计行），所以不需要新开关——它
+  // 不改变任何写入行为，也不新增拦截分支；既有的 llmAudit.enabled 关掉时它同样
+  // 不写（那个开关连审计行的启动期清理一起关掉）。第二阶段把拦截打开时才按仓库
+  // 惯例引入 opt-in 默认关的配置键，届时只改这一个实例的构造与 service 的调用点。
+  const writeAdmission = createWriteAdmission({ store, config: cfg, logger: ctx.logger });
+  const service = createService({ store, mirror, config: cfg, logger: ctx.logger, documentIndex, writeAdmission });
 
   // F-NEW-03: if the mirror sync failed last run (persisted dirty state), retry
   // a safe re-render at boot so a stale mirror converges without needing a
@@ -273,6 +360,9 @@ export const apply = (ctx, config) => {
         dimension: cfg.localEmbedDimension,
         device: cfg.localEmbedDevice,
         batchSize: cfg.localEmbedBatchSize,
+        // 池化方式必须与模型的训练口径一致（BGE 系 = CLS）。它既进 embed() 的调用，
+        // 也进 modelHash —— 池化改了就是换向量空间，既有索引会被判失配并重建。
+        pooling: cfg.localEmbedPooling,
         cacheDir: cfg.embedModelCacheDir,
         runtimeDir: cfg.runtimeDir,
         // #188：embedModelMirror 接成 transformers 的下载镜像（此前死配置）。
@@ -401,8 +491,37 @@ export const apply = (ctx, config) => {
       thresholdChars: cfg.dreamThresholdChars,
       delayMs: cfg.dreamDelayMs,
       minIntervalMs: (cfg.dreamMinIntervalMinutes ?? 0) * 60000,
+      // Issue #292：连续失败指数退避（opt-in，默认关 = 行为不变）。
+      failureBackoff: cfg.autoDreamFailureBackoff === true,
       logger: ctx.logger,
       semantic: { embedder, vectorIndex },
+      lastRunAtSeed: store.lastDreamRunAt("auto"),
+      // Issue #239（第 4 项）镜像到巩固：高峰期不做梦，顺延到最近的高峰结束时刻。
+      peakHours: cfg.dreamPeakHours ?? "",
+      peakMaxDeferMinutes: cfg.dreamPeakMaxDeferMinutes ?? 120,
+      // 跳过时的审计行在这里落地（调度器只拿到 service，拿不到 config 的
+      // llmAudit 开关与巩固模型路由）。口径与 runAuditedLlm 一致：审计关掉就
+      // 不写；写失败只 warn，绝不反噬调度（CONTRIBUTING 的 fail-safe 硬约定）。
+      auditPeakSkip: ({ count, chars }) => {
+        if (cfg?.llmAudit?.enabled === false || typeof service?.saveLlmAudit !== "function") return;
+        const modelId = cfg.dreamProvider && cfg.dreamModel ? `${cfg.dreamProvider}:${cfg.dreamModel}` : "";
+        service.saveLlmAudit({
+          timestamp: new Date().toISOString(),
+          trigger_source: "autoDream",
+          operation_type: "dream_consolidate",
+          model_id: modelId,
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          cost_usd: 0,
+          duration_ms: 0,
+          status: "skipped",
+          error_message: "peak-hours",
+          related_memory_ids: [],
+          // 观测用：跳过时窗口里积了多少（阈值继续累积，不是丢弃）。
+          metadata: JSON.stringify({ count, chars })
+        });
+      },
       onRun: () => (dream ? dream.runDream(ctx, service, cfg) : Promise.resolve({ ok: true, skipped: true }))
     });
     service.setDreamHook(() => dream.maybeSchedule(service));
@@ -419,6 +538,7 @@ export const apply = (ctx, config) => {
       service,
       config: cfg,
       logger: ctx.logger,
+      lastRunAtSeed: store.lastDreamRunAt("sleep"),
       onRun: (signal) => (sleep ? runSleep(ctx, service, cfg, ctx.logger, { embedder, vectorIndex }, signal) : Promise.resolve({ ok: true, skipped: true }))
     });
     service.setSleepHook(() => sleep.noteWrite());
@@ -442,7 +562,11 @@ export const apply = (ctx, config) => {
       const streamEntityText = createEntityStreamAdapter({
         llm: ctx.llm,
         agentDefaultModel: ctx.agentDefaultModel,
-        logger: ctx.logger
+        logger: ctx.logger,
+        // Issue #250: the adapter needs service to write its llm_audit_logs row
+        // (it never had it) and config for the shared llmAudit.enabled gate.
+        service,
+        config: cfg
       });
       service.setEntityExtractor((memory) =>
         extractEntities(memory, { store, config: cfg, callLLM: streamEntityText, logger: ctx.logger })
@@ -463,6 +587,13 @@ export const apply = (ctx, config) => {
   ctx.inject(["systemPrompt"], (promptCtx) => {
     if (cfg.autoInject) disposers.push(createInjector(promptCtx, service, settings, cfg));
   });
+
+  // #249 N3：压缩边缘双落点。触发靠宿主自己落的压缩事件（订阅 + pre-step 追加），
+  // 不需要 systemPrompt / tools 的任何能力，所以不塞进上面的 inject 回调；父／子
+  // 闸门在挂载点判一次，与 inject.js 共用同一个 injectChildEnabled 判据。
+  if (cfg.autoInject && injectChildEnabled(cfg, "continuityRescueEnabled")) {
+    disposers.push(createContinuityRescue(ctx, store));
+  }
 
   ctx.inject(["tools"], (toolsCtx) => {
     disposers.push(createTools(toolsCtx, service, cfg, embedder));
@@ -487,13 +618,19 @@ export const apply = (ctx, config) => {
     disposers.push(api.dispose);
   }
 
+  // #275 存储生命周期第一批：无损回收的手动入口。刻意不挂启动路径、不接定时器——
+  // 这一步是不可逆的内容丢弃，只由人显式触发（`dsh-mneme reclaim`）。实例在这里建、
+  // 在 standalone API 上暴露，是为了让 CLI 能在插件进程内跑（VACUUM 要排他锁，跟宿主
+  // 抢锁的那条路走不通）。
+  const maintenance = createMaintenance({ store, config: cfg, logger: ctx.logger });
+
   // Standalone external API (v0.7.12): plain node:http server for ecosystem
   // integrations outside the DSH host. Persisted external_api settings win
   // over the bundle config (enabled/port); the Bearer token lives in the same
   // kv and is auto-generated on first boot by createStandaloneApi. Binding a
   // non-loopback host is the operator's documented responsibility.
   if ((settings.getExternalApi?.()?.enabled ?? cfg.externalApiEnabled) === true) {
-    const standalone = createStandaloneApi({ service, store, config: cfg, logger: ctx.logger, settings });
+    const standalone = createStandaloneApi({ service, store, config: cfg, logger: ctx.logger, settings, maintenance });
     disposers.push(() => standalone.server.close());
     standalone.ready.catch((error) => {
       ctx.logger?.warn?.(`[dsh-mneme] standalone API failed to start: ${String(error)}`);

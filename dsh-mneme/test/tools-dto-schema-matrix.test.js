@@ -18,7 +18,7 @@
 //      绿着却毫无保护力（校验器被换掉、schema 被放开都会静默通过）。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateJsonSchemaValue } from "@deepseek-ai/dsh-tools";
@@ -37,12 +37,15 @@ const TOOL_NAMES = [
   "memory_delete",
   "memory_forget",
   "memory_archive",
+  "memory_register_document",
   "memory_runtime"
 ];
 
 function setup(config = {}) {
   const store = createStore(":memory:");
-  const service = createService({ store, mirror: null, config: {} });
+  // config 同时喂 service 与 tools：#230 起 registerDocument 的闸在 service
+  // 侧读同一个 config，只喂 tools 会让注册工具在矩阵里永远抛 disabled。
+  const service = createService({ store, mirror: null, config });
   const registered = [];
   const ctx = {
     tools: {
@@ -81,16 +84,17 @@ function assertMatches(byName, name, value, label) {
 // 都要真实落一行，否则 B 层会（正确地）报「声明了却从未产出」。
 function seedShapes(store) {
   const rows = [];
-  const push = (over) =>
-    rows.push(
-      store.save({
-        type: "project",
-        title: `shape-${rows.length}`,
-        content: `形态 ${rows.length} 的正文`,
-        source: "test",
-        ...over
-      })
-    );
+  const push = (over) => {
+    const memory = {
+      type: "project",
+      title: `shape-${rows.length}`,
+      content: `形态 ${rows.length} 的正文`,
+      source: "test",
+      ...over
+    };
+    // #230：document 走存储层唯一铸造口（通用 save 拒绝 document）。
+    rows.push(memory.type === "document" ? store.saveDocument(memory) : store.save(memory));
+  };
   push({}); // 极简形态：只有基础键
   push({ sensitivity: "personal" });
   push({ occurred_at: "2026-09-15T00:00:00Z" });
@@ -107,6 +111,8 @@ function seedShapes(store) {
     tags: ["shape", "annotated"],
     importance: 5
   });
+  // #230：document 指针行——doc_path 是 toApiList 的条件键，必须有一行真的产出它。
+  push({ type: "document", title: "shape-doc", content: "指针行摘要", doc_path: "X:\\seed\\doc.md", evidence: [] });
   return rows;
 }
 
@@ -115,8 +121,8 @@ test("工具矩阵与 TOOL_NAMES 清单一致（新增工具必须补进矩阵�
   assert.deepEqual(Object.keys(byName).sort(), [...TOOL_NAMES].sort());
 });
 
-test("A 实跑：9 个工具每个可安全触达的分支，真实返回 ⊆ 声明的 output schema", async () => {
-  const { store, service, byName } = setup();
+test("A 实跑：10 个工具每个可安全触达的分支，真实返回 ⊆ 声明的 output schema", async () => {
+  const { store, service, byName } = setup({ documentMemoryEnabled: true });
   const shapes = seedShapes(store);
   const annotated = shapes[shapes.length - 1];
   const plain = shapes[0];
@@ -208,6 +214,28 @@ test("A 实跑：9 个工具每个可安全触达的分支，真实返回 ⊆ �
     rmSync(emptyRuntimeDir, { recursive: true, force: true });
   }
 
+  // --- memory_register_document（#230）：created 分支 + evidence 求交（含丢弃）。
+  // superseded 分支由 document.test.js 覆盖；flag 关闭的拒绝路径同样在那边。
+  const docDir = mkdtempSync(join(tmpdir(), "mneme-230-doc-"));
+  const docFile = join(docDir, "report.md");
+  try {
+    writeFileSync(docFile, "# report\n\nbody", "utf8");
+    const reg = await drive(byName, "memory_register_document", {
+      path: docFile,
+      title: "matrix-doc",
+      summary: "指针行摘要",
+      tags: ["matrix"],
+      evidence: [plain.id, "fabricated-230"]
+    });
+    assert.equal(reg.action, "created");
+    assert.equal(reg.evidence_kept, 1);
+    assert.equal(reg.evidence_dropped, 1);
+    assert.equal(reg.degraded, true);
+    note("memory_register_document");
+  } finally {
+    rmSync(docDir, { recursive: true, force: true });
+  }
+
   assert.deepEqual([...driven].sort(), [...TOOL_NAMES].sort(), "每个工具都必须至少被驱动一次（矩阵不允许空缺）");
 });
 
@@ -257,7 +285,7 @@ test("B' search / list / get 三个消费方共用同一份 item schema（#184 �
   }
 });
 
-test("C 结构：全部 9 个工具的 output schema 闭合、required ⊆ properties、每项带 type", () => {
+test("C 结构：全部 10 个工具的 output schema 闭合、required ⊆ properties、每项带 type", () => {
   const { byName } = setup();
   for (const name of TOOL_NAMES) {
     const schema = byName[name].output.schema;

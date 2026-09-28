@@ -7,7 +7,80 @@ window.__ModuleLoader__.load({
     let react = require("react");
     let primitives = require("@deepseek-ai/dsh-client-ui-primitives");
     let { useState, useEffect, useCallback, useRef } = react;
-    const IconArchiveOutline20 = primitives.IconArchiveOutline20;
+
+    // #178 无障碍批次一：aria-live 网络。模块级单例 polite live region +
+    // announce()：面板所有瞬时反馈（保存成功/失败、队列刷新、裁决完成、
+    // 复制成功）经此播报，读屏用户不再依赖纯视觉 span。单例挂 <body>，
+    // 与面板组件生命周期解耦；文本先清空下一帧再写入，让连续两次相同
+    // 文案也能各播报一次。
+    let liveRegion = null;
+    function announce(text) {
+      if (!text || typeof document === "undefined") return;
+      if (!liveRegion || !liveRegion.isConnected) {
+        liveRegion = document.createElement("div");
+        liveRegion.setAttribute("role", "status");
+        liveRegion.setAttribute("aria-live", "polite");
+        liveRegion.style.cssText = "position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap";
+        document.body.appendChild(liveRegion);
+      }
+      liveRegion.textContent = "";
+      window.requestAnimationFrame(() => { if (liveRegion) liveRegion.textContent = text; });
+    }
+
+    // #177 词级 diff：经典 LCS 对齐——删除片段标红、新增标绿、公共部分原样。
+    // 分词两段式：Han 段先切出再逐字打散（\p{L} 把整句中文当一个词，必须单列），
+    // 其余按 Unicode 词边界（拉丁按词、标点独立）。相邻同侧片段合并成 run。
+    // 输入先截 800 字符；O(n·m) DP 仅在小文本启用（任一侧 > 800 词或 edit run
+    // > 200 时返回 null），caller 退回原文展示，不为极端文本烧内存。
+    function wordDiff(aText, bText) {
+      const HAN = /^[\u{3400}-\u{4DBF}\u{4E00}-\u{9FFF}\u{F900}-\u{FAFF}]+$/u;
+      const tokenize = (s) => (s || "")
+        .split(/([\u{3400}-\u{4DBF}\u{4E00}-\u{9FFF}\u{F900}-\u{FAFF}]+)/u)
+        .filter(Boolean)
+        .flatMap((seg) => HAN.test(seg)
+          ? [...seg]
+          : seg.split(/(?=[^\p{L}\p{N}])|(?<=[^\p{L}\p{N}])/u).filter(Boolean));
+      const a = tokenize((aText || "").slice(0, 800)), b = tokenize((bText || "").slice(0, 800));
+      const n = a.length, m = b.length;
+      if (n === 0 && m === 0) return null;
+      if (n > 800 || m > 800) return null; // ponytail: O(n·m) DP，800×800 封顶（~2.5MB Int32），超限退回原文
+      const dp = new Int32Array((n + 1) * (m + 1));
+      const at = (i, j) => i * (m + 1) + j;
+      for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+          dp[at(i, j)] = a[i] === b[j] ? dp[at(i + 1, j + 1)] + 1 : Math.max(dp[at(i + 1, j)], dp[at(i, j + 1)]);
+        }
+      }
+      const ops = [];
+      const push = (kind, text) => {
+        const last = ops[ops.length - 1];
+        if (last && last.kind === kind) last.text += text;
+        else ops.push({ kind, text });
+      };
+      let i = 0, j = 0;
+      while (i < n && j < m) {
+        if (a[i] === b[j]) { push("same", a[i]); i++; j++; }
+        else if (dp[at(i + 1, j)] >= dp[at(i, j + 1)]) { push("del", a[i]); i++; }
+        else { push("ins", b[j]); j++; }
+      }
+      while (i < n) { push("del", a[i]); i++; }
+      while (j < m) { push("ins", b[j]); j++; }
+      if (ops.filter((o) => o.kind !== "same").length > 200) return null;
+      return ops;
+    }
+    // #287 归档图标跨代兼容：primitives 在 0.1.7 把图标命名从「像素后缀」改成
+    // 「字重后缀」（IconArchiveOutline20 → …OutlineRegular / …OutlineMedium），
+    // 旧名不留别名，而 peerDependencies 同时覆盖 0.1.6 与 0.1.7 两代宿主——
+    // 只认某一代的名字，另一代就会取到 undefined，h(undefined) 即 React #130
+    // （整个 slot entry 崩掉）。故按「旧名 → 新名」顺序取第一个存在的；
+    // 两代都缺时降级为不渲染图标，宁可无图标也不把 slot 打崩。
+    const IconArchive = primitives.IconArchiveOutline20
+      ?? primitives.IconArchiveOutlineRegular
+      ?? primitives.IconArchiveOutlineMedium
+      ?? null;
+
+    /** 渲染归档图标；宿主未提供任一候选名时返回 null（无图标，不影响其余内容）。 */
+    const renderArchiveIcon = (props) => (IconArchive ? h(IconArchive, props) : null);
 
     // Portal target for the hero fallback surface. The host whitelists
     // react-dom for its own bundles (dsh-client-ui-trajectory requires it);
@@ -56,7 +129,10 @@ window.__ModuleLoader__.load({
       check: [["path", { d: "M20 6 9 17l-5-5" }]],
       inbox: [["polyline", { points: "22 12 16 12 14 15 10 15 8 12 2 12" }], ["path", { d: "M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" }]],
       activity: [["path", { d: "M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2" }]],
-      flame: [["path", { d: "M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z" }]]
+      flame: [["path", { d: "M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z" }]],
+      // 意见与反馈入口的行首图标（Lucide 数据，同上 ISC 惯例内联）
+      bug: [["path", { d: "m8 2 1.88 1.88" }], ["path", { d: "M14.12 3.88 16 2" }], ["path", { d: "M9 7.13v-1a3.003 3.003 0 1 1 6 0v1" }], ["path", { d: "M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6" }], ["path", { d: "M12 20v-9" }], ["path", { d: "M6.53 9C4.6 8.8 3 7.1 3 5" }], ["path", { d: "M6 13H2" }], ["path", { d: "M3 21c0-2.1 1.7-3.9 3.8-4" }], ["path", { d: "M20.97 5c0 2.1-1.6 3.8-3.5 4" }], ["path", { d: "M22 13h-4" }], ["path", { d: "M17.2 17c2.1.1 3.8 1.9 3.8 4" }]],
+      mail: [["rect", { width: "20", height: "16", x: "2", y: "4", rx: "2" }], ["path", { d: "m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" }]]
     };
     const Icon = ({ name, size = 16, className }) => {
       const parts = ICON_PATHS[name];
@@ -92,6 +168,21 @@ window.__ModuleLoader__.load({
             opacity: i < filled ? 1 : 0.35
           }))));
     };
+
+    // 单颗星（与 ImportanceStars 同一份 Lucide 路径）：筛选 chip、实体提及数、
+    // 注入预览这类行内小指标用它渲染，替换此前的文本星号——文本星号角更尖锐，
+    // 与卡片/抽屉的 SVG 星并排时明显不同形（用户反馈后全线统一）。
+    const StarGlyph = ({ size = 11, filled = true }) => h("svg", {
+      width: size,
+      height: size,
+      viewBox: "0 0 24 24",
+      "aria-hidden": "true",
+      fill: filled ? "currentColor" : "none",
+      stroke: "currentColor",
+      strokeWidth: 1.6,
+      strokeLinejoin: "round",
+      style: { verticalAlign: "-1px" }
+    }, h("path", { d: STAR_PATH_D, opacity: filled ? 1 : 0.35 }));
 
     // 热度徽章（阶段二）：flame 图标 + 整数百分比，三档配色（热/温/冷）。
     // /list 仅在 heatEnabled=true 时下发 heat 字段——缺省即不渲染，开关关闭
@@ -160,7 +251,13 @@ window.__ModuleLoader__.load({
         "memory.tab.project": "项目",
         "memory.tab.decision": "决策",
         "memory.tab.history": "历史",
+        "memory.tab.summary": "小结",
         "memory.settings.title": "记忆库设置",
+        "memory.settings.group.personal": "个性化",
+        "memory.settings.group.engine": "记忆引擎",
+        "memory.settings.group.search": "搜索",
+        "memory.settings.group.connect": "连接与安全",
+        "memory.settings.group.help": "帮助",
         "memory.settings.profile": "用户画像",
         "memory.settings.profileHint": "写一段自我介绍（角色、背景、偏好），Agent 每轮对话都会自动带上。",
         "memory.settings.profileSave": "保存画像",
@@ -245,6 +342,7 @@ window.__ModuleLoader__.load({
         "memory.graph.sourceMemory": "查看来源记忆",
         "memory.graph.hint": "拖拽节点调整布局 · 空白处拖动平移 · 滚轮缩放",
         "memory.graph.resetView": "重置视图",
+        "memory.graph.summary": "实体关系图：{entity} 及其 {nodes} 个节点、{edges} 条关系",
         "memory.graph.viewInGraph": "在实体视图中打开",
         "memory.graph.loading": "加载中…",
         "memory.graph.distance": "距中心 {n} 跳",
@@ -264,22 +362,25 @@ window.__ModuleLoader__.load({
         "memory.settings.apiTokenPlaceholder": "留空 = 不鉴权（默认）",
         "memory.settings.apiTokenSave": "保存 Token",
         "memory.settings.apiTokenSaved": "Token 已保存",
-        "memory.settings.feedback.title": "帮助与反馈",
-        "memory.settings.feedback.desc": "遇到问题？先看看仓库已有的 issue，或直接把情况反馈过来：",
-        "memory.settings.feedback.newIssue": "GitHub 新建 issue（自动带上环境信息）",
-        "memory.settings.feedback.email": "邮件反馈（work@modusensus.space）",
-        "memory.settings.feedback.browse": "浏览仓库已知问题",
+        "memory.settings.feedback.title": "意见与反馈",
+        "memory.settings.feedback.desc": "遇到问题？直接告诉我们，或先看看有没有人遇到过：",
+        "memory.settings.feedback.newIssue": "在 GitHub 上反馈问题",
+        "memory.settings.feedback.newIssue.sub": "自动带上插件版本与环境信息",
+        "memory.settings.feedback.email": "邮件反馈",
+        "memory.settings.feedback.email.sub": "work@modusensus.space",
+        "memory.settings.feedback.browse": "浏览已知问题",
+        "memory.settings.feedback.browse.sub": "先搜搜，省一份重复 issue",
         "memory.settings.feedback.hint": "反馈前先搜搜是否已有相同问题，能省一份重复的 issue～",
         "memory.settings.version.outdated": "🆕 有新版本 {v}（当前运行 {c}）",
         "memory.settings.version.outdatedHint": "若安装时指定过版本号，常规升级不会跨大/小版本（pnpm 钉子）——请重新安装或在升级命令加 --latest；npm 已发布而市场暂未收录属正常（约 1 天延迟）。",
         "memory.settings.mode.title": "运行模式",
-        "memory.settings.mode.desc": "轻量模式只保留核心的记忆读写与自动注入（关闭 autoDream 巩固、实体抽取、语义搜索等高级功能），适合只想「记住偏好」的轻量使用；标准模式开启全部功能。",
+        "memory.settings.mode.desc": "轻量模式只保留核心能力：记忆读写、自动注入、热记忆；巩固、实体抽取、语义搜索等全部关闭，适合低配机器或只想「记住偏好」的场景。标准模式开启全部功能。",
         "memory.settings.mode.light": "轻量",
         "memory.settings.mode.standard": "标准",
         "memory.settings.mode.savedHint": "已保存，重启 DSH 后生效",
         "memory.settings.mode.offList": "已关闭：巩固（autoDream）· 实体抽取 · 语义搜索",
         "memory.settings.extapi.title": "外部访问 API",
-        "memory.settings.extapi.desc": "独立 HTTP 服务，供其他插件 / CLI / 桌面工具读写记忆，默认绑定 127.0.0.1。重启 DSH 后生效。",
+        "memory.settings.extapi.desc": "开放一个本机接口，让其他工具（插件、命令行、桌面应用）也能读写这份记忆库，默认只允许本机连接。改动保存后重启 DSH 生效。",
         "memory.settings.extapi.enabled": "启用",
         "memory.settings.extapi.disabled": "停用",
         "memory.settings.extapi.address": "地址",
@@ -292,18 +393,24 @@ window.__ModuleLoader__.load({
         "memory.tab.rejected_solution": "被否决方案",
         "memory.tab.pitfall": "踩坑记录",
         "memory.tab.constraint": "工程约束",
+        "memory.tab.document": "文档",
         "memory.features.title": "功能开关",
-        "memory.features.desc": "按需启停后端能力，改动保存后重启 DSH 生效。",
-        "memory.features.group.core": "核心",
-        "memory.features.group.enhance": "记忆增强",
+        "memory.features.desc": "控制插件在后台做哪些事。改动即时保存，重启 DSH 后生效。",
+        "memory.features.group.core": "基础",
+        "memory.features.group.enhance": "检索与增强",
         "memory.features.group.dream": "巩固与睡眠",
-        "memory.features.group.scope": "作用域隔离",
+        "memory.features.group.scope": "多会话隔离",
         "memory.features.group.advanced": "高级",
         "memory.features.advancedToggle": "高级（注入策略 · 反思 · 实验项）",
         "memory.features.restartHint": "重启 DSH 后生效",
         "memory.features.loadFailed": "加载失败",
         "memory.features.autoInject": "自动注入",
         "memory.features.autoInject.hint": "每轮对话自动携带相关记忆",
+        "memory.features.injectGuidanceEnabled": "能力说明",
+        "memory.features.injectGuidanceEnabled.hint": "教 Agent 怎么用记忆：什么时候该查、什么时候该写、拿不准就不动",
+        "memory.features.continuityRescueEnabled": "压缩边缘抢救",
+        "memory.features.continuityRescueEnabled.hint": "长对话被压缩前，先存一份「正在做什么 / 下一步 / 未决问题」的快照，让关键上下文活过压缩",
+        "memory.features.parentOff": "父开关关闭时不生效",
         "memory.features.autoSummarize": "自动总结",
         "memory.features.autoSummarize.hint": "对话结束自动提炼记忆条目",
         "memory.features.hotMemoryEnabled": "热记忆",
@@ -317,15 +424,24 @@ window.__ModuleLoader__.load({
         "memory.features.entityExtractionReasoning.low": "低",
         "memory.features.entityExtractionReasoning.medium": "中",
         "memory.features.entityExtractionReasoning.high": "高",
-        "memory.features.entityExtractionModelHint": "Provider/模型留空 = 跟随主对话模型；思考强度 none = 服务商默认",
+        "memory.features.summarizeReasoningEffort": "蒸馏思考强度",
+        "memory.features.summarizeReasoningEffort.off": "关闭思考",
+        "memory.features.summarizeReasoningEffort.none": "跟随默认",
+        "memory.features.summarizeReasoningEffort.low": "低",
+        "memory.features.summarizeReasoningEffort.medium": "中",
+        "memory.features.summarizeReasoningEffort.high": "高",
+        "memory.features.summarizeReasoningEffort.hint": "思考型模型建议选「低」或「关闭思考」，避免推理占满输出导致总结失败",
+        "memory.features.entityExtractionModelHint": "Provider / 模型留空 = 跟随主对话模型；思考强度选「跟随默认」= 服务商默认",
         "memory.features.codingRetrospect": "编码记忆蒸馏",
-        "memory.features.codingRetrospect.hint": "用完整转录（含工具调用与报错）提炼踩坑、约束与被否决方案",
+        "memory.features.codingRetrospect.hint": "回顾写代码的完整过程（含报错与工具调用），沉淀踩坑、约束和被否决的方案",
         "memory.features.rerankEnabled": "结果重排",
         "memory.features.rerankEnabled.hint": "本地重排模型对召回结果精排，更慢更准",
         "memory.features.heatEnabled": "热度衰减",
-        "memory.features.heatEnabled.hint": "按遗忘曲线给记忆降温：久未访问热度越低，参与注入排序与睡眠降级判定",
+        "memory.features.heatEnabled.hint": "像遗忘曲线一样给记忆降温：越久没用到排得越靠后，不占注入名额",
+        "memory.features.documentMemoryEnabled": "document 型记忆",
+        "memory.features.documentMemoryEnabled.hint": "Agent 写的长文档只在记忆里放一张「摘要卡」：正文仍由 Agent 保管、按需读取，注入时只带摘要，不占上下文",
         "memory.features.resilientModelDownload": "模型下载断点续传",
-        "memory.features.resilientModelDownload.hint": "模型文件下载中断后从已下载部分续传并自动重试，失败会记录中断位置；关闭后回到一次性下载",
+        "memory.features.resilientModelDownload.hint": "模型下载中断后从断点续传并自动重试；关闭则回到一次性下载",
         "memory.features.searchSemanticDedup": "语义去重",
         "memory.features.searchSemanticDedup.hint": "搜索结果中意思相近的条目只保留一条",
         "memory.features.autoDream": "记忆巩固",
@@ -355,13 +471,13 @@ window.__ModuleLoader__.load({
         "memory.features.conflictFreezeEnabled": "冲突冻结",
         "memory.features.conflictFreezeEnabled.hint": "巩固发现互相矛盾的记忆时先冻结待确认",
         "memory.features.scopeEnabled": "作用域标注",
-        "memory.features.scopeEnabled.hint": "按会话身份（agent/工作区）给新记忆打归属标注；重启 DSH 后生效",
+        "memory.features.scopeEnabled.hint": "新记忆自动记下来自哪个会话（Agent / 工作区），供隔离与检索过滤使用",
         "memory.features.strictScope": "严格隔离",
-        "memory.features.strictScope.hint": "检索与注入硬过滤，只对显式声明的归属生效：显式收窄到他者作用域的记忆不可见；载体自动标注只降权保留可见（真正的物理隔离请用 sensitivity）。重启 DSH 后生效",
+        "memory.features.strictScope.hint": "开启后，其他会话明确设为私有的记忆对你完全不可见；关闭时仍可见、只是排到后面。要做到彻底隔离，请用条目的「敏感度」字段",
         "memory.features.trustEpistemicWeighting": "可信度加权",
         "memory.features.trustEpistemicWeighting.hint": "按来源可信度调整召回排序（实验性）",
         "memory.features.reflectionFailureTracking": "反思失败追踪",
-        "memory.features.reflectionFailureTracking.hint": "记录巩固决策的失败样本供后续改进",
+        "memory.features.reflectionFailureTracking.hint": "记录巩固失败的案例供后续改进（诊断用）",
         "memory.features.embedRoute": "语义检索路线",
         "memory.features.embedProvider": "Embedding 提供方",
         "memory.features.embedProvider.openai": "OpenAI 兼容接口",
@@ -376,6 +492,10 @@ window.__ModuleLoader__.load({
         "memory.features.dreamProvider": "巩固模型 Provider",
         "memory.features.dreamModel": "巩固用模型名",
         "memory.features.dreamModelHint": "留空 = 跟随主对话模型；只影响记忆巩固（autoDream）用的模型",
+        "memory.features.dreamPeakHours": "高峰时段（不做梦）",
+        "memory.features.dreamPeakHours.hint": "设置忙碌时段，巩固会避开这些时间、事后补跑。写法：09:00-18:00，多段用逗号分隔，可带星期（如 mon-fri 08:00-12:00），支持跨零点；留空 = 不限制",
+        "memory.features.summarizePeakHours": "高峰时段（不蒸馏）",
+        "memory.features.summarizePeakHours.hint": "与巩固侧同一份写法；蒸馏会避开这些时段，窗口先攒着、非高峰一次蒸完",
         "memory.features.sleepProvider": "睡眠 Provider",
         "memory.features.sleepModel": "睡眠模型",
         "memory.features.sleepModelHint": "留空 = 用巩固模型或当前模型；建议选非思考模型",
@@ -386,7 +506,7 @@ window.__ModuleLoader__.load({
         "memory.features.modelTestFail": "测试失败",
         "memory.features.modelTestHint": "真实发起一次最小巩固调用，验证 Provider/模型连通与 effort 支持",
         "memory.features.routeStaleMark": "（不在可用列表）",
-        "memory.features.routeStaleHint": "不在当前可用列表，多为切换 Provider 后的旧值：请改选，或点「测试连通性」当场验证；改动保存后重启 DSH 生效。",
+        "memory.features.routeStaleHint": "该值不在当前可用列表（常见于切换过 Provider）：请重新选择，或点「测试连通性」当场验证",
         "memory.explorer.viewCards": "卡片",
         "memory.explorer.viewTimeline": "时间线",
         "memory.explorer.viewAria": "视图切换",
@@ -439,12 +559,25 @@ window.__ModuleLoader__.load({
         "memory.explorer.detail.editTitle": "标题",
         "memory.explorer.detail.editContent": "内容",
         "memory.explorer.detail.editImportance": "重要性",
+        "memory.explorer.detail.starLabel": "设为 {n} 星",
         "memory.status.dream": "最近巩固",
         "memory.status.dreamNever": "尚未运行",
         "memory.status.conflicts": "待确认冲突",
         "memory.status.conflictsHint": "冻结的矛盾记忆，等待人工确认",
         "memory.status.injectSuppressed": "极简模式下注入按宿主设计关闭",
-        "memory.status.injectSuppressedHint": "当前会话使用 minimal 预设，记忆注入 / 用户画像 / hot memory 不送达模型（宿主设计，非插件缺陷）。解法：切换标准模式，或在 ~/.dsh/settings.yaml 设 agent-presets.default: standard；过渡方案：把画像与规则写入 AGENTS.md",
+        "memory.status.injectSuppressedHint": "当前会话使用 minimal 预设：记忆注入 / 用户画像 / 热记忆不会送达模型（宿主设计，非插件缺陷）。切到标准模式，或在 ~/.dsh/settings.yaml 设 agent-presets.default: standard；过渡方案：把画像与规则写进 AGENTS.md",
+        "memory.status.injectPreview": "注入预览",
+        "memory.status.injectPreviewNone": "暂无预览——尚未发生注入（新会话或注入已关闭）",
+        "memory.status.injectPreview.chars": "总体积",
+        "memory.status.injectPreview.charsUnit": " 字符",
+        "memory.status.injectPreview.maxItems": "注入上限",
+        "memory.status.injectPreview.threshold": "相关性门槛",
+        "memory.status.injectPreview.scope": "会话归属",
+        "memory.status.injectPreview.query": "查询「{query}…」",
+        "memory.status.injectPreview.hot": "hot memory",
+        "memory.status.injectPreview.adaptiveOn": "自适应条数",
+        "memory.status.injectPreview.rotated": "轮换抑制",
+        "memory.status.injectPreview.empty": "本次组装未注入任何跨会话记忆（阈值或轮换过滤）",
         "memory.status.conflictQueue.reason": "原因",
         "memory.status.conflictQueue.sideA": "A 方",
         "memory.status.conflictQueue.sideB": "B 方",
@@ -453,7 +586,18 @@ window.__ModuleLoader__.load({
         "memory.status.conflictQueue.markReviewed": "仅标记已处理",
         "memory.status.conflictQueue.applyHint": "确认后：保留方正文追加已否决注记，另一方归档。",
         "memory.status.conflictQueue.missing": "（该记忆已不存在）",
+        "memory.status.conflictQueue.goto": "查看待确认冲突队列",
+        "memory.status.conflictQueue.resolved": "已裁决：保留{name}",
         "memory.status.conflictQueue.refresh": "刷新队列",
+        "memory.status.conflictQueue.refreshed": "冲突队列已刷新",
+        "memory.status.conflictQueue.frozenBadge": "⏸ 冻结中",
+        "memory.status.conflictQueue.frozenTitle": "冻结中：不参与注入与巩固，等你裁决",
+        "memory.status.conflictQueue.similarity": "相似度",
+        "memory.status.conflictQueue.diffTitle": "差异已高亮：红=删除、绿=新增",
+        "memory.status.conflictQueue.diffFallback": "两段文本差异较大，请对照原文阅读",
+        "memory.status.conflictQueue.emptyTitle": "暂无待确认冲突",
+        "memory.status.conflictQueue.emptyBody": "当巩固发现两条互相矛盾或高度相似的记忆时，会先冻结在这里等你裁决，不会自动修改。裁决前双方都不参与注入。",
+        "memory.status.conflictQueue.applyHintTitle": "确认后：保留方正文追加已否决注记，另一方归档",
         "memory.status.workbench": "工作动态",
         "memory.status.dreamConsolidate": "记忆巩固",
         "memory.status.summarize": "总结提炼",
@@ -467,10 +611,19 @@ window.__ModuleLoader__.load({
         "memory.status.consolidatedEmpty": "autoDream / autoSummarize 沉淀的记忆会出现在这里",
         "memory.status.archivedMemories": "已归档的记忆",
         "memory.status.heatDistribution": "热度分布",
-        "memory.status.heatHint": "热门（≥66%）{hot} · 温热（33–66%）{warm} · 冷却（<33%）{cold}，样本为最近 {sample} 条",
+        "memory.status.heat.hot": "热门（≥66%）",
+        "memory.status.heat.warm": "温热（33–66%）",
+        "memory.status.heat.cold": "冷却（<33%）",
+        "memory.status.heat.sample": "按最近 {sample} 条采样",
         "memory.status.recallStats": "记忆复用",
-        "memory.status.recallHint": "复用率 {rate} · 僵尸 {zombie}/{active}（豁免 {exempt}）· 30 天回执 {runs} 次 · Top：{top}",
-        "memory.status.recallInject": "注入 {runs} 轮 {count} 条，槽位填充 {fill}%",
+        "memory.status.recall.zombie": "僵尸记忆",
+        "memory.status.recall.exempt": "豁免",
+        "memory.status.recall.runs": "30 天回执",
+        "memory.status.recall.top": "常被召回",
+        "memory.status.recall.inject": "注入",
+        "memory.status.recall.archive": "归档",
+        "memory.status.recallInject": "{runs} 轮 · {count} 条 · 槽位 {fill}%",
+        "memory.status.recallArchive": "{total} 行 · +{add}/天 · 可压掉 {compress}",
         "memory.status.viewAll": "查看全部",
         "memory.status.depositedCount": "沉淀的记忆（{n}）",
         "memory.status.archivedCount": "已归档的记忆（{n}）",
@@ -492,7 +645,7 @@ window.__ModuleLoader__.load({
         "memory.status.vectorInitHint": "embedder 不可达，正在重试",
         "memory.status.vectorRuntimeMissing": "缺少本地推理运行时",
         "memory.status.vectorRuntimeHint": "本地推理运行时未就绪（{status}）",
-        "memory.status.vectorRuntimeCost": "本地向量化要额外一份本地推理运行时（transformers + onnxruntime 闭包，解包后数百 MB）。下面的按钮会先尝试收编本机已有的那份（同盘则硬链接，不占额外空间），没有再按固定清单从 npm 取回（逐个校验 sha512）。也可以直接让 agent 处理，或在终端里自己跑：node scripts/mneme-runtime.mjs status / adopt [--from <node_modules>] / verify（详见 docs/LOCAL_MODEL.md §2.5）。",
+        "memory.status.vectorRuntimeCost": "本地向量化需要额外一份本地推理运行时（解包后数百 MB）。下面的按钮会优先收编本机已有的那份（同盘硬链接、不占额外空间），没有再从 npm 下载并逐个校验。也可以让 Agent 代劳，或在终端自己跑：node scripts/mneme-runtime.mjs status / adopt / verify（见 docs/LOCAL_MODEL.md）",
         "memory.runtime.title": "本地推理运行时",
         "memory.runtime.available": "已就绪",
         "memory.runtime.missing": "未就绪 —— 只有用本地嵌入（embedProvider: local）时才需要它",
@@ -508,6 +661,8 @@ window.__ModuleLoader__.load({
       "memory.status.vectorUnconfigured": "未配置",
       "memory.status.vectorUnconfiguredHint": "未填 embedding 端点/模型或未启用，语义召回不可用",
       "memory.status.vectorDegradedHint": "已索引 0 / {m} 条，语义召回实际不可用",
+        "memory.status.sec.overview": "库内一览",
+        "memory.status.sec.engine": "后台运转",
         "memory.status.llm": "LLM 消耗",
         "memory.status.llmCalls": "近 7 天 · {n} 次调用",
         "memory.status.error": "加载失败"
@@ -520,7 +675,13 @@ window.__ModuleLoader__.load({
         "memory.tab.project": "Projects",
         "memory.tab.decision": "Decisions",
         "memory.tab.history": "History",
+        "memory.tab.summary": "Summaries",
         "memory.settings.title": "Memory Settings",
+        "memory.settings.group.personal": "Personalization",
+        "memory.settings.group.engine": "Memory engine",
+        "memory.settings.group.search": "Search",
+        "memory.settings.group.connect": "Connections & safety",
+        "memory.settings.group.help": "Help",
         "memory.settings.profile": "User Profile",
         "memory.settings.profileHint": "Describe yourself once — the agent reads it every turn.",
         "memory.settings.profileSave": "Save Profile",
@@ -605,6 +766,7 @@ window.__ModuleLoader__.load({
         "memory.graph.sourceMemory": "View source memory",
         "memory.graph.hint": "Drag nodes to rearrange · drag the background to pan · scroll to zoom",
         "memory.graph.resetView": "Reset view",
+        "memory.graph.summary": "Entity graph: {entity} with {nodes} nodes and {edges} edges",
         "memory.graph.viewInGraph": "Open in entity explorer",
         "memory.graph.loading": "Loading…",
         "memory.graph.distance": "{n} hop(s) from root",
@@ -624,22 +786,25 @@ window.__ModuleLoader__.load({
         "memory.settings.apiTokenPlaceholder": "Empty = no auth (default)",
         "memory.settings.apiTokenSave": "Save Token",
         "memory.settings.apiTokenSaved": "Token saved",
-        "memory.settings.feedback.title": "Help & feedback",
-        "memory.settings.feedback.desc": "Stuck? Search the existing issues, or tell us what happened:",
-        "memory.settings.feedback.newIssue": "Open a GitHub issue (environment info prefilled)",
-        "memory.settings.feedback.email": "Email feedback (work@modusensus.space)",
+        "memory.settings.feedback.title": "Feedback",
+        "memory.settings.feedback.desc": "Something off? Tell us directly, or check if someone hit it first:",
+        "memory.settings.feedback.newIssue": "Report on GitHub",
+        "memory.settings.feedback.newIssue.sub": "Plugin version & environment prefilled",
+        "memory.settings.feedback.email": "Email us",
+        "memory.settings.feedback.email.sub": "work@modusensus.space",
         "memory.settings.feedback.browse": "Browse known issues",
+        "memory.settings.feedback.browse.sub": "Check if it's already reported",
         "memory.settings.feedback.hint": "Search for an existing issue first — it saves a duplicate.",
         "memory.settings.version.outdated": "🆕 New version {v} available (running {c})",
         "memory.settings.version.outdatedHint": "If the plugin was installed with a pinned version, regular upgrades never cross minor/major lines — reinstall or pass --latest. A fresh npm release may take about a day to appear in the market.",
         "memory.settings.mode.title": "Runtime mode",
-        "memory.settings.mode.desc": "Light mode keeps only the core memory read/write and auto-injection (autoDream consolidation, entity extraction and semantic search are off) — for light use where you just want preferences remembered. Standard mode enables everything.",
+        "memory.settings.mode.desc": "Light mode keeps the core loop only: memory read/write, auto-injection and hot memory — consolidation, entity extraction and semantic search are all off. For modest machines or when you just want preferences remembered. Standard mode enables everything.",
         "memory.settings.mode.light": "Light",
         "memory.settings.mode.standard": "Standard",
         "memory.settings.mode.savedHint": "Saved. Takes effect after restarting DSH",
         "memory.settings.mode.offList": "Off: consolidation (autoDream) · entity extraction · semantic search",
         "memory.settings.extapi.title": "External API",
-        "memory.settings.extapi.desc": "A standalone HTTP service for other plugins / CLIs / desktop tools to read and write memories, bound to 127.0.0.1 by default. Takes effect after restarting DSH.",
+        "memory.settings.extapi.desc": "Opens a local API so other tools (plugins, CLIs, desktop apps) can also read and write this memory store; binds to localhost only by default. Changes take effect after restarting DSH.",
         "memory.settings.extapi.enabled": "Enable",
         "memory.settings.extapi.disabled": "Disable",
         "memory.settings.extapi.address": "Address",
@@ -652,18 +817,24 @@ window.__ModuleLoader__.load({
         "memory.tab.rejected_solution": "Rejected solutions",
         "memory.tab.pitfall": "Pitfalls",
         "memory.tab.constraint": "Constraints",
+        "memory.tab.document": "Documents",
         "memory.features.title": "Features",
-        "memory.features.desc": "Toggle backend capabilities. Changes take effect after restarting DSH.",
-        "memory.features.group.core": "Core",
-        "memory.features.group.enhance": "Enhancement",
-        "memory.features.group.dream": "Consolidation",
-        "memory.features.group.scope": "Scope isolation",
+        "memory.features.desc": "Choose what the plugin does in the background. Changes are saved immediately and take effect after restarting DSH.",
+        "memory.features.group.core": "Basics",
+        "memory.features.group.enhance": "Search & enrichment",
+        "memory.features.group.dream": "Consolidation & sleep",
+        "memory.features.group.scope": "Multi-session isolation",
         "memory.features.group.advanced": "Advanced",
         "memory.features.advancedToggle": "Advanced (injection · reflection · experimental)",
         "memory.features.restartHint": "Takes effect after restarting DSH",
         "memory.features.loadFailed": "Failed to load",
         "memory.features.autoInject": "Auto injection",
         "memory.features.autoInject.hint": "Carry relevant memories into every turn",
+        "memory.features.injectGuidanceEnabled": "Capability guide",
+        "memory.features.injectGuidanceEnabled.hint": "Teach the agent how to use memory: when to search, when to save, when to leave things alone",
+        "memory.features.continuityRescueEnabled": "Compaction-edge rescue",
+        "memory.features.continuityRescueEnabled.hint": "Before a long conversation gets compacted, store a snapshot of what's in progress / next steps / open questions so key context survives the compaction",
+        "memory.features.parentOff": "Inactive while auto injection is off",
         "memory.features.autoSummarize": "Auto summarization",
         "memory.features.autoSummarize.hint": "Distill memory entries when a conversation ends",
         "memory.features.hotMemoryEnabled": "Hot memory",
@@ -677,15 +848,24 @@ window.__ModuleLoader__.load({
         "memory.features.entityExtractionReasoning.low": "Low",
         "memory.features.entityExtractionReasoning.medium": "Medium",
         "memory.features.entityExtractionReasoning.high": "High",
-        "memory.features.entityExtractionModelHint": "Provider / model empty = follow the main conversation model; reasoning none = provider default",
+        "memory.features.summarizeReasoningEffort": "Distill reasoning effort",
+        "memory.features.summarizeReasoningEffort.off": "No reasoning",
+        "memory.features.summarizeReasoningEffort.none": "Follow default",
+        "memory.features.summarizeReasoningEffort.low": "Low",
+        "memory.features.summarizeReasoningEffort.medium": "Medium",
+        "memory.features.summarizeReasoningEffort.high": "High",
+        "memory.features.summarizeReasoningEffort.hint": "For thinking models, prefer Low or No reasoning so thinking cannot fill the output budget and break summaries",
+        "memory.features.entityExtractionModelHint": "Provider / model empty = follow the main conversation model; reasoning \"Follow default\" = provider default",
         "memory.features.codingRetrospect": "Coding retrospection",
-        "memory.features.codingRetrospect.hint": "Distill pitfalls, constraints and rejected solutions from full transcripts (tools and errors included)",
+        "memory.features.codingRetrospect.hint": "Review the full coding session (tools and errors included) and distill pitfalls, constraints and rejected solutions",
         "memory.features.rerankEnabled": "Reranking",
         "memory.features.rerankEnabled.hint": "Rerank recalled results with a local model — slower, more precise",
         "memory.features.heatEnabled": "Heat decay",
-        "memory.features.heatEnabled.hint": "Decay memory heat since last access; feeds injection ranking and sleep demotion",
+        "memory.features.heatEnabled.hint": "Cool memories down like a forgetting curve: the longer unused, the lower they rank — they stop taking injection slots",
+        "memory.features.documentMemoryEnabled": "Document memory",
+        "memory.features.documentMemoryEnabled.hint": "Long agent-authored documents are stored as a \"summary card\" only: the full text stays agent-owned and is read on demand, so injection carries the summary without filling the context",
         "memory.features.resilientModelDownload": "Resumable model downloads",
-        "memory.features.resilientModelDownload.hint": "Resume model file downloads from received bytes and retry on failure; failures log where they stopped",
+        "memory.features.resilientModelDownload.hint": "Resume model downloads from where they stopped and retry automatically; off = one-shot downloads",
         "memory.features.searchSemanticDedup": "Semantic dedup",
         "memory.features.searchSemanticDedup.hint": "Keep one entry when search hits near-duplicates",
         "memory.features.autoDream": "Memory consolidation",
@@ -715,13 +895,13 @@ window.__ModuleLoader__.load({
         "memory.features.conflictFreezeEnabled": "Conflict freezing",
         "memory.features.conflictFreezeEnabled.hint": "Freeze contradictory memories for confirmation during consolidation",
         "memory.features.scopeEnabled": "Scope tagging",
-        "memory.features.scopeEnabled.hint": "Stamp new memories with the writing session's identity (agent/workspace); takes effect after restarting DSH",
+        "memory.features.scopeEnabled.hint": "New memories record which session (agent / workspace) they came from, for isolation and filtered recall",
         "memory.features.strictScope": "Strict isolation",
-        "memory.features.strictScope.hint": "Hard-filter search and injection for EXPLICITLY declared scopes only: memories explicitly narrowed to other agents/workspaces become invisible; auto carrier labels are demoted but stay visible (use sensitivity for true physical isolation). Takes effect after restarting DSH",
+        "memory.features.strictScope.hint": "When on, memories explicitly made private by other sessions become fully invisible; when off they stay visible but rank lower. For true isolation use a memory's sensitivity field",
         "memory.features.trustEpistemicWeighting": "Credibility weighting",
         "memory.features.trustEpistemicWeighting.hint": "Adjust recall ranking by source credibility (experimental)",
         "memory.features.reflectionFailureTracking": "Reflection failure tracking",
-        "memory.features.reflectionFailureTracking.hint": "Record failed consolidation decisions for later improvement",
+        "memory.features.reflectionFailureTracking.hint": "Record failed consolidation cases for later improvement (diagnostics)",
         "memory.features.embedRoute": "Semantic search route",
         "memory.features.embedProvider": "Embedding provider",
         "memory.features.embedProvider.openai": "OpenAI-compatible API",
@@ -736,6 +916,10 @@ window.__ModuleLoader__.load({
         "memory.features.dreamProvider": "Consolidation provider",
         "memory.features.dreamModel": "Consolidation model",
         "memory.features.dreamModelHint": "Leave empty to follow the main conversation model; only affects autoDream consolidation",
+        "memory.features.dreamPeakHours": "Peak hours (no dreaming)",
+        "memory.features.dreamPeakHours.hint": "Busy hours for the machine; consolidation avoids them and catches up afterwards. Syntax: 09:00-18:00, several windows comma-separated, weekday prefix allowed (mon-fri 08:00-12:00), midnight-crossing allowed; empty = no limit",
+        "memory.features.summarizePeakHours": "Peak hours (no distillation)",
+        "memory.features.summarizePeakHours.hint": "Same syntax as the consolidation side above; distillation avoids these windows and accumulates the material for one run off-peak",
         "memory.features.sleepProvider": "Sleep provider",
         "memory.features.sleepModel": "Sleep model",
         "memory.features.sleepModelHint": "Leave empty to reuse the consolidation model; a non-reasoning model is recommended",
@@ -746,7 +930,7 @@ window.__ModuleLoader__.load({
         "memory.features.modelTestFail": "Test failed",
         "memory.features.modelTestHint": "Fires one minimal consolidation call to verify provider/model connectivity and effort support",
         "memory.features.routeStaleMark": " (not in list)",
-        "memory.features.routeStaleHint": "Not in the currently available list, often a leftover from a provider switch: reselect, or run a connectivity test to verify now; changes take effect after restarting DSH.",
+        "memory.features.routeStaleHint": "This value is not in the currently available list (often a leftover from switching providers): reselect, or run a connectivity test to verify now",
         "memory.explorer.viewCards": "Cards",
         "memory.explorer.viewTimeline": "Timeline",
         "memory.explorer.viewAria": "Switch view",
@@ -799,12 +983,25 @@ window.__ModuleLoader__.load({
         "memory.explorer.detail.editTitle": "Title",
         "memory.explorer.detail.editContent": "Content",
         "memory.explorer.detail.editImportance": "Importance",
+        "memory.explorer.detail.starLabel": "Set importance to {n} stars",
         "memory.status.dream": "Last consolidation",
         "memory.status.dreamNever": "Not yet run",
         "memory.status.conflicts": "Pending conflicts",
         "memory.status.conflictsHint": "Frozen contradictory memories awaiting confirmation",
         "memory.status.injectSuppressed": "Injection disabled by host minimal preset",
-        "memory.status.injectSuppressedHint": "This session uses the minimal preset: memory injection / user profile / hot memory never reach the model (by host design, not a plugin defect). Fix: switch to standard mode, or set agent-presets.default: standard in ~/.dsh/settings.yaml. Interim: put profile and rules in AGENTS.md",
+        "memory.status.injectSuppressedHint": "This session uses the minimal preset: memory injection / profile / hot memory never reach the model (by host design, not a plugin defect). Switch to standard mode, or set agent-presets.default: standard in ~/.dsh/settings.yaml. Interim: put profile and rules in AGENTS.md",
+        "memory.status.injectPreview": "Injection preview",
+        "memory.status.injectPreviewNone": "No preview yet — no injection has happened (new session or injection off)",
+        "memory.status.injectPreview.chars": "Total",
+        "memory.status.injectPreview.charsUnit": " chars",
+        "memory.status.injectPreview.maxItems": "Max items",
+        "memory.status.injectPreview.threshold": "Relevance floor",
+        "memory.status.injectPreview.scope": "Session scope",
+        "memory.status.injectPreview.query": "query \"{query}…\"",
+        "memory.status.injectPreview.hot": "hot memory",
+        "memory.status.injectPreview.adaptiveOn": "adaptive budget",
+        "memory.status.injectPreview.rotated": "rotation-suppressed",
+        "memory.status.injectPreview.empty": "No cross-session memories injected this assembly (threshold or rotation filter)",
         "memory.status.conflictQueue.reason": "Reason",
         "memory.status.conflictQueue.sideA": "Side A",
         "memory.status.conflictQueue.sideB": "Side B",
@@ -813,7 +1010,18 @@ window.__ModuleLoader__.load({
         "memory.status.conflictQueue.markReviewed": "Mark reviewed only",
         "memory.status.conflictQueue.applyHint": "On confirm: a veto note is appended to the kept side and the other side is archived.",
         "memory.status.conflictQueue.missing": "(memory no longer exists)",
+        "memory.status.conflictQueue.goto": "View pending conflict queue",
+        "memory.status.conflictQueue.resolved": "Resolved: kept {name}",
         "memory.status.conflictQueue.refresh": "Refresh queue",
+        "memory.status.conflictQueue.refreshed": "Conflict queue refreshed",
+        "memory.status.conflictQueue.frozenBadge": "⏸ Frozen",
+        "memory.status.conflictQueue.frozenTitle": "Frozen: excluded from injection and consolidation, awaiting your review",
+        "memory.status.conflictQueue.similarity": "similarity",
+        "memory.status.conflictQueue.diffTitle": "Differences highlighted: red = removed, green = added",
+        "memory.status.conflictQueue.diffFallback": "The two texts differ substantially — compare the originals",
+        "memory.status.conflictQueue.emptyTitle": "No pending conflicts",
+        "memory.status.conflictQueue.emptyBody": "When consolidation finds two contradictory or highly similar memories, it freezes them here for your review instead of changing anything automatically. Neither side participates in injection until resolved.",
+        "memory.status.conflictQueue.applyHintTitle": "On confirm: a veto note is appended to the kept side and the other side is archived",
         "memory.status.workbench": "Activity",
         "memory.status.dreamConsolidate": "Consolidation",
         "memory.status.summarize": "Summarization",
@@ -827,10 +1035,19 @@ window.__ModuleLoader__.load({
         "memory.status.consolidatedEmpty": "Memories deposited by autoDream / autoSummarize appear here",
         "memory.status.archivedMemories": "Archived memories",
         "memory.status.heatDistribution": "Heat distribution",
-        "memory.status.heatHint": "hot (≥66%) {hot} · warm (33–66%) {warm} · cooled (<33%) {cold}, sampled from the latest {sample}",
+        "memory.status.heat.hot": "Hot (≥66%)",
+        "memory.status.heat.warm": "Warm (33–66%)",
+        "memory.status.heat.cold": "Cooled (<33%)",
+        "memory.status.heat.sample": "Sampled from the latest {sample}",
         "memory.status.recallStats": "Recall reuse",
-        "memory.status.recallHint": "reuse {rate} · zombie {zombie}/{active} (exempt {exempt}) · {runs} runs in 30d · top: {top}",
-        "memory.status.recallInject": "injected {runs} turns · {count} items ({fill}% slots)",
+        "memory.status.recall.zombie": "Zombie memories",
+        "memory.status.recall.exempt": "exempt",
+        "memory.status.recall.runs": "Receipts (30d)",
+        "memory.status.recall.top": "Most recalled",
+        "memory.status.recall.inject": "Injected",
+        "memory.status.recall.archive": "Archived",
+        "memory.status.recallInject": "{runs} turns · {count} items · {fill}% slots",
+        "memory.status.recallArchive": "{total} rows · +{add}/day · {compress} compressible",
         "memory.status.viewAll": "View all",
         "memory.status.depositedCount": "Deposited memories ({n})",
         "memory.status.archivedCount": "Archived memories ({n})",
@@ -852,7 +1069,7 @@ window.__ModuleLoader__.load({
         "memory.status.vectorInitHint": "embedder unreachable, retrying",
         "memory.status.vectorRuntimeMissing": "Local inference runtime missing",
         "memory.status.vectorRuntimeHint": "Local inference runtime not ready ({status})",
-        "memory.status.vectorRuntimeCost": "Local vectorization needs an extra local inference runtime (the transformers + onnxruntime closure, hundreds of MB unpacked). The button below first tries to adopt an existing copy on this machine (hardlinked when on the same volume, so no extra disk), and otherwise fetches it from npm against a pinned manifest (every tarball checked against its sha512). You can also just ask the agent, or run it yourself: node scripts/mneme-runtime.mjs status / adopt [--from <node_modules>] / verify (see docs/LOCAL_MODEL.md §2.5).",
+        "memory.status.vectorRuntimeCost": "Local vectorization needs an extra local inference runtime (hundreds of MB unpacked). The button below first adopts an existing copy on this machine (hardlinked on the same volume, no extra disk) and otherwise fetches it from npm with per-file checksums. You can also just ask the agent, or run it yourself: node scripts/mneme-runtime.mjs status / adopt / verify (see docs/LOCAL_MODEL.md)",
         "memory.runtime.title": "Local inference runtime",
         "memory.runtime.available": "ready",
         "memory.runtime.missing": "not ready — only needed when you use local embedding (embedProvider: local)",
@@ -868,6 +1085,8 @@ window.__ModuleLoader__.load({
       "memory.status.vectorUnconfigured": "Not configured",
       "memory.status.vectorUnconfiguredHint": "No embedding endpoint/model configured — semantic recall is off",
       "memory.status.vectorDegradedHint": "Indexed 0 / {m} items — semantic recall is effectively unavailable",
+        "memory.status.sec.overview": "Library",
+        "memory.status.sec.engine": "Background activity",
         "memory.status.llm": "LLM Usage",
         "memory.status.llmCalls": "Last 7 days · {n} calls",
         "memory.status.error": "Failed to load"
@@ -966,7 +1185,7 @@ window.__ModuleLoader__.load({
       ".mneme-xrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
       ".mneme-xsearch{width:100%}",
       ".mneme-xselect{flex:1;min-width:0}",
-      ".mneme-xcolhead{flex:none;font-size:12px;font-weight:500;color:var(--dsw-alias-label-tertiary);padding:2px 8px 8px}",
+      ".mneme-xcolhead{flex:none;font-size:12px;font-weight:500;margin:0;color:var(--dsw-alias-label-tertiary);padding:2px 8px 8px}",
       ".mneme-xtype{display:flex;justify-content:flex-start;align-items:center;gap:8px;width:100%;padding:5px 8px;border:none;border-radius:8px;background:none;color:var(--dsw-alias-label-secondary);cursor:pointer;font-family:inherit;font-size:13px;line-height:18px;text-align:left}",
       ".mneme-xtype:hover{background:var(--dsw-alias-interactive-bg-hover)}",
       ".mneme-xtype.mneme-active{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary);font-weight:500}",
@@ -1047,8 +1266,8 @@ window.__ModuleLoader__.load({
       // --- settings: quiet stacked sections, one concern per section ---
       ".mneme-set{flex:1;min-height:0;overflow-y:auto;padding:8px 24px 48px;box-sizing:border-box}",
       ".mneme-set-inner{max-width:720px;margin:0 auto}",
-      ".mneme-set-sec{padding:20px 0 24px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
-      ".mneme-set-sec:last-child{border-bottom:none}",
+      // 设置页各节一律用 boxed 卡（.mneme-set-card）+ 分组标题（.mneme-set-grouphead）：
+      // 旧的「无框 set-sec + 有框 set-card」混排是版面杂乱的一半来源
       ".mneme-set-title{font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary);margin-bottom:4px}",
       ".mneme-set-desc{font-size:13px;line-height:19px;color:var(--dsw-alias-label-tertiary);margin-bottom:14px}",
       ".mneme-set-input{box-sizing:border-box;width:100%;height:34px;padding:0 12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;outline:none;margin-bottom:10px;transition:border-color .12s,box-shadow .12s}",
@@ -1093,7 +1312,7 @@ window.__ModuleLoader__.load({
       ".mneme-heat--cold{color:var(--dsw-alias-label-tertiary)}",
       ".mneme-heat--cold .mneme-heatpct{display:none}",
       // 纵向 flex 容器按原生按钮的宽度与外边距分配空间，保留展开和收起态的对齐。
-      ".mneme-topentry{display:flex;flex-direction:column}",
+      ".mneme-topentry{display:flex;flex-direction:column;position:relative}",
       ".mneme-topentry-native{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary)}",
       ".mneme-topentry-native:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
       ".mneme-topentry-native .mneme-topentry-label{white-space:nowrap}",
@@ -1116,7 +1335,6 @@ window.__ModuleLoader__.load({
       ".mneme-numinput:focus{border-color:var(--dsw-alias-state-business-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-business-primary) 15%,transparent)}",
       // 字符串开关的输入框（provider/model 等）与其子块容器
       ".mneme-strinput{box-sizing:border-box;width:240px;max-width:60%;height:30px;padding:0 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;outline:none;text-align:left;transition:border-color .12s,box-shadow .12s}",
-      ".mneme-feed-link{display:block;color:var(--dsw-alias-brand,var(--dsw-alias-label-primary));text-decoration:none;font-size:13px;line-height:20px;padding:4px 2px;border-radius:6px;transition:opacity .12s}.mneme-feed-link:hover{opacity:.8;text-decoration:underline}",
       ".mneme-strinput:focus{border-color:var(--dsw-alias-state-business-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-business-primary) 15%,transparent)}",
       ".mneme-featsub{margin:2px 0 8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;display:flex;flex-direction:column;gap:6px}",
       ".mneme-featsub .mneme-featnum{padding:6px 0;border-bottom:none}",
@@ -1158,6 +1376,31 @@ window.__ModuleLoader__.load({
       ".mneme-conflict-missing{font-size:12px;color:var(--dsw-alias-label-tertiary)}",
       ".mneme-conflict-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}",
       ".mneme-conflict-hint{font-size:11px;color:var(--dsw-alias-label-tertiary);margin-right:auto}",
+      // #177 冲突队列视觉批次：A/B 侧色、相似度条、词级 diff、主色按钮、空态
+      ".mneme-conflict-side--a{border-color:color-mix(in srgb,var(--dsw-alias-state-business-primary) 35%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 4%,transparent)}",
+      ".mneme-conflict-side--a .mneme-conflict-sidelabel{color:var(--dsw-alias-state-business-primary);font-weight:600}",
+      ".mneme-conflict-side--b{border-color:color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 5%,transparent)}",
+      ".mneme-conflict-side--b .mneme-conflict-sidelabel{color:var(--dsw-alias-state-warning,#e6a23c);font-weight:600}",
+      ".mneme-conflict-simrow{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--dsw-alias-label-secondary)}",
+      ".mneme-conflict-simbar{position:relative;flex:1;height:5px;border-radius:3px;background:var(--dsw-alias-interactive-bg-hover);overflow:hidden}",
+      ".mneme-conflict-simfill{position:absolute;top:0;bottom:0;left:0;border-radius:3px;background:var(--dsw-alias-state-business-primary)}",
+      ".mneme-conflict-diff{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}",
+      ".mneme-conflict-mark{text-decoration:none;border-radius:3px;padding:0 1px}",
+      ".mneme-conflict-mark--del{background:color-mix(in srgb,var(--dsw-alias-state-error,#c33) 16%,transparent);text-decoration:line-through}",
+      ".mneme-conflict-mark--ins{background:color-mix(in srgb,var(--dsw-alias-state-success,#3c9) 18%,transparent)}",
+      ".mneme-conflict-primary{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 10px;border-radius:8px;border:none;background:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-bg-layer-1);cursor:pointer;font-family:inherit;font-size:12px;line-height:16px}",
+      ".mneme-conflict-primary:disabled{opacity:.55;cursor:default}",
+      ".mneme-conflict-primary:hover:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 85%,black)}",
+      ".mneme-badge--frozen{color:var(--dsw-alias-state-warning,#e6a23c);background:color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 12%,transparent)}",
+      ".mneme-conflict-empty{border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:4px}",
+      ".mneme-conflict-empty-title{font-size:12.5px;font-weight:600;color:var(--dsw-alias-label-secondary)}",
+      ".mneme-conflict-empty-body{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}",
+      ".mneme-statuscard--actionable{border-color:color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 55%,transparent);box-shadow:0 0 0 1px color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 35%,transparent)}",
+      ".mneme-entrybadge{position:absolute;top:-3px;right:-3px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:var(--dsw-alias-state-error,#c33);color:var(--dsw-alias-bg-layer-1,#fff);font-size:10.5px;line-height:16px;font-weight:600;text-align:center;box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1)}",
+      ".mneme-triggerwrap{position:relative;pointer-events:none}",
+      ".mneme-triggerwrap .mneme-trigger{pointer-events:auto}",
+      ".mneme-conflict-jump .mneme-statuscard{border-color:color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 55%,transparent);box-shadow:0 0 0 1px color-mix(in srgb,var(--dsw-alias-state-warning,#e6a23c) 35%,transparent)}",
+      ".mneme-conflict-jump:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px;border-radius:12px}",
       // 详情抽屉：sheet 内右侧滑出，覆盖在浏览区之上
       ".mneme-xmain{position:relative}",
       "@keyframes mneme-slidein{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:translateX(0)}}",
@@ -1198,8 +1441,36 @@ window.__ModuleLoader__.load({
       ".mneme-xemptyico{display:block;margin:0 auto 6px;opacity:.7}",
       // --- status sub-view: responsive stat-card grid (auto-fill, ~220px min) ---
       ".mneme-status{flex:1;min-height:0;overflow-y:auto;padding:20px 24px 40px;box-sizing:border-box}",
-      ".mneme-statusgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;max-width:1000px;margin:0 auto}",
-      ".mneme-statuscard{min-width:0;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;padding:14px}",
+      ".mneme-statusgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;max-width:1000px;margin:0 auto 12px}",
+      ".mneme-statusgrid:last-of-type{margin-bottom:0}",
+      // 概览区是单行三卡：auto-fit 让不满的轨道塌缩，三张卡恒等宽铺满、行尾不留洞
+      ".mneme-statusgrid--overview{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}",
+      // 跨列只在容器够放下 ≥2 列时生效（220px 最小轨 + 12px 间隙推出来的界）；
+      // 单列容器里 span 2 会撑出隐式轨道把布局撑爆，必须撤掉
+      "@container (min-width:452px) and (max-width:683px){.mneme-statuscard--vectorwide{grid-column:span 2}}",
+      "@container (min-width:452px){.mneme-statuscard--wide{grid-column:span 2}}",
+      // 状态页分组标题（库内一览 / 后台运转）：只做扫读锚点，压得比卡片标题低
+      ".mneme-statushead{max-width:1000px;margin:0 auto 10px;font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-label-tertiary)}",
+      ".mneme-statusgrid+.mneme-statushead{margin-top:26px}",
+      ".mneme-statuscard{min-width:0;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;padding:16px 16px 14px}",
+      // 指标行：一行一指标（label 左 / 数值右），取代「·」串联的说明长句——
+      // 拥挤感的根源是把多指标压进一段会换行的散文
+      ".mneme-statrows{margin-top:10px;display:flex;flex-direction:column;gap:4px}",
+      ".mneme-statrow{display:flex;align-items:baseline;justify-content:space-between;gap:12px;font-size:12px;line-height:17px;color:var(--dsw-alias-label-tertiary)}",
+      ".mneme-statrow>span:first-child{flex:none;white-space:nowrap}",
+      ".mneme-statrow .mneme-heatdot{align-self:center}",
+      ".mneme-statrowval{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;text-align:right}",
+      ".mneme-statfoot{margin-top:8px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-dimmed)}",
+      // 热度分布条：三档占比一图看清，行标只补数字（类名带双横线，与 heatdot 同款）
+      ".mneme-heatbar{display:flex;height:6px;border-radius:3px;overflow:hidden;margin-top:12px;background:var(--dsw-alias-interactive-bg-hover)}",
+      ".mneme-heatbar-seg{min-width:2px}",
+      ".mneme-heatbar--hot{background:var(--dsw-alias-state-warning,#d97706)}",
+      ".mneme-heatbar--warm{background:var(--dsw-alias-label-tertiary)}",
+      ".mneme-heatbar--cold{background:var(--dsw-alias-label-dimmed)}",
+      ".mneme-heatdot{flex:none;width:8px;height:8px;border-radius:50%}",
+      ".mneme-heatdot--hot{background:var(--dsw-alias-state-warning,#d97706)}",
+      ".mneme-heatdot--warm{background:var(--dsw-alias-label-tertiary)}",
+      ".mneme-heatdot--cold{background:var(--dsw-alias-label-dimmed)}",
       // --- 状态页工作台：让用户看见插件在干活（动态/沉淀/归档） ---
       ".mneme-wbhead{margin:28px auto 10px;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);max-width:1000px;display:flex;align-items:baseline;justify-content:space-between;gap:8px}",
       ".mneme-wblist{max-width:1000px;display:flex;flex-direction:column;gap:6px}",
@@ -1222,9 +1493,29 @@ window.__ModuleLoader__.load({
       // --- settings cards: boxed cards for the runtime-mode and external-API
       // sections — each card owns its fetch/PUT state, so it renders as a
       // self-contained unit inside the stacked settings view ---
-      ".mneme-set-card{border:1px solid var(--dsw-alias-border-l2);border-radius:10px;padding:14px;margin-bottom:12px}",
+      ".mneme-set-card{border:1px solid var(--dsw-alias-border-l2);border-radius:12px;padding:16px;margin-bottom:10px}",
+      // 设置页分组标题（个性化 / 记忆引擎 / 搜索 / 连接与安全 / 帮助）：
+      // 先给「这一段在管什么」，卡片才是具体选项
+      ".mneme-set-grouphead{font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-label-tertiary);margin:24px 0 10px}",
+      ".mneme-set-grouphead:first-child{margin-top:8px}",
       ".mneme-set-token{font-family:monospace;font-size:12px;padding:7px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary);word-break:break-all;user-select:all}",
-      ".mneme-set-hint{font-size:12px;color:var(--dsw-alias-label-tertiary)}"
+      ".mneme-set-hint{font-size:12px;color:var(--dsw-alias-label-tertiary)}",
+      // --- 重要性编辑行：与查看态同一份 Lucide 星形（此前是文本星号下拉，角更尖锐且与其他星不统一） ---
+      ".mneme-staredit{display:inline-flex;align-items:center;gap:1px;justify-self:start}",
+      ".mneme-starbtn{border:none;background:none;cursor:pointer;padding:2px 1px;display:inline-flex;color:var(--dsw-alias-label-secondary);transition:transform .12s}",
+      ".mneme-starbtn--on{color:var(--dsw-alias-state-warning,#d97706)}",
+      ".mneme-starbtn:hover{transform:scale(1.12)}",
+      ".mneme-starbtn:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px;border-radius:4px}",
+      // --- 意见与反馈：图标行 + 版本 footer，收在设置页末尾当「关于」用 ---
+      ".mneme-feedlist{display:flex;flex-direction:column;gap:4px}",
+      ".mneme-feedrow{display:flex;align-items:flex-start;gap:10px;padding:9px 10px;border-radius:10px;text-decoration:none;transition:background .12s}",
+      ".mneme-feedrow:hover{background:var(--dsw-alias-interactive-bg-hover)}",
+      ".mneme-feedico{flex:none;width:28px;height:28px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}",
+      ".mneme-feedrow:hover .mneme-feedico{background:var(--dsw-alias-interactive-bg-active)}",
+      ".mneme-feedtext{display:flex;flex-direction:column;gap:1px;min-width:0}",
+      ".mneme-feedname{font-size:13px;line-height:18px;font-weight:500;color:var(--dsw-alias-label-primary)}",
+      ".mneme-feedsub{font-size:12px;line-height:17px;color:var(--dsw-alias-label-tertiary)}",
+      ".mneme-set-foot{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-top:12px;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l1);font-size:12px;color:var(--dsw-alias-label-tertiary)}"
     ].join("\n");
     if (typeof document !== "undefined" && document.querySelector(`style[data-plugin-css="${CSS_TAG}"]`) === null) {
       const tag = document.createElement("style");
@@ -1597,7 +1888,9 @@ window.__ModuleLoader__.load({
             h("div", { className: "mneme-gs-title" },
               h("span", null, selected.node.name),
               h("span", { className: "mneme-gs-meta" },
-                `${entityTypeLabel(t, selected.node.type || "concept")} · ★${selected.node.mention_count ?? 1}`)
+                `${entityTypeLabel(t, selected.node.type || "concept")} · `,
+                h(StarGlyph, { size: 11 }),
+                ` ${selected.node.mention_count ?? 1}`)
             ),
             selected.node.name !== entityName && h("button", {
               className: "mneme-footbtn",
@@ -1721,6 +2014,11 @@ window.__ModuleLoader__.load({
                       className: "mneme-graphsvg",
                       viewBox: `0 0 ${VIEW_W} ${VIEW_H}`,
                       style: { height: 320 },
+                      role: "img",
+                      "aria-label": t("memory.graph.summary")
+                        .replace("{entity}", (data.root && (data.root.label || data.root.name)) || "")
+                        .replace("{nodes}", String(data.nodes.length))
+                        .replace("{edges}", String(data.edges.length)),
                       onMouseDown: onSurfaceMouseDown
                     },
                       h("g", {
@@ -1767,9 +2065,15 @@ window.__ModuleLoader__.load({
     // 分组排版：核心/增强/巩固常驻，注入策略等收进「高级」折叠，普通用户
     // 不被专业项淹没。429 调速器参数、distillMaxChars、codingBoostFactor
     // 属调优噪音，按对齐结论留在配置文件，不上 UI。
+    // #249 第二批：注入形态的父／子开关（父 = autoInject）。子项紧跟父行、缩进
+    // 显示；父关时子项加一句「不生效」，但开关仍可点——父关是「不生效」而不是
+    // 「重置用户配置」，子项自己勾着的值要留着，也应该能提前设好。同一份关系在
+    // 后端 src/config.js 的 INJECT_CHILD_FLAGS（运行时闸门），两侧漂移由
+    // test/inject-parent-gate.test.js 钉住。
+    const FEATURE_CHILDREN = { autoInject: ["injectGuidanceEnabled", "continuityRescueEnabled"] };
     const FEATURE_GROUPS = [
       { key: "group.core", items: ["autoInject", "autoSummarize", "hotMemoryEnabled", "memoryQualityFilter.enabled", "llmAudit.enabled"] },
-      { key: "group.enhance", items: ["entityExtractionEnabled", "codingRetrospect", "rerankEnabled", "resilientModelDownload", "searchSemanticDedup", "bm25SearchEnabled", "heatEnabled"] },
+      { key: "group.enhance", items: ["entityExtractionEnabled", "codingRetrospect", "rerankEnabled", "resilientModelDownload", "searchSemanticDedup", "bm25SearchEnabled", "heatEnabled", "documentMemoryEnabled"] },
       { key: "group.dream", items: ["autoDream", "sleepModeEnabled"] },
       // v0.8.0 A4（issue #17）：作用域隔离组——标注总开关 + 严格硬过滤。
       { key: "group.scope", items: ["scopeEnabled", "strictScope"] }
@@ -1777,13 +2081,19 @@ window.__ModuleLoader__.load({
     const FEATURE_ADVANCED_BOOLS = ["hybridInject", "selectiveInjectEnabled", "adaptiveThresholdEnabled", "reflectionUpdateEnabled", "reflectionFailureTracking", "conflictFreezeEnabled", "trustEpistemicWeighting"];
     // 字符串键（blur/Enter 提交，空串合法 = 跟随默认）：巩固模型与语义
     // 检索路线。embedProvider 是枚举，用下拉单独渲染。
-    const FEATURE_STRINGS = ["dreamProvider", "dreamModel", "sleepProvider", "sleepModel", "entityExtractionProvider", "entityExtractionModel", "localEmbedModel", "ollamaBaseUrl", "ollamaModel"];
+    const FEATURE_STRINGS = ["dreamProvider", "dreamModel", "sleepProvider", "sleepModel", "entityExtractionProvider", "entityExtractionModel", "localEmbedModel", "ollamaBaseUrl", "ollamaModel",
+      // Issue #239 第 4 项：错峰时段串（巩固侧与蒸馏侧）。此前只有后端白名单、
+      // 面板调不到——两个错峰键一个能调一个不能比都不给更让人困惑。
+      "dreamPeakHours", "summarizePeakHours"];
     const EMBED_PROVIDERS = ["openai", "local", "ollama"];
     // 实体抽取思考强度（issue #109）：与后端 FEATURE_FLAG_ENUMS 枚举对齐。
     const ENTITY_REASONING = ["none", "low", "medium", "high"];
+    // 蒸馏思考强度（issue #315）：比 entity 多一个 off（显式关思考，思考型模型
+    // 蒸馏防推理烧预算）。后端枚举含 off，面板必须能选到，否则操作者用不上。
+    const SUMMARIZE_REASONING = ["off", "none", "low", "medium", "high"];
 
-    function FeatureRow({ name, hint, on, disabled, onToggle }) {
-      return h("div", { className: "mneme-featrow" },
+    function FeatureRow({ name, hint, on, disabled, onToggle, sub }) {
+      return h("div", { className: "mneme-featrow", style: sub ? { paddingLeft: 18, opacity: 0.86 } : undefined },
         h("div", { className: "mneme-featmain" },
           h("div", { className: "mneme-featname" }, name),
           h("div", { className: "mneme-feathint" }, hint)
@@ -1853,6 +2163,7 @@ window.__ModuleLoader__.load({
           });
           if (!res.ok) throw new Error("HTTP " + res.status);
           setState(await res.json());
+          announce(t("memory.features.restartHint"));
           setSavedTick(true);
           setTimeout(() => setSavedTick(false), 1800);
         } catch {
@@ -1873,14 +2184,23 @@ window.__ModuleLoader__.load({
         put({ [key]: raw });
       };
 
-      const boolRow = (k) => h(FeatureRow, {
+      const boolRow = (k, opts = {}) => h(FeatureRow, {
         key: k,
         name: t(`memory.features.${k}`),
-        hint: t(`memory.features.${k}.hint`),
+        hint: t(`memory.features.${k}.hint`)
+          + (opts.gate && !eff[opts.gate] ? ` · ${t("memory.features.parentOff")}` : ""),
         on: !!eff[k],
         disabled: busy,
+        sub: !!opts.sub,
         onToggle: () => put({ [k]: !eff[k] })
       });
+
+      // 带子项的父开关：父行 + 紧随其后的子行（子行缩进，父关时标注不生效）。
+      const flagRow = (k) => {
+        const kids = FEATURE_CHILDREN[k];
+        if (!kids) return boolRow(k);
+        return h(react.Fragment, { key: k }, boolRow(k), kids.map((c) => boolRow(c, { sub: true, gate: k })));
+      };
 
       // 模型枚举项的统一形状：string 或 {id, name?}（/llm-providers 契约）。
       const modelLabel = (m) => (typeof m === "string" ? m : String((m && (m.name || m.id)) ?? ""));
@@ -2026,7 +2346,11 @@ window.__ModuleLoader__.load({
         Array.isArray(routes)
           ? routeSelects("dreamProvider", "dreamModel", dreamTest, setDreamTest, "dreamReasoningEffort")
           : h(react.Fragment, null, strRow("dreamProvider"), strRow("dreamModel")),
-        h("div", { className: "mneme-featsubhint" }, t("memory.features.dreamModelHint"))
+        h("div", { className: "mneme-featsubhint" }, t("memory.features.dreamModelHint")),
+        // Issue #239 第 4 项镜像到巩固：高峰时段串（空 = 关闭）。放在 autoDream
+        // 子块内——它是巩固的排程，开关关掉时不该还在界面上留着可编辑的输入框。
+        strRow("dreamPeakHours"),
+        h("div", { className: "mneme-featsubhint" }, t("memory.features.dreamPeakHours.hint"))
       );
 
       // 睡眠模型：sleepModeEnabled 开着才展开（sleepProvider/sleepModel 随本版
@@ -2056,6 +2380,27 @@ window.__ModuleLoader__.load({
         h("div", { className: "mneme-featsubhint" }, t("memory.features.entityExtractionModelHint"))
       );
 
+      // 蒸馏思考强度（issue #315）：autoSummarize 开着才展开，档位与实体抽取
+      // 同款枚举下拉、即时提交。蒸馏没有独立 provider/model 路由键（跟随会话
+      // 头或 config 文件的 summarizeProvider/summarizeModel），不上连通性测试。
+      const summarizeSub = eff.autoSummarize && h("div", { className: "mneme-featsub" },
+        h("div", { className: "mneme-featnum" },
+          h("span", { className: "mneme-featnumlabel" }, t("memory.features.summarizeReasoningEffort")),
+          h("select", {
+            className: "mneme-select",
+            value: eff.summarizeReasoningEffort || "none",
+            disabled: busy,
+            onChange: (e) => put({ summarizeReasoningEffort: e.target.value })
+          },
+            SUMMARIZE_REASONING.map((r) => h("option", { key: r, value: r }, t(`memory.features.summarizeReasoningEffort.${r}`))))
+        ),
+        h("div", { className: "mneme-featsubhint" }, t("memory.features.summarizeReasoningEffort.hint")),
+        // Issue #239 第 4 项：蒸馏侧错峰时段串（空 = 关闭）。与思考强度同处一个
+        // autoSummarize 子块——两处错峰开关都能在面板上调（巩固侧见 dreamSub）。
+        strRow("summarizePeakHours"),
+        h("div", { className: "mneme-featsubhint" }, t("memory.features.summarizePeakHours.hint"))
+      );
+
       if (error && !state) return h("section", { className: "mneme-set-card" },
         h("div", { className: "mneme-set-title" }, t("memory.features.title")),
         h("div", { className: "mneme-set-hint" }, error));
@@ -2072,7 +2417,8 @@ window.__ModuleLoader__.load({
           : h(react.Fragment, null,
               FEATURE_GROUPS.map((g) => h(react.Fragment, { key: g.key },
                 h("div", { className: "mneme-featgroup" }, t(`memory.features.${g.key}`)),
-                g.items.map(boolRow),
+                g.items.map(flagRow),
+                g.key === "group.core" && h(react.Fragment, null, summarizeSub),
                 g.key === "group.enhance" && h(react.Fragment, null, embedSub, entitySub),
                 g.key === "group.dream" && h(react.Fragment, null, dreamSub, sleepSub)
               )),
@@ -2086,7 +2432,7 @@ window.__ModuleLoader__.load({
                   h(Icon, { name: showAdv ? "chevronDown" : "chevronRight", size: 12 }),
                   t("memory.features.advancedToggle"))
               ),
-              showAdv && FEATURE_ADVANCED_BOOLS.map(boolRow)
+              showAdv && FEATURE_ADVANCED_BOOLS.map((k) => boolRow(k))
             )
       );
     }
@@ -2196,12 +2542,20 @@ window.__ModuleLoader__.load({
       // 版本/平台方便归档，正文同款模板；纯链接零后端成本。
       const feedbackEnv = `**插件版本**: ${pkgVersion}\n**平台**: ${platformLabel()}\n`;
       const feedbackBody = feedbackEnv + "**问题描述**:\n- 期望行为:\n- 实际行为:\n- 复现步骤:\n";
-      const issueHref = "https://github.com/modusensus/dsh-mneme/issues/new?title="
+      const issueHref = "https://github.com/slow-stack/mneme/issues/new?title="
         + encodeURIComponent("[dsh-mneme] 问题反馈")
         + "&body=" + encodeURIComponent(feedbackBody);
       const mailHref = "mailto:work@modusensus.space?subject="
         + encodeURIComponent(`[dsh-mneme 反馈] ${pkgVersion} / ${platformLabel()}`)
         + "&body=" + encodeURIComponent(feedbackBody);
+      // 反馈行：图标 + 主标题 + 一句副标；锚点属性由调用点给（保持 href 字面量可被测试锁住）
+      const feedRow = (iconName, label, sub, anchorProps) => h("a", {
+        className: "mneme-feedrow", ...anchorProps
+      },
+        h("span", { className: "mneme-feedico", "aria-hidden": "true" }, h(Icon, { name: iconName, size: 14 })),
+        h("span", { className: "mneme-feedtext" },
+          h("span", { className: "mneme-feedname" }, label),
+          h("span", { className: "mneme-feedsub" }, sub)));
 
       // Runtime mode + external API — two independent fetches: one failing
       // endpoint only errors its own card, never the other one.
@@ -2239,6 +2593,7 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ profile })
           });
           setSaved(true);
+          announce(t("memory.settings.profileSaved"));
           setTimeout(() => setSaved(false), 1500);
         } catch { /* ignore */ }
       }
@@ -2297,6 +2652,7 @@ window.__ModuleLoader__.load({
             body: JSON.stringify(vector)
           });
           setVectorSaved(true);
+          announce(t("memory.settings.vectorSaved"));
           setTimeout(() => setVectorSaved(false), 1500);
         } catch { /* ignore */ }
       }
@@ -2318,6 +2674,7 @@ window.__ModuleLoader__.load({
           if (apiToken.trim()) window.localStorage.setItem("dsh-mneme-api-token", apiToken.trim());
           else window.localStorage.removeItem("dsh-mneme-api-token");
           setApiTokenSaved(true);
+          announce(t("memory.settings.apiTokenSaved"));
           setTimeout(() => setApiTokenSaved(false), 1500);
         } catch { /* ignore */ }
       }
@@ -2338,6 +2695,7 @@ window.__ModuleLoader__.load({
           });
           if (!res.ok) throw new Error("HTTP " + res.status);
           setModeSaved(true);
+          announce(t("memory.settings.mode.savedHint"));
           setTimeout(() => setModeSaved(false), 2500);
         } catch (err) {
           setMode(prev);
@@ -2370,6 +2728,7 @@ window.__ModuleLoader__.load({
           setExtapiHost(next.host);
           setExtapiPort(next.port ? String(next.port) : "");
           setExtapiSaved(true);
+          announce(t("memory.settings.extapi.savedHint"));
           setTimeout(() => setExtapiSaved(false), 2500);
         } catch (err) {
           setExtapiError((err && err.message) || "failed");
@@ -2396,7 +2755,7 @@ window.__ModuleLoader__.load({
       function copyExtapiToken() {
         const token = extapi ? extapi.token || "" : "";
         navigator.clipboard?.writeText(token).then(
-          () => { setExtapiCopied(true); setTimeout(() => setExtapiCopied(false), 1500); },
+          () => { setExtapiCopied(true); announce(t("memory.settings.extapi.copied")); setTimeout(() => setExtapiCopied(false), 1500); },
           () => {}
         );
       }
@@ -2405,7 +2764,7 @@ window.__ModuleLoader__.load({
         // 版本自检横幅 — 仅 outdated 时渲染（up-to-date/ahead/unknown/失败
         // 全部零渲染）。钉子警示：安装时指定过版本号的 profile 会被 pnpm
         // 挡住常规升级（#174 报障者的实际成因）；市场收录新发布约有 1 天延迟。
-        updateInfo && h("section", { className: "mneme-set-sec" },
+        updateInfo && h("section", { className: "mneme-set-card" },
           h("div", { className: "mneme-set-title" },
             t("memory.settings.version.outdated")
               .replace("{v}", updateInfo.latest)
@@ -2413,8 +2772,10 @@ window.__ModuleLoader__.load({
           ),
           h("div", { className: "mneme-featsubhint" }, t("memory.settings.version.outdatedHint"))
         ),
+        // —— 个性化：画像 / 规则 / 自定义指令（Agent 怎么对你） ——
+        h("div", { className: "mneme-set-grouphead" }, t("memory.settings.group.personal")),
         // 用户画像 — who the agent is talking to
-        h("section", { className: "mneme-set-sec" },
+        h("section", { className: "mneme-set-card" },
           h("div", { className: "mneme-set-title" }, t("memory.settings.profile")),
           h("div", { className: "mneme-set-desc" }, t("memory.settings.profileHint")),
           h("textarea", {
@@ -2429,7 +2790,7 @@ window.__ModuleLoader__.load({
           )
         ),
         // 规则 — numbered rows, hover reveals the delete affordance
-        h("section", { className: "mneme-set-sec" },
+        h("section", { className: "mneme-set-card" },
           h("div", { className: "mneme-set-title" }, t("memory.settings.rules")),
           h("div", { className: "mneme-set-desc" }, t("memory.settings.rulesHint")),
           rules.length === 0 && h("div", { className: "mneme-xempty" }, t("memory.settings.empty")),
@@ -2458,7 +2819,7 @@ window.__ModuleLoader__.load({
           )
         ),
         // 自定义指令 — slash commands as titled rows
-        h("section", { className: "mneme-set-sec" },
+        h("section", { className: "mneme-set-card" },
           h("div", { className: "mneme-set-title" }, t("memory.settings.commands")),
           h("div", { className: "mneme-set-desc" }, t("memory.settings.commandsHint")),
           commands.length === 0 && h("div", { className: "mneme-xempty" }, t("memory.settings.empty")),
@@ -2488,9 +2849,8 @@ window.__ModuleLoader__.load({
             )
           )
         ),
-        // 功能开关 — 0.7.13/0.7.14 后端能力的前端总闸（codingRetrospect、
-        // 智能调速器参数、实体抽取、巩固等）；重启 DSH 后生效。
-        h(FeaturesCard, { t }),
+        // —— 记忆引擎：运行模式（粗粒度）在前，功能开关（细粒度）紧随 ——
+        h("div", { className: "mneme-set-grouphead" }, t("memory.settings.group.engine")),
         // 运行模式 — light vs standard chip radios; each click PUTs and the
         // change only lands after a DSH restart (green saved hint says so).
         h("section", { className: "mneme-set-card" },
@@ -2517,6 +2877,30 @@ window.__ModuleLoader__.load({
                   t("memory.settings.mode.offList"))
               )
         ),
+        // 功能开关 — 后端能力的细粒度闸门；改动即时保存，重启 DSH 后生效。
+        h(FeaturesCard, { t }),
+        // —— 搜索：语义召回 ——
+        h("div", { className: "mneme-set-grouphead" }, t("memory.settings.group.search")),
+        // 向量搜索 — semantic recall over an embeddings API
+        h("section", { className: "mneme-set-card" },
+          h("div", { className: "mneme-set-title" }, t("memory.settings.vectorTitle")),
+          h("div", { className: "mneme-set-desc" }, t("memory.settings.vectorHint")),
+          h("label", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10, fontSize: 13, color: "var(--dsw-alias-label-primary)" } },
+            h("input", { type: "checkbox", checked: !!vector.enabled, onChange: (e) => setVector({ ...vector, enabled: e.target.checked }) }),
+            h("span", null, t("memory.settings.vectorEnabled"))
+          ),
+          h("input", { className: "mneme-set-input", value: vector.baseUrl, placeholder: t("memory.settings.vectorBaseUrl"), onChange: (e) => setVector({ ...vector, baseUrl: e.target.value }) }),
+          h("input", { className: "mneme-set-input", type: "password", value: vector.apiKey, placeholder: t("memory.settings.vectorApiKey"), onChange: (e) => setVector({ ...vector, apiKey: e.target.value }) }),
+          h("input", { className: "mneme-set-input", value: vector.model, placeholder: t("memory.settings.vectorModel"), onChange: (e) => setVector({ ...vector, model: e.target.value }) }),
+          h("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } },
+            h("button", { className: "mneme-btn", onClick: saveVector }, t("memory.settings.vectorSave")),
+            vectorSaved && h("span", { className: "mneme-saved" }, t("memory.settings.vectorSaved")),
+            h("button", { className: "mneme-btn", onClick: reindex, disabled: reindexing }, reindexing ? t("memory.settings.vectorReindexing") : t("memory.settings.vectorReindex")),
+            reindexMsg && h("span", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary, #666)" } }, reindexMsg)
+          )
+        ),
+        // —— 连接与安全：外部访问 API / 面板令牌 ——
+        h("div", { className: "mneme-set-grouphead" }, t("memory.settings.group.connect")),
         // 外部访问 API — standalone HTTP service for plugins/CLI/desktop tools;
         // the token is generated and kept by the backend, so it is read-only
         // here with a copy affordance. Changes need a DSH restart.
@@ -2580,26 +2964,10 @@ window.__ModuleLoader__.load({
                 )
               )
         ),
-        // 向量搜索 — semantic recall over an embeddings API
-        h("section", { className: "mneme-set-sec" },
-          h("div", { className: "mneme-set-title" }, t("memory.settings.vectorTitle")),
-          h("div", { className: "mneme-set-desc" }, t("memory.settings.vectorHint")),
-          h("label", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10, fontSize: 13, color: "var(--dsw-alias-label-primary)" } },
-            h("input", { type: "checkbox", checked: !!vector.enabled, onChange: (e) => setVector({ ...vector, enabled: e.target.checked }) }),
-            h("span", null, t("memory.settings.vectorEnabled"))
-          ),
-          h("input", { className: "mneme-set-input", value: vector.baseUrl, placeholder: t("memory.settings.vectorBaseUrl"), onChange: (e) => setVector({ ...vector, baseUrl: e.target.value }) }),
-          h("input", { className: "mneme-set-input", type: "password", value: vector.apiKey, placeholder: t("memory.settings.vectorApiKey"), onChange: (e) => setVector({ ...vector, apiKey: e.target.value }) }),
-          h("input", { className: "mneme-set-input", value: vector.model, placeholder: t("memory.settings.vectorModel"), onChange: (e) => setVector({ ...vector, model: e.target.value }) }),
-          h("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } },
-            h("button", { className: "mneme-btn", onClick: saveVector }, t("memory.settings.vectorSave")),
-            vectorSaved && h("span", { className: "mneme-saved" }, t("memory.settings.vectorSaved")),
-            h("button", { className: "mneme-btn", onClick: reindex, disabled: reindexing }, reindexing ? t("memory.settings.vectorReindexing") : t("memory.settings.vectorReindex")),
-            reindexMsg && h("span", { style: { fontSize: 12, color: "var(--dsw-alias-label-secondary, #666)" } }, reindexMsg)
-          )
-        ),
+        // 向量搜索卡片已上移到「搜索」分组（与功能开关里的语义检索路线相邻），
+        // 这里不再重复渲染。
         // API Token — advanced, last
-        h("section", { className: "mneme-set-sec" },
+        h("section", { className: "mneme-set-card" },
           h("div", { className: "mneme-set-title" }, t("memory.settings.apiTokenTitle")),
           h("div", { className: "mneme-set-desc" }, t("memory.settings.apiTokenHint")),
           h("div", { style: { display: "flex", gap: 8 } },
@@ -2615,18 +2983,25 @@ window.__ModuleLoader__.load({
           ),
           apiTokenSaved && h("div", { style: { marginTop: 8 } }, h("span", { className: "mneme-saved" }, t("memory.settings.apiTokenSaved")))
         ),
-        // 帮助与反馈 — 反馈问题三入口（新建 issue 预填 / 邮件 / 浏览已知问题）。
+        // —— 帮助：意见与反馈（图标行 + 版本 footer，兼当「关于」收尾） ——
+        h("div", { className: "mneme-set-grouphead" }, t("memory.settings.group.help")),
+        // 反馈三入口：新建 issue 预填（版本+平台）/ 邮件 / 浏览已知问题。
         // 纯前端链接零后端成本；插件版本来自 /info，平台取 userAgent。GitHub
         // 仓库当前没有 issue 模板，故用 issues/new?title=&body= 直接预填。
-        h("section", { className: "mneme-set-sec" },
+        h("section", { className: "mneme-set-card" },
           h("div", { className: "mneme-set-title" }, t("memory.settings.feedback.title")),
           h("div", { className: "mneme-set-desc" }, t("memory.settings.feedback.desc")),
-          h("div", { style: { display: "flex", flexDirection: "column", gap: 2 } },
-            h("a", { className: "mneme-feed-link", href: issueHref, target: "_blank", rel: "noopener noreferrer" }, t("memory.settings.feedback.newIssue")),
-            h("a", { className: "mneme-feed-link", href: mailHref }, t("memory.settings.feedback.email")),
-            h("a", { className: "mneme-feed-link", href: "https://github.com/modusensus/dsh-mneme/issues", target: "_blank", rel: "noopener noreferrer" }, t("memory.settings.feedback.browse"))
+          h("div", { className: "mneme-feedlist" },
+            feedRow("bug", t("memory.settings.feedback.newIssue"), t("memory.settings.feedback.newIssue.sub"),
+              { href: issueHref, target: "_blank", rel: "noopener noreferrer" }),
+            feedRow("mail", t("memory.settings.feedback.email"), t("memory.settings.feedback.email.sub"),
+              { href: mailHref }),
+            feedRow("search", t("memory.settings.feedback.browse"), t("memory.settings.feedback.browse.sub"),
+              { href: "https://github.com/slow-stack/mneme/issues", target: "_blank", rel: "noopener noreferrer" })
           ),
-          h("div", { className: "mneme-featsubhint", style: { marginTop: 8 } }, t("memory.settings.feedback.hint"))
+          h("div", { className: "mneme-set-foot" },
+            h("span", null, `dsh-mneme v${pkgVersion}`)
+          )
         )
       );
     }
@@ -2664,11 +3039,35 @@ window.__ModuleLoader__.load({
     // 上下文裁不住它；运行时拒绝 react-dom 时就地渲染（position:fixed 仍然成立）。
     function MemoryOverlay({ t }) {
       const [open, setOpen] = useOverlayOpen();
+      // #178：弹层焦点管理——打开时把焦点移入面板（关闭按钮为入口），
+      // Tab 循环圈在面板内（Tab 从最后一个元素出去回到关闭按钮），
+      // Esc/关闭时把焦点还给触发元素（侧边栏入口）。
+      const panelRef = useRef(null);
+      const closeBtnRef = useRef(null);
       useEffect(() => {
         if (!open) return undefined;
-        const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+        const onKey = (e) => {
+          if (e.key === "Escape") { setOpen(false); return; }
+          if (e.key !== "Tab" || !panelRef.current) return;
+          const focusables = panelRef.current.querySelectorAll('button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])');
+          if (focusables.length === 0) return;
+          const first = focusables[0];
+          const last = focusables[focusables.length - 1];
+          if (e.shiftKey && (document.activeElement === first || !panelRef.current.contains(document.activeElement))) {
+            e.preventDefault();
+            last.focus();
+          } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+          }
+        };
         window.addEventListener("keydown", onKey);
-        return () => window.removeEventListener("keydown", onKey);
+        if (closeBtnRef.current) closeBtnRef.current.focus();
+        return () => {
+          window.removeEventListener("keydown", onKey);
+          const opener = document.querySelector('[data-mneme-overlay-opener]');
+          if (opener) opener.focus();
+        };
       }, [open]);
       if (!open) return null;
       // 背板与 sheet 是兄弟节点而不是嵌套：点击背板自身才关闭，sheet 内部
@@ -2679,15 +3078,16 @@ window.__ModuleLoader__.load({
           onClick: () => setOpen(false),
           "aria-hidden": "true"
         }),
-        h("div", { className: "mneme-overlay", role: "region", "aria-label": t("memory.view.label") },
+        h("div", { className: "mneme-overlay", role: "region", "aria-label": t("memory.view.label"), ref: panelRef },
           h("div", { className: "mneme-overlaybar" },
             h("span", { className: "mneme-overlaytitle" },
-              h(IconArchiveOutline20, { size: 15 }),
+              renderArchiveIcon({ size: 15 }),
               t("memory.view.label")
             ),
             h("button", {
               type: "button",
               className: "mneme-footbtn",
+              ref: closeBtnRef,
               "aria-label": t("memory.overlay.close"),
               title: t("memory.overlay.close"),
               onClick: () => setOpen(false)
@@ -2705,17 +3105,26 @@ window.__ModuleLoader__.load({
 
     // --- Status sub-view: a responsive grid of stat cards. Every card owns
     // its fetch, loading ("…") and error state, so one failing endpoint
-    // never blanks or blocks the others. ---
-    function StatusCard({ t, title, loading, error, num, cap }) {
-      return h("div", { className: "mneme-statuscard" },
-        h("div", { className: "mneme-xcolhead" }, title),
+    // never blanks or blocks the others.
+    // 卡片解剖：标题（h3）→ 大数字 → 指标行（rows，一行一指标）→ 脚注
+    // （foot，采样口径这类背景信息）。cap 仍保留给单句说明型卡片。
+    function StatusCard({ t, title, loading, error, num, cap, rows, foot, className }) {
+      return h("div", { className: className ? `mneme-statuscard ${className}` : "mneme-statuscard" },
+        h("h3", { className: "mneme-xcolhead" }, title),
         loading
           ? h("div", { className: "mneme-statusnum" }, "…")
           : error
             ? h("div", { className: "mneme-statuscap", style: { color: "var(--dsw-alias-state-error,#c33)" } }, t("memory.status.error"))
             : h(react.Fragment, null,
                 h("div", { className: "mneme-statusnum" }, num),
-                cap ? h("div", { className: "mneme-statuscap" }, cap) : null
+                rows && rows.length
+                  ? h("div", { className: "mneme-statrows" },
+                      rows.map((r, i) => h("div", { className: "mneme-statrow", key: r.key ?? i },
+                        h("span", null, r.label),
+                        h("span", { className: "mneme-statrowval", title: String(r.value) }, String(r.value))))
+                    )
+                  : cap ? h("div", { className: "mneme-statuscap" }, cap) : null,
+                foot ? h("div", { className: "mneme-statfoot" }, foot) : null
               )
       );
     }
@@ -2742,16 +3151,15 @@ window.__ModuleLoader__.load({
           .catch(() => { if (!cancelled) setState({ loading: false, error: true, total: 0, byType: [] }); });
         return () => { cancelled = true; };
       }, []);
-      const cap = state.byType
-        .map(([ty, n]) => `${typeLabel(t, ty)} ${n === null ? "—" : n}`)
-        .join(" · ");
+      const rows = state.byType
+        .map(([ty, n]) => ({ label: typeLabel(t, ty), value: n === null ? "—" : String(n) }));
       return h(StatusCard, {
         t,
         title: t("memory.status.memories"),
         loading: state.loading,
         error: state.error,
         num: state.total.toLocaleString(),
-        cap
+        rows
       });
     }
 
@@ -2779,14 +3187,14 @@ window.__ModuleLoader__.load({
           .catch(() => { if (!cancelled) setState({ loading: false, error: true, total: 0, byType: [] }); });
         return () => { cancelled = true; };
       }, []);
-      const cap = state.byType.map(([ty, n]) => `${entityTypeLabel(t, ty)} ${n}`).join(" · ");
+      const rows = state.byType.map(([ty, n]) => ({ label: entityTypeLabel(t, ty), value: String(n) }));
       return h(StatusCard, {
         t,
         title: t("memory.status.entities"),
         loading: state.loading,
         error: state.error,
         num: state.total.toLocaleString(),
-        cap
+        rows
       });
     }
 
@@ -2953,7 +3361,9 @@ window.__ModuleLoader__.load({
           loading: state.loading,
           error: state.error,
           num,
-          cap
+          cap,
+          // 概览区三张卡在 2 列档位会剩下半行空洞：向量卡在该档位跨满整行
+          className: "mneme-statuscard--vectorwide"
         }),
         !state.loading && !state.error && localBlocked
           ? h("div", { className: "mneme-statuscap", style: { marginTop: "6px" } },
@@ -2989,39 +3399,59 @@ window.__ModuleLoader__.load({
 
     // 巩固状态卡（×2）：最近一次 autoDream 运行 + 待确认冲突计数。数据来自
     // /dream-status，一次取回两张卡共用；失败只影响这两张卡自身。
-    function DreamStatusCards({ t }) {
+    function DreamStatusCards({ t, onGotoQueue }) {
       const [state, setState] = useState({ loading: true, error: false, lastRun: null, pending: 0 });
       useEffect(() => {
         let cancelled = false;
-        apiFetch("/api/dsh-mneme/dream-status")
-          .then((res) => { if (!res.ok) throw new Error("http"); return res.json(); })
-          .then((d) => {
-            if (cancelled) return;
-            setState({
-              loading: false,
-              error: false,
-              lastRun: (d && d.lastRun) || null,
-              pending: Number((d && d.pendingConflicts) ?? 0)
-            });
-          })
-          .catch(() => { if (!cancelled) setState({ loading: false, error: true, lastRun: null, pending: 0 }); });
-        return () => { cancelled = true; };
+        const loadOnce = () => {
+          apiFetch("/api/dsh-mneme/dream-status")
+            .then((res) => { if (!res.ok) throw new Error("http"); return res.json(); })
+            .then((d) => {
+              if (cancelled) return;
+              setState({
+                loading: false,
+                error: false,
+                lastRun: (d && d.lastRun) || null,
+                pending: Number((d && d.pendingConflicts) ?? 0)
+              });
+            })
+            .catch(() => { if (!cancelled) setState({ loading: false, error: true, lastRun: null, pending: 0 }); });
+        };
+        loadOnce();
+        // #295 评审：裁决完成后队列会广播 mneme:conflicts-changed，这里重取
+        // 计数，状态卡的「待确认冲突」不再停留旧值。
+        window.addEventListener("mneme:conflicts-changed", loadOnce);
+        return () => { cancelled = true; window.removeEventListener("mneme:conflicts-changed", loadOnce); };
       }, []);
       const run = state.lastRun;
       const num = run ? formatRelativeTime(run.created_at, t) : t("memory.status.dreamNever");
       const cap = run
         ? `${run.status || "—"}${run.model ? ` · ${run.model}` : ""}`
         : t("memory.settings.mode.offList");
+      // #178：pending>0 时冲突卡可激活（role=button + 可聚焦 + 回车/空格），
+      // 激活直达队列——StatusPanel 把 onGotoQueue 传进来（一步 prop，无线程）。
+      const pending = state.pending > 0;
+      const gotoQueue = () => { if (pending && onGotoQueue) onGotoQueue(); };
       return h(react.Fragment, null,
         h(StatusCard, { t, title: t("memory.status.dream"), loading: state.loading, error: state.error, num, cap }),
-        h(StatusCard, {
-          t,
-          title: t("memory.status.conflicts"),
-          loading: state.loading,
-          error: state.error,
-          num: state.pending.toLocaleString(),
-          cap: t("memory.status.conflictsHint")
-        })
+        h("div", {
+          role: pending ? "button" : undefined,
+          tabIndex: pending ? 0 : undefined,
+          "aria-label": pending ? t("memory.status.conflictQueue.goto") : undefined,
+          className: pending ? "mneme-conflict-jump" : undefined,
+          style: pending ? { cursor: "pointer" } : undefined,
+          onClick: pending ? gotoQueue : undefined,
+          onKeyDown: pending ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); gotoQueue(); } } : undefined
+        },
+          h(StatusCard, {
+            t,
+            title: t("memory.status.conflicts"),
+            loading: state.loading,
+            error: state.error,
+            num: state.pending.toLocaleString(),
+            cap: t("memory.status.conflictsHint")
+          })
+        )
       );
     }
 
@@ -3045,6 +3475,66 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // --- 注入预览（issue #179，状态页）---------------------------------------
+    // 展示最近一帧 prompt 组装注入了什么：条目构成（类型/标题/重要性/字符数）、
+    // hot memory 与总体积、当前生效参数（maxItems/threshold/自适应/scope/轮换）。
+    // 数据来自 /inject-preview 的旁路快照——就是上次真实渲染用的同一份候选，
+    // 不二次检索。无快照（autoInject 关/新会话/旧宿主）整卡退化为「暂无预览」。
+    function InjectPreviewCard({ t }) {
+      const [snap, setSnap] = useState(null);
+      const [loading, setLoading] = useState(true);
+      useEffect(() => {
+        let cancelled = false;
+        apiFetch("/api/dsh-mneme/inject-preview")
+          .then((res) => { if (!res.ok) throw new Error("http"); return res.json(); })
+          .then((j) => { if (!cancelled) { setSnap(j && j.snapshot); setLoading(false); } })
+          .catch(() => { if (!cancelled) setLoading(false); });
+        return () => { cancelled = true; };
+      }, []);
+      if (loading) return null;
+      if (!snap) {
+        return h("div", { className: "mneme-statuscard" },
+          h("h3", { className: "mneme-xcolhead" }, t("memory.status.injectPreview")),
+          h("div", { className: "mneme-statuscap" }, t("memory.status.injectPreviewNone"))
+        );
+      }
+      // 参数改用指标行呈现：maxItems/threshold 这类裸键名换成白话标签，
+      // 查询串这类背景信息放脚注。
+      const rows = [
+        { label: t("memory.status.injectPreview.maxItems"), value: String(snap.maxItems) },
+        { label: t("memory.status.injectPreview.threshold"), value: String(snap.threshold) },
+        snap.adaptive ? { label: t("memory.status.injectPreview.adaptiveOn"), value: "✓" } : null,
+        snap.scoped
+          ? { label: t("memory.status.injectPreview.scope"), value: snap.scoped.agent_scope || snap.scoped.workspace_scope }
+          : null,
+        snap.rotated > 0 ? { label: t("memory.status.injectPreview.rotated"), value: String(snap.rotated) } : null,
+        snap.hotChars > 0
+          ? { label: t("memory.status.injectPreview.hot"), value: `${snap.hotChars}${t("memory.status.injectPreview.charsUnit")}` }
+          : null,
+        { label: t("memory.status.injectPreview.chars"), value: `${snap.totalChars}${t("memory.status.injectPreview.charsUnit")}` }
+      ].filter(Boolean);
+      const foot = snap.query
+        ? t("memory.status.injectPreview.query").replace("{query}", snap.query.slice(0, 24))
+        : null;
+      return h("div", { className: "mneme-statuscard mneme-statuscard--wide" },
+        h("h3", { className: "mneme-xcolhead" }, t("memory.status.injectPreview")),
+        h("div", { className: "mneme-statrows" },
+          rows.map((r, i) => h("div", { className: "mneme-statrow", key: i },
+            h("span", null, r.label),
+            h("span", { className: "mneme-statrowval", title: String(r.value) }, String(r.value))))),
+        foot ? h("div", { className: "mneme-statfoot" }, foot) : null,
+        h("div", { style: { marginTop: 10 } },
+          (snap.entries || []).length === 0
+            ? h("div", { className: "mneme-statuscap" }, t("memory.status.injectPreview.empty"))
+            : (snap.entries || []).map((m) => h("div", { key: m.id, style: { display: "flex", gap: 8, alignItems: "baseline", fontSize: 12, padding: "2px 0" } },
+                h("span", { className: "mneme-xcolhead" }, typeLabel(t, m.type)),
+                h("span", { style: { flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, m.title || "—"),
+                h("span", { className: "mneme-xcolhead" },
+                  h(StarGlyph, { size: 11 }),
+                  ` ${m.importance ?? "—"} · ${m.chars}${t("memory.status.injectPreview.charsUnit")}`))))
+      );
+    }
+
     // --- 冲突集中处理队列（v0.8.0，状态页）---------------------------------
     // 此前冻结冲突只有计数与散落徽章，resolveConflictPending 无任何调用方——
     // 这里是第一处理入口：并排展示双方内容 + reason，人工选保留方后走
@@ -3052,53 +3542,120 @@ window.__ModuleLoader__.load({
     // 队列为空时整块不渲染（不打扰无冲突实例）。
     function ConflictsQueue({ t }) {
       const [items, setItems] = useState(null);
+      const [loadError, setLoadError] = useState(false);
       const [busy, setBusy] = useState(false);
-      const load = () => {
+      const load = (silent) => {
         apiFetch("/api/dsh-mneme/conflicts")
           .then((res) => { if (!res.ok) throw new Error("http"); return res.json(); })
-          .then((d) => setItems(d.items || []))
-          .catch(() => setItems([]));
+          .then((d) => { setItems(d.items || []); setLoadError(false); if (!silent) announce(t("memory.status.conflictQueue.refreshed")); })
+          // #295 评审：加载失败 ≠ 没有冲突——错误态渲染错误卡而不是空态教育卡，
+          // 不能让 500 把「暂时看不到」伪装成「没有冲突」。
+          .catch(() => { setItems([]); setLoadError(true); });
       };
       useEffect(() => { load(); }, []);
-      if (!items || items.length === 0) return null;
+      // #177：空队列不再整块消失——空态教育卡要渲染（原 return null 已移除）。
+      if (!items) return null;
       const resolve = (id, winner) => {
+        if (busy) return;
         setBusy(true);
+        // #178：裁决结果经 live region 播报（纯视觉刷新读屏不可感知）
+        const it = (items || []).find((x) => x.id === id) || {};
         apiFetch("/api/dsh-mneme/conflicts/resolve", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ id, winner, apply: winner !== null })
         })
           .then((res) => { if (!res.ok) throw new Error("http"); return res.json(); })
-          .then(() => load())
+          .then(() => {
+            announce(t("memory.status.conflictQueue.resolved").replace("{name}",
+              (winner === "a" ? (it.memory_a && it.memory_a.title) : winner === "b" ? (it.memory_b && it.memory_b.title) : "") || ""));
+            // #295 评审：裁决改变了 pending 总数——DreamStatusCards 只在挂载时
+            // 读一次 dream-status，不广播的话状态卡停留在旧计数。同页两个组件
+            // 用一个 window 事件对齐（比提升状态到 StatusPanel 少动三处）。
+            try { window.dispatchEvent(new CustomEvent("mneme:conflicts-changed")); } catch { /* 非浏览器环境 */ }
+            load(true);
+          })
           .catch(() => {})
           .finally(() => setBusy(false));
       };
-      const side = (s, label) => h("div", { className: "mneme-conflict-side" },
+      const side = (s, label, sideClass, ops, diffSide) => h("div", { className: `mneme-conflict-side ${sideClass}` },
         h("div", { className: "mneme-conflict-sidelabel" }, label),
         s.missing
           ? h("div", { className: "mneme-conflict-missing" }, t("memory.status.conflictQueue.missing"))
           : h(react.Fragment, null,
               h("div", { className: "mneme-conflict-sidetitle", title: s.title }, s.title || "…"),
-              h("div", { className: "mneme-conflict-snippet" }, (s.content || "").slice(0, 140)),
-              s.archived && h("span", { className: "mneme-badge mneme-badge--archived" }, t("memory.explorer.archivedBadge")))
+              // #177：词级 diff 可用（LCS 无损对齐成功）时用高亮视图替代纯文本。
+              // 侧别过滤（#295 评审修正）：A 侧渲染 same+del（它被删的部分高亮），
+              // B 侧渲染 same+ins（它新增的部分高亮）——每列忠实于自己的原文。
+              // title 提示颜色语义；diff 不可用时保留原 snippet。
+              ops
+                ? h("div", { className: "mneme-conflict-diff", title: t("memory.status.conflictQueue.diffTitle") },
+                    ops.map((o, k) => {
+                      if (o.kind === "same") return o.text;
+                      if (o.kind === "del" && diffSide === "a") {
+                        return h("span", { key: k, className: "mneme-conflict-mark mneme-conflict-mark--del" }, o.text);
+                      }
+                      if (o.kind === "ins" && diffSide === "b") {
+                        return h("span", { key: k, className: "mneme-conflict-mark mneme-conflict-mark--ins" }, o.text);
+                      }
+                      return null; // 对侧的编辑片段不出现在本列
+                    }))
+                : h("div", { className: "mneme-conflict-snippet" }, (s.content || "").slice(0, 140)),
+              // #177：预裁决阶段两侧都还活着——「已归档」徽章换成「冻结中」，
+              // 原注销记说明（applyHint）挪进 tooltip，不再整段占一行动态区。
+              h("span", {
+                className: "mneme-badge mneme-badge--frozen",
+                title: `${t("memory.status.conflictQueue.frozenTitle")} ${t("memory.status.conflictQueue.applyHintTitle")}`
+              }, t("memory.status.conflictQueue.frozenBadge")))
       );
+      // #177：相似度从 reason 文本中回收（sleep 路径写「相似度 0.87」，dream 路径
+      // 是 LLM 自由文本）——回收得到就画进度条，否则不画，绝不显示编造的数字。
+      // 防误报：只认「相似度 0.87 / similarity 0.87」这类锚定短语，不在全文里
+      // 捞数字（否则 reason 里的年份、条数都会被当成相似度）。
+      const similarityOf = (reason) => {
+        const m = /(?:相似度|similarity)\s*([01](?:\.\d+)?)/i.exec(String(reason || ""));
+        const v = m ? Number(m[1]) : NaN;
+        return v >= 0 && v <= 1 ? v : null;
+      };
       return h("div", { className: "mneme-conflictq" },
         h("div", { className: "mneme-conflictq-head" },
           h("span", { className: "mneme-xcount" }, t("memory.status.conflicts")),
           h("button", { className: "mneme-footbtn", onClick: () => load() },
             h(Icon, { name: "refresh", size: 12 }), t("memory.status.conflictQueue.refresh"))),
-        items.map((it) => h("div", { key: it.id, className: "mneme-conflict-item" },
+        // #177 空态教育卡：队列没有条目时也渲染（整块此前直接 return null），
+        // 解释「什么情况会产生冲突、冻结是什么」——新用户第一次遇见冻结时
+        // 状态页已有解释在等他。加载失败时显示错误卡而不是空态卡。
+        items.length === 0 && (loadError
+          ? h("div", { className: "mneme-conflict-empty", role: "alert" },
+              h("div", { className: "mneme-conflict-empty-title" }, t("memory.status.error")))
+          : h("div", { className: "mneme-conflict-empty" },
+              h("div", { className: "mneme-conflict-empty-title" }, t("memory.status.conflictQueue.emptyTitle")),
+              h("div", { className: "mneme-conflict-empty-body" }, t("memory.status.conflictQueue.emptyBody")))),
+        items.map((it) => {
+          const sim = similarityOf(it.reason);
+          const aText = (it.memory_a && it.memory_a.content) || "";
+          const bText = (it.memory_b && it.memory_b.content) || "";
+          // diff 与相似度条互补：reason 给不出数字时才跑 LCS（两者表达同一信息）。
+          const diff = (sim === null && !it.memory_a.missing && !it.memory_b.missing)
+            ? wordDiff(aText, bText) : null;
+          return h("div", { key: it.id, className: "mneme-conflict-item" },
           it.reason && h("div", { className: "mneme-conflict-reason" },
             `${t("memory.status.conflictQueue.reason")}: ${it.reason}`),
+          sim !== null && h("div", { className: "mneme-conflict-simrow" },
+            h("span", null, t("memory.status.conflictQueue.similarity")),
+            h("span", { className: "mneme-conflict-simbar" },
+              h("span", { className: "mneme-conflict-simfill", style: { width: `${Math.round(sim * 100)}%` } })),
+            h("span", null, `${Math.round(sim * 100)}%`)),
           h("div", { className: "mneme-conflict-pair" },
-            side(it.memory_a, t("memory.status.conflictQueue.sideA")),
-            side(it.memory_b, t("memory.status.conflictQueue.sideB"))),
+            side(it.memory_a, t("memory.status.conflictQueue.sideA"), "mneme-conflict-side--a", diff, "a"),
+            side(it.memory_b, t("memory.status.conflictQueue.sideB"), "mneme-conflict-side--b", diff, "b")),
           h("div", { className: "mneme-conflict-actions" },
-            h("span", { className: "mneme-conflict-hint" }, t("memory.status.conflictQueue.applyHint")),
-            h("button", { className: "mneme-footbtn", disabled: busy, onClick: () => resolve(it.id, "a") }, t("memory.status.conflictQueue.keepA")),
-            h("button", { className: "mneme-footbtn", disabled: busy, onClick: () => resolve(it.id, "b") }, t("memory.status.conflictQueue.keepB")),
-            h("button", { className: "mneme-footbtn", disabled: busy, onClick: () => resolve(it.id, null) }, t("memory.status.conflictQueue.markReviewed"))))
-        ));
+            h("span", { className: "mneme-conflict-hint", title: t("memory.status.conflictQueue.applyHintTitle") },
+              t("memory.status.conflictQueue.applyHint")),
+            h("button", { className: "mneme-conflict-primary", disabled: busy, "aria-label": `${t("memory.status.conflictQueue.keepA")}: ${(it.memory_a && it.memory_a.title) || ""}`, onClick: () => resolve(it.id, "a") }, t("memory.status.conflictQueue.keepA")),
+            h("button", { className: "mneme-conflict-primary", disabled: busy, "aria-label": `${t("memory.status.conflictQueue.keepB")}: ${(it.memory_b && it.memory_b.title) || ""}`, onClick: () => resolve(it.id, "b") }, t("memory.status.conflictQueue.keepB")),
+            h("button", { className: "mneme-footbtn", disabled: busy, onClick: () => resolve(it.id, null) }, t("memory.status.conflictQueue.markReviewed"))));
+        }));
     }
 
     // --- 状态页工作台：让用户切实看见插件在干活 ---
@@ -3267,18 +3824,34 @@ window.__ModuleLoader__.load({
         return () => { cancelled = true; };
       }, []);
       if (state.off) return null;
-      return h(StatusCard, {
-        t,
-        title: t("memory.status.heatDistribution"),
-        loading: state.loading,
-        error: false,
-        num: `${state.hot}`,
-        cap: t("memory.status.heatHint")
-          .replace("{hot}", String(state.hot))
-          .replace("{warm}", String(state.warm))
-          .replace("{cold}", String(state.cold))
-          .replace("{sample}", String(state.sample))
-      });
+      // 三档占比用堆叠条直接画出来（一眼读出分布），数字退到指标行；大数字
+      // 不再放「热门数」——它曾被误读成总数。
+      const total = state.hot + state.warm + state.cold;
+      const tiers = [
+        ["--hot", state.hot, t("memory.status.heat.hot")],
+        ["--warm", state.warm, t("memory.status.heat.warm")],
+        ["--cold", state.cold, t("memory.status.heat.cold")]
+      ];
+      return h("div", { className: "mneme-statuscard" },
+        h("h3", { className: "mneme-xcolhead" }, t("memory.status.heatDistribution")),
+        state.loading
+          ? h("div", { className: "mneme-statusnum" }, "…")
+          : h(react.Fragment, null,
+              total > 0 && h("div", { className: "mneme-heatbar" },
+                tiers.map(([tier, n]) => h("span", {
+                  key: tier,
+                  className: `mneme-heatbar-seg mneme-heatbar${tier}`,
+                  style: { flexGrow: n }
+                }))),
+              h("div", { className: "mneme-statrows" },
+                tiers.map(([tier, n, label]) => h("div", { className: "mneme-statrow", key: tier },
+                  h("span", { style: { display: "flex", alignItems: "center", gap: 6 } },
+                    h("span", { className: `mneme-heatdot mneme-heatdot${tier}`, "aria-hidden": "true" }),
+                    label),
+                  h("span", { className: "mneme-statrowval" }, String(n))))),
+              h("div", { className: "mneme-statfoot" },
+                t("memory.status.heat.sample").replace("{sample}", String(state.sample)))
+            ));
     }
 
     // 记忆复用卡（#217）：只读聚合 /recall-stats（Top-N 召回 + 僵尸率 +
@@ -3286,7 +3859,7 @@ window.__ModuleLoader__.load({
     // 口径不可信）或库为空时整卡不渲染，前端不感知；truncated（扫描超上限）
     // 只影响 hint 里的回执计数，不挡渲染。
     function RecallStatsCard({ t }) {
-      const [state, setState] = useState({ loading: true, off: false, rate: null, zombie: 0, active: 0, exempt: 0, runs: 0, top: "", inject: "" });
+      const [state, setState] = useState({ loading: true, off: false, rate: null, zombie: 0, active: 0, exempt: 0, runs: 0, top: "", inject: "", archive: "" });
       useEffect(() => {
         let cancelled = false;
         apiFetch("/api/dsh-mneme/recall-stats?window=30")
@@ -3294,7 +3867,11 @@ window.__ModuleLoader__.load({
           .then((d) => {
             if (cancelled) return;
             const z = d.zombie || {};
-            const hasData = (d.coverage?.runsScanned ?? 0) > 0 || (z.activeCount ?? 0) > 0;
+            // 归档侧第五指标（#275）不能只靠 run/active 两路撑整张卡：整库归档是它的正常
+            // 工作状态，那种库「窗口内没有召回回执、也没有活跃僵尸行」时若 hasData 为假，
+            // 组件直接走 off 分支 return null，归档指标永远没机会显示。
+            const hasData = (d.coverage?.runsScanned ?? 0) > 0 || (z.activeCount ?? 0) > 0
+              || (d.archive?.total ?? 0) > 0;
             if (!hasData) {
               setState({ loading: false, off: true });
               return;
@@ -3311,45 +3888,75 @@ window.__ModuleLoader__.load({
                 .replace("{count}", String(inj.injectedCount ?? 0))
                 .replace("{fill}", inj.slotFillRate == null ? "—" : String(Math.round(inj.slotFillRate * 100)))
               : "";
+            // 第五指标（#275）：归档净增速率 + 可压掉行数。与注入口径同款自门控
+            // ——归档区为空时整段省略，不往卡里塞一个恒 0 的数字。
+            const ar = d.archive || {};
+            const archive = (ar.total ?? 0) > 0
+              ? t("memory.status.recallArchive")
+                .replace("{total}", String(ar.total ?? 0))
+                .replace("{add}", String(ar.perDay ?? 0))
+                .replace("{compress}", String(ar.compressible?.rows ?? 0))
+              : "";
             setState({
               loading: false, off: false, rate,
               zombie: z.zombieCount ?? 0, active: z.activeCount ?? 0,
-              exempt: z.exemptCount ?? 0, runs: d.coverage?.runsScanned ?? 0, top, inject
+              exempt: z.exemptCount ?? 0, runs: d.coverage?.runsScanned ?? 0, top, inject, archive
             });
           })
           .catch(() => { if (!cancelled) setState({ loading: false, off: true }); });
         return () => { cancelled = true; };
       }, []);
       if (state.off) return null;
+      // 大数字保留复用率；其余指标拆成一行一条，不再用「·」串成散文。
+      const rows = [
+        {
+          label: t("memory.status.recall.zombie"),
+          value: `${state.zombie}/${state.active}（${t("memory.status.recall.exempt")} ${state.exempt}）`
+        },
+        { label: t("memory.status.recall.runs"), value: String(state.runs) },
+        state.top && state.top !== "—" ? { label: t("memory.status.recall.top"), value: state.top } : null,
+        state.inject ? { label: t("memory.status.recall.inject"), value: state.inject } : null,
+        state.archive ? { label: t("memory.status.recall.archive"), value: state.archive } : null
+      ].filter(Boolean);
       return h(StatusCard, {
         t,
         title: t("memory.status.recallStats"),
         loading: state.loading,
         error: false,
         num: state.rate ?? "—",
-        cap: t("memory.status.recallHint")
-          .replace("{rate}", state.rate ?? "—")
-          .replace("{zombie}", String(state.zombie))
-          .replace("{active}", String(state.active))
-          .replace("{exempt}", String(state.exempt))
-          .replace("{runs}", String(state.runs))
-          .replace("{top}", state.top || "—") + (state.inject ? " · " + state.inject : "")
+        rows,
+        // 引擎区五张卡是奇数：复用卡信息量最大，宽容器下跨两列补齐行尾空洞
+        className: "mneme-statuscard--wide"
       });
     }
 
     function StatusPanel({ t, onBrowse }) {
+      // #178：冲突卡键盘直达——激活后把焦点与视口带到队列块。
+      const queueRef = useRef(null);
+      const gotoQueue = () => {
+        if (!queueRef.current) return;
+        queueRef.current.setAttribute("tabindex", "-1");
+        queueRef.current.focus({ preventScroll: true });
+        if (queueRef.current.scrollIntoView) queueRef.current.scrollIntoView({ block: "start", behavior: "smooth" });
+      };
       return h("div", { className: "mneme-status" },
-        h("div", { className: "mneme-statusgrid" },
+        // 两个分组标题把九张卡拆成「库内一览 / 后台运转」两段扫读单元
+        h("div", { className: "mneme-statushead" }, t("memory.status.sec.overview")),
+        h("div", { className: "mneme-statusgrid mneme-statusgrid--overview" },
           h(MemoriesStatusCard, { t }),
           h(EntitiesStatusCard, { t }),
-          h(VectorStatusCard, { t }),
+          h(VectorStatusCard, { t })
+        ),
+        h("div", { className: "mneme-statushead" }, t("memory.status.sec.engine")),
+        h("div", { className: "mneme-statusgrid" },
+          h(DreamStatusCards, { t, onGotoQueue: gotoQueue }),
           h(LlmStatusCard, { t }),
-          h(DreamStatusCards, { t }),
           h(HeatStatusCard, { t }),
           h(RecallStatsCard, { t }),
-          h(InjectStatusCard, { t })
+          h(InjectStatusCard, { t }),
+          h(InjectPreviewCard, { t })
         ),
-        h(ConflictsQueue, { t }),
+        h("div", { ref: queueRef }, h(ConflictsQueue, { t })),
         h(WorkbenchSection, { t, onBrowse })
       );
     }
@@ -3411,6 +4018,7 @@ window.__ModuleLoader__.load({
           .then((d) => {
             onSaved(d.memory, opts);
             setEditing(false);
+            announce(t("memory.explorer.detail.saved"));
             setSavedTick(true);
             setTimeout(() => setSavedTick(false), 2000);
           })
@@ -3467,12 +4075,16 @@ window.__ModuleLoader__.load({
           h("div", { className: "mneme-dmeta" },
             h("span", { className: "mneme-dmetakey" }, t("memory.explorer.importance")),
             editing
-              ? h("select", {
-                  className: "mneme-select",
-                  style: { height: 26, fontSize: 12, justifySelf: "start" },
-                  value: importance,
-                  onChange: (e) => setImportance(Number(e.target.value))
-                }, [1, 2, 3, 4, 5].map((n) => h("option", { key: n, value: n }, "★".repeat(n))))
+              ? h("div", { className: "mneme-staredit", role: "radiogroup", "aria-label": t("memory.explorer.detail.editImportance") },
+                  [1, 2, 3, 4, 5].map((n) => h("button", {
+                    key: n,
+                    type: "button",
+                    role: "radio",
+                    "aria-checked": String(importance === n),
+                    "aria-label": t("memory.explorer.detail.starLabel").replace("{n}", String(n)),
+                    className: importance >= n ? "mneme-starbtn mneme-starbtn--on" : "mneme-starbtn",
+                    onClick: () => setImportance(n)
+                  }, h(StarGlyph, { size: 15, filled: importance >= n }))))
               : h(ImportanceStars, { className: "mneme-dmetaval", value: memory.importance || 0 }),
             memory.heat != null && h(react.Fragment, null,
               h("span", { className: "mneme-dmetakey" }, t("memory.explorer.heat")),
@@ -4124,7 +4736,7 @@ window.__ModuleLoader__.load({
                   key: v,
                   className: minImp === v ? "mneme-chip mneme-active" : "mneme-chip",
                   onClick: () => setMinImp(v)
-                }, v === 0 ? t("memory.tab.all") : `★${v}+`))
+                }, v === 0 ? t("memory.tab.all") : h(react.Fragment, null, h(StarGlyph, { size: 11 }), ` ${v}+`)))
             ),
             h("div", { className: "mneme-xcolhead" }, t("memory.explorer.sourceFilter")),
             h("div", { className: "mneme-xrow" },
@@ -4305,22 +4917,56 @@ window.__ModuleLoader__.load({
     // 我们的修饰类覆盖配色（次级观感）。这样展开态与收起态（rail）都直接
     // 继承宿主自己的盒模型与间距——宿主改版/缩进动画零位移，无需硬编码。
     // 宿主结构异常时约 2 秒后放弃 portal，footer 回退按钮保持可用。
+    // #177：未处理冲突数 badge——数据走 dream-status 的 pendingConflicts（状态卡
+    // 同一端点），60s 轮询 + 打开面板即刷新。挂侧边栏入口按钮右上角（portal 与
+    // 回退两处都挂），让用户不进面板也知道有冻结要裁决。
+    function useConflictBadgeCount(t) {
+      const [pending, setPending] = useState(0);
+      useEffect(() => {
+        let cancelled = false;
+        const tick = () => {
+          apiFetch("/api/dsh-mneme/dream-status")
+            .then((res) => (res.ok ? res.json() : { pendingConflicts: 0 }))
+            .then((d) => { if (!cancelled) setPending(Number((d && d.pendingConflicts) ?? 0) || 0); })
+            .catch(() => { if (!cancelled) setPending(0); });
+        };
+        tick();
+        const timer = setInterval(tick, 60_000);
+        return () => { cancelled = true; clearInterval(timer); };
+      }, []);
+      return pending;
+    }
+    function ConflictBadge({ pending }) {
+      if (!pending || pending <= 0) return null;
+      return h("span", { className: "mneme-entrybadge", "aria-hidden": "true" },
+        pending > 99 ? "99+" : String(pending));
+    }
     function SidebarFallbackTrigger({ wide, t }) {
-      return h("button", {
-        type: "button",
-        className: wide ? "mneme-trigger" : "mneme-trigger mneme-rail",
-        "aria-label": t("memory.sidebar.aria"),
-        title: t("memory.panel.open"),
-        onClick: openLibrary
-      },
-        h(IconArchiveOutline20, { size: wide ? 16 : 18 }),
-        wide && h("span", { className: "mneme-trigger-label" }, t("memory.panel.open"))
+      const pending = useConflictBadgeCount(t);
+      // #295 评审：.mneme-trigger 自身 overflow:hidden 且无定位上下文，badge
+      // 直接放里面会被裁剪——包一层定位容器，badge 挂在容器上。
+      return h("div", { className: "mneme-triggerwrap" },
+        h("button", {
+          type: "button",
+          className: wide ? "mneme-trigger" : "mneme-trigger mneme-rail",
+          "aria-label": pending > 0
+            ? `${t("memory.sidebar.aria")} · ${t("memory.status.conflicts")} ${pending}`
+            : t("memory.sidebar.aria"),
+          title: t("memory.panel.open"),
+          onClick: openLibrary,
+          "data-mneme-overlay-opener": "true"
+        },
+          renderArchiveIcon({ size: wide ? 16 : 18 }),
+          wide && h("span", { className: "mneme-trigger-label" }, t("memory.panel.open"))
+        ),
+        h(ConflictBadge, { pending })
       );
     }
 
     function SidebarTopEntry({ wide, t, fallback }) {
       const [host, setHost] = useState(null);
       const [nativeCls, setNativeCls] = useState("");
+      const pending = useConflictBadgeCount(t);
       useEffect(() => {
         if (!reactDom || typeof document === "undefined") return undefined;
         let tries = 0, timer = null, created = null, mo = null;
@@ -4396,12 +5042,16 @@ window.__ModuleLoader__.load({
           h("button", {
             type: "button",
             className: `${nativeCls} mneme-topentry-native`.trim(),
-            "aria-label": t("memory.sidebar.aria"),
+            "aria-label": pending > 0
+              ? `${t("memory.sidebar.aria")} · ${t("memory.status.conflicts")} ${pending}`
+              : t("memory.sidebar.aria"),
             title: t("memory.panel.open"),
-            onClick: openLibrary
+            onClick: openLibrary,
+            "data-mneme-overlay-opener": "true"
           },
-            h(IconArchiveOutline20, { size: wide ? 15 : 18 }),
-            wide && h("span", { className: "mneme-topentry-label" }, t("memory.panel.open"))
+            renderArchiveIcon({ size: wide ? 15 : 18 }),
+            wide && h("span", { className: "mneme-topentry-label" }, t("memory.panel.open")),
+            h(ConflictBadge, { pending })
           )
         ), host);
     }
@@ -4461,7 +5111,7 @@ window.__ModuleLoader__.load({
                   reg.registerTab({
                     id: TAB_ID,
                     title: () => t("memory.view.label"),
-                    icon: (size) => h(IconArchiveOutline20, { size }),
+                    icon: (size) => renderArchiveIcon({ size }),
                     order: 60,
                     component: () => h(MemoryExplorer, { t })
                   });

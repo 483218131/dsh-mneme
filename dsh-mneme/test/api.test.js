@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { createStore } from "../src/store.js";
 import { createService } from "../src/service.js";
 import { createApi } from "../src/api.js";
+import { createInjector } from "../src/inject.js";
 import { createSettings } from "../src/settings.js";
 import { createVectorIndex } from "../src/vector-index.js";
 import { Config } from "../src/config.js";
@@ -660,11 +661,18 @@ test("GET /api/dsh-mneme/features returns empty overrides and effective config d
   // 第 4 项的 summarizePeakHours/summarizePeakMaxDeferMinutes 与
   // 第 5 项的 injectUncertaintyAdaptive、
   // issue #257 新增 sleepMaxTokens、issue #258 新增总览路由两键与
-  // dreamSummaryMaxInputs）
-  assert.equal(Object.keys(data.effective).length, 59 + 3 + 2 + 1);
+  // dreamSummaryMaxInputs、issue #230 新增 documentMemoryEnabled/
+  // documentInjectBudget、issue #249 第一批新增 injectGuidanceEnabled/
+  // pinnedInjectBudget、issue #249 N3 新增 continuityRescueEnabled，
+  // v0.8.5 新增 disableMemorySearch/disableMemoryArchive，
+  // 本地嵌入池化新增 localEmbedPooling，issue #315 新增 summarizeReasoningEffort，
+  // issue #239 第 4 项镜像到巩固新增 dreamPeakHours/dreamPeakMaxDeferMinutes，
+  // issue #292 新增 autoDreamFailureBackoff）
+  assert.equal(Object.keys(data.effective).length, 59 + 3 + 2 + 1 + 2 + 2 + 2 + 1 + 1 + 1 + 2 + 1);
   assert.equal(data.effective.dreamSkipInvalid, true);
   assert.equal(data.effective.allowCrossTypeMerge, false);
   assert.equal(data.effective.dreamMinIntervalMinutes, 0);
+  assert.equal(data.effective.autoDreamFailureBackoff, false);
   assert.equal(data.effective.dreamMaxTokens, 131072);
   assert.equal(data.effective.sleepProvider, "");
   assert.equal(data.effective.sleepModel, "");
@@ -691,6 +699,8 @@ test("GET /api/dsh-mneme/features returns empty overrides and effective config d
   assert.equal(data.effective.entityExtractionProvider, "");
   assert.equal(data.effective.entityExtractionModel, "");
   assert.equal(data.effective.entityExtractionReasoning, "none");
+  // issue #315：蒸馏思考强度（默认 none = 不发送字段，行为不变）
+  assert.equal(data.effective.summarizeReasoningEffort, "none");
   // issue #127：summarize 节流五键（均有默认值，故计入 effective 计数）
   assert.equal(data.effective.summarizeMinIntervalMinutes, 0);
   assert.equal(data.effective.summarizeMaxEntriesPerRun, 0);
@@ -1005,6 +1015,18 @@ test("GET /api/dsh-mneme/export markdown feeds straight back through import", as
   assert.match(res.headers["Content-Disposition"], /attachment; filename="dsh-mneme-export-\d{8}\.md"/);
   const md = res.body;
   assert.ok(md.includes("- **ID**: `" + a.memory.id + "`"), "anchor line present (readHumanEdits-compatible)");
+
+  // 导出是一个文档（#278 审查 F1/F3）：frontmatter 只能有一份并在最前，分节不带
+  // 各自的文件头；而且它的覆盖声明必须与正文条目数一致——「说一套写一套」比没有
+  // 这个字段更糟，外部工具会照着它聚合。
+  assert.equal([...md.matchAll(/^type: /gm)].length, 1, "只有一个 frontmatter 的 type 键");
+  assert.match(md, /^type: memory-export$/m);
+  assert.match(md, /^coverage: all$/m, "导出含归档/已遗忘行，声明要说实话");
+  assert.equal(
+    Number(md.match(/^covered: (\d+)$/m)[1]),
+    (md.match(/^- \*\*ID\*\*: /gm) ?? []).length,
+    "covered 必须等于实际导出的条目数"
+  );
 
   // 黄金用例：导出文本原样导入 → 解析出全部条目，且字段无漂移
   const back = new FakeRes();
@@ -1405,7 +1427,8 @@ test("POST /api/dsh-mneme/test-model succeeds and reports reply + latency", asyn
   // 0.1.6-alpha.1 起被官方 API 整单拒绝（「messages: at least one message
   // is required」），探测按钮会 502。
   assert.equal(MOCK_LLM.lastOptions.messages[0].role, "user");
-  assert.equal(MOCK_LLM.lastOptions.messages[0].source?.kind, "plugin");
+  // issue #326：kind 必须是生产者自有值，裸 "plugin" 被 DSH 0.1.7 的 V4 写入准入拒绝。
+  assert.equal(MOCK_LLM.lastOptions.messages[0].source?.kind, "plugin:dsh-mneme");
   assert.equal("reasoningEffort" in MOCK_LLM.lastOptions, false, "no effort configured -> field omitted");
 });
 
@@ -1580,4 +1603,58 @@ test("inject-status: autoInject off is never suppressed (user's own choice, not 
   const res = new FakeRes();
   await route.handler(req("/api/dsh-mneme/inject-status"), res);
   assert.deepEqual(JSON.parse(res.body), { autoInject: false, agentPreset: "minimal", suppressed: false });
+});
+
+test("GET /api/dsh-mneme/inject-preview: returns last assembly snapshot (issue #179)", async () => {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: {} });
+  const settings = createSettings(store.db);
+  const routes = [];
+  const ctx = {
+    webServer: {
+      register(route) {
+        routes.push(route);
+        return () => {};
+      }
+    }
+  };
+  const api = createApi(
+    ctx,
+    service,
+    settings,
+    { add() {}, remove() {}, list() { return []; } },
+    undefined,
+    undefined,
+    "",
+    Config({})
+  );
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/inject-preview");
+  assert.ok(route, "preview endpoint must be registered");
+
+  // 无渲染发生：snapshot=null（新宿主/新会话/autoInject 关闭同形）。
+  let res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-preview"), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(JSON.parse(res.body), { snapshot: null });
+
+  // 真实渲染一帧后：快照透传（api 层不做任何加工）。
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "用户用中文交流", importance: 5 });
+  const contexts = [];
+  const promptCtx = {
+    systemPrompt: { context(def) { contexts.push(def); return () => {}; } }
+  };
+  const injector = createInjector(promptCtx, service, settings, Config({ maxInjectedItems: 3, importanceThreshold: 3 }));
+  contexts[0].text({});
+  res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-preview"), res);
+  const body = JSON.parse(res.body);
+  assert.ok(body.snapshot, "snapshot present after a real render");
+  assert.equal(body.snapshot.entries[0].title, "语言");
+  assert.ok(body.snapshot.totalChars > 0);
+
+  // 非 GET → 404（与 inject-status 同款）。
+  res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-preview", "POST"), res);
+  assert.equal(res.statusCode, 404);
+  injector(); // 快照是模块全局：用完即清，不污染后续用例
 });

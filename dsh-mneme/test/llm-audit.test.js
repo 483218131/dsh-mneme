@@ -1,12 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Context } from "@deepseek-ai/cordis";
 import { createStore } from "../src/store.js";
+import * as mneme from "../src/index.js";
 import { createService } from "../src/service.js";
 import { createDreamScheduler } from "../src/dream.js";
 import { createSummarizer } from "../src/summarize.js";
 import { createApi } from "../src/api.js";
 import { createSettings } from "../src/settings.js";
+import { createEntityStreamAdapter } from "../src/index.js";
 import { mockCtx } from "./helpers/dream-mock.js";
 
 // Bug8: LLM audit trail. Every background LLM call (autoDream consolidation +
@@ -459,4 +466,133 @@ test("GET /api/dsh-mneme/semantic/llm-audit/stats aggregates by source and statu
   const errStatus = stats.by_status.find((s) => s.status === "error");
   assert.equal(errStatus.c, 1);
   store.close();
+});
+
+// ------------------------------------------- entity extraction (issue #250)
+// 实体抽取是「每次写入记忆都会跑」的后台 LLM 链路，但 createEntityStreamAdapter
+// 只拿到 llm 句柄、没有 service，所以从来没有写审计的能力——面板因此回答不了
+// 「关掉实体抽取能省多少」。下面两条用例锁定 usage chunk 汇总落库，以及审计写失败
+// 只 warn 不反噬（CONTRIBUTING 的 fail-safe 硬约定）。
+
+test("entity extraction writes an llm_audit row with the streamed usage tokens", async () => {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: {} });
+  const streamEntityText = createEntityStreamAdapter({
+    llm: {
+      async *stream() {
+        yield { type: "text-delta", index: 0, text: '{"entities":[],"relations":[]}' };
+        yield { type: "usage", usage: { inputTokens: 700, outputTokens: 180, totalTokens: 880 } };
+        yield { type: "finish", reason: { kind: "stop" } };
+      }
+    },
+    agentDefaultModel: { currentSelection: () => ({ provider: "mock", model: "mock-model" }) },
+    logger: { warn: () => {} },
+    service
+  });
+  const text = await streamEntityText(
+    [{ role: "user", content: [{ type: "text", text: "记忆内容" }] }],
+    {}
+  );
+  assert.ok(text.includes("entities"), "the extracted text still reaches the extractor");
+
+  const row = service.listLlmAudits({ source: "entityExtract" })[0];
+  assert.ok(row, "entity_extract audit row present");
+  assert.equal(row.trigger_source, "entityExtract");
+  assert.equal(row.operation_type, "entity_extract");
+  assert.equal(row.status, "success");
+  assert.equal(row.model_id, "mock:mock-model", "the resolved route is recorded");
+  assert.equal(row.input_tokens, 700, "input tokens come from chunk.usage");
+  assert.equal(row.output_tokens, 180, "output tokens come from chunk.usage");
+  assert.equal(row.total_tokens, 880);
+  store.close();
+});
+
+test("entity extraction audit write failure only warns and never sinks the extraction", async () => {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: {} });
+  // 审计表写不进去（只读库 / 磁盘满）绝不能把抽取本身拖失败—— fail-safe 是硬约定。
+  service.saveLlmAudit = () => { throw new Error("attempt to write a readonly database"); };
+  const warnings = [];
+  const streamEntityText = createEntityStreamAdapter({
+    llm: {
+      async *stream() {
+        yield { type: "text-delta", index: 0, text: '{"entities":[],"relations":[]}' };
+        yield { type: "usage", usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } };
+        yield { type: "finish", reason: { kind: "stop" } };
+      }
+    },
+    agentDefaultModel: { currentSelection: () => ({ provider: "mock", model: "mock-model" }) },
+    logger: { warn: (m) => warnings.push(String(m)) },
+    service
+  });
+  const text = await streamEntityText(
+    [{ role: "user", content: [{ type: "text", text: "记忆内容" }] }],
+    {}
+  );
+  assert.ok(text.includes("entities"), "extraction text survives an audit write failure");
+  assert.ok(warnings.some((w) => w.includes("llm audit write failed")),
+    "the audit failure is logged rather than swallowed silently");
+  store.close();
+});
+
+test("entity extraction writes no audit row when llmAudit.enabled === false", async () => {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: {} });
+  const streamEntityText = createEntityStreamAdapter({
+    llm: {
+      async *stream() {
+        yield { type: "text-delta", index: 0, text: '{"entities":[],"relations":[]}' };
+        yield { type: "usage", usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } };
+        yield { type: "finish", reason: { kind: "stop" } };
+      }
+    },
+    agentDefaultModel: { currentSelection: () => ({ provider: "mock", model: "mock-model" }) },
+    logger: { warn: () => {} },
+    service,
+    // 单闸门：与 dream / sleep / summarize 同一个 llmAudit.enabled，不新增第二道。
+    config: { llmAudit: { enabled: false } }
+  });
+  const text = await streamEntityText(
+    [{ role: "user", content: [{ type: "text", text: "记忆内容" }] }],
+    {}
+  );
+  assert.ok(text.includes("entities"), "turning the audit off must not break extraction");
+  assert.equal(service.listLlmAudits().length, 0, "no audit rows when disabled");
+  store.close();
+});
+
+// 启动期保留清理（Bug8）必须与写入侧读**同一份**配置。面板把 llmAudit.enabled 写进
+// kv、经 nestedFlags 合进 cfg，bundle 里可能是关的：清理若读 rawCfg，就会出现「面板
+// 说开 → 各写入点照写，raw 说关 → 不清理」这种无保留期的增长（写入准入 #254 也是读
+// cfg 的写入点之一）。所以这条锁的是「清理跟着装配后的 cfg 走」。
+test("boot retention purge reads the assembled config, not rawCfg", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mneme-audit-retention-"));
+  const dbPath = join(dir, "memory.db");
+
+  const seed = createStore(dbPath);
+  createSettings(seed.db).setFeatureFlags({ "llmAudit.enabled": true });
+  seed.saveLlmAudit({
+    timestamp: new Date(Date.now() - 2 * 86400000).toISOString(),
+    trigger_source: "autoDream",
+    operation_type: "dream_consolidate",
+    model_id: "m",
+    status: "success"
+  });
+  assert.equal(seed.listLlmAudits().length, 1, "先放一行过期审计");
+  seed.close();
+
+  const ctx = new Context();
+  ctx.provide("tools", { register() { return () => {}; } });
+  ctx.provide("commands", { register() { return () => {}; } });
+  ctx.provide("systemPrompt", { context() { return () => {}; } });
+  ctx.provide("agentDefaultModel", { currentSelection() { return { provider: "mock", model: "mock" }; } });
+  ctx.provide("llm", { async *stream() { yield { type: "finish", reason: { kind: "stop" } }; } });
+  ctx.provide("webServer", { register() { return () => {}; } });
+  // bundle 说关、面板说开，保留期 1 天而那行已过期 2 天：只有读装配后的 cfg 才会清掉它
+  await ctx.plugin(mneme, { memoryDir: dir, llmAudit: { enabled: false, retentionDays: 1 } });
+
+  const after = new DatabaseSync(dbPath);
+  const left = after.prepare("SELECT count(*) AS c FROM llm_audit_logs").get().c;
+  after.close();
+  assert.equal(left, 0, "面板开着的审计必须按 cfg 清理，否则审计行只增不减");
 });

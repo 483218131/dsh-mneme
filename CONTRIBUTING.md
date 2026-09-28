@@ -24,7 +24,7 @@ dsh-mneme-repo/           # repo root (docs only, no package.json)
     ├── lib/              # build output; DSH actually loads lib/index.js
     ├── scripts/          # sync-lib.js, check-sync.js, e2e-dsh.js, stress-dsh.js, benchmark-*
     ├── test/             # node:test test suite
-    ├── docs/             # SEMANTIC / SLEEP / ENTITIES / MIGRATION deep-dives
+    ├── docs/             # SEMANTIC / SLEEP / ENTITIES / LOCAL_MODEL deep-dives
     ├── package.json      # plugin metadata and scripts
     └── cordis.patch.yml  # DSH injection patch
 ```
@@ -118,6 +118,8 @@ Almost every change — **fixes and small features included** — starts from an
 2. **One PR per Issue**: reference it in the PR body (`Closes #N` / `Fixes #N` when the PR fully resolves it).
 3. **Keep the PR minimal**: behavior changes belong in `src/` (+ `test/`); run `npm run sync` so `lib/` follows (`check-sync` will fail CI otherwise); `npm test` green; user-visible changes include their README line in the same PR.
 4. **CI must be green** (Node 22/24 × Linux/Windows, full suite, Codecov) before review.
+5. **A claimed Issue belongs to the claimant**: the claim comment is the lock — a second PR on the same Issue will be marked `duplicate` and closed, unless the first PR is clearly low-quality or has gone silent.
+6. **Claims expire**: a claim with no PR within 2 weeks is released — anyone may re-claim it on the Issue thread.
 
 ---
 
@@ -190,7 +192,7 @@ Every report meeting the minimums gets code-level verification and a reply. Issu
 
 ## Contact
 
-- **General questions & contributions**: [GitHub Discussions](https://github.com/modusensus/dsh-mneme/discussions) or `work@modusensus.space`
+- **General questions & contributions**: [GitHub Discussions](https://github.com/slow-stack/mneme/discussions) or `work@modusensus.space`
 - **Security vulnerabilities**: report privately via [SECURITY.md](SECURITY.md) — never open a public issue for vulnerabilities
 
 ---
@@ -228,7 +230,7 @@ dsh-mneme-repo/           # 仓库根（仅文档清单，无 package.json）
     ├── lib/              # 构建产物，DSH 实际加载的是 lib/index.js
     ├── scripts/          # sync-lib.js、check-sync.js、e2e-dsh.js、stress-dsh.js、benchmark-*
     ├── test/             # node:test 测试
-    ├── docs/             # SEMANTIC / SLEEP / ENTITIES / MIGRATION 等专题文档
+    ├── docs/             # SEMANTIC / SLEEP / ENTITIES / LOCAL_MODEL 等专题文档
     ├── package.json      # 插件包元数据与 scripts
     └── cordis.patch.yml  # DSH 注入补丁
 ```
@@ -374,7 +376,7 @@ DSH 上游仍处于 developer preview 阶段，API 与服务接口变动频繁�
 
 ## 联系方式
 
-- **一般问题与贡献咨询**：[GitHub Discussions](https://github.com/modusensus/dsh-mneme/discussions) 或 `work@modusensus.space`
+- **一般问题与贡献咨询**：[GitHub Discussions](https://github.com/slow-stack/mneme/discussions) 或 `work@modusensus.space`
 - **安全漏洞**：请通过 [SECURITY.md](SECURITY.md) 私有提交，不要在公开 Issue 中提交漏洞
 
 ---

@@ -34,12 +34,7 @@ export function createScopeResolver({ ctx, config, logger } = {}) {
   };
 
   return function resolveWriteScope(exec) {
-    let session = null;
-    try {
-      session = exec?.agent?.session ?? null;
-    } catch {
-      session = null;
-    }
+    const session = sessionOf(exec);
 
     // 持久化 header（issue #17 的身份契约）：session.header 是创建时冻结的
     // SessionHeader（含 agentPreset/cwd）。⚠️ 不能先读 requestHeader()——那返回
@@ -81,6 +76,39 @@ export function createScopeResolver({ ctx, config, logger } = {}) {
 
     return { agent_scope: agentScope, workspace_scope: workspaceScope };
   };
+}
+
+/**
+ * 工具 exec 上的会话对象。宿主 ctx 是 Proxy（cordis 4），裸读未 inject 的属性会
+ * 抛错——所以取值恒包在 try 里，取不到返回 null。scope 解析与写入准入的会话键
+ * 共用这一处取值口径。
+ * @param {object} exec
+ * @returns {object|null}
+ */
+export function sessionOf(exec) {
+  try {
+    return exec?.agent?.session ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 写入准入的会话键（#254 G1 会话写入预算的计数单位）。session_id 在这里只作
+ * 「同一段对话」的标识，不作为作用域键（见文件头：记忆挂在持久化身份标签上）；
+ * 取不到会话身份（系统写入）返回 null = 不进预算。
+ * @param {object} exec
+ * @returns {string|null}
+ */
+export function sessionKeyOf(exec) {
+  // 整个取值（含 .id）都在 try 里：宿主 session 可能是会抛错的 accessor，而这个
+  // 函数在 memory_save 的保存之前被调用——抛出去就是一次工具调用直接失败。
+  try {
+    const id = sessionOf(exec)?.id;
+    return id == null ? null : String(id);
+  } catch {
+    return null;
+  }
 }
 
 /**

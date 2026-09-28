@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { TYPE_FILE } from "./mirror.js";
+import { TYPE_FILE, MIRROR_READONLY_TYPES } from "./mirror.js";
 import { updatedAtBounds } from "./store.js";
 import { normalizeExplicitScope, scopeKeyOf } from "./scope.js";
 import { STR, langOf } from "./lang.js";
@@ -7,15 +7,31 @@ import { computeHeat } from "./heat.js";
 import { recallStats } from "./recall-stats.js";
 import { evaluateMemoryQuality } from "./quality-filter.js";
 import { applyDecisions } from "./dream/decisions.js";
+import { createDocumentRegistrar } from "./document.js";
+import { createOrganizer } from "./organize.js";
 import { createBM25Index } from "./search/bm25.js";
 import { adaptiveThreshold } from "./search/adaptive.js";
 
 const INJECT_TYPES = new Set(["preference", "project", "decision", "summary", "rejected_solution", "pitfall", "constraint"]);
 
+// document 摘要行（#230）：仅 documentMemoryEnabled 开启时进注入候选。独立
+// 集合而非常改共享 Set——INJECT_TYPES 本身是「类型可注入」的静态事实，flag
+// 是运行时状态，两者不能搅在一起。
+const INJECT_TYPES_WITH_DOCUMENT = new Set([...INJECT_TYPES, "document"]);
+
 // 编码记忆类型（codingRetrospect）：rejected_solution / pitfall / constraint
 // 只在编码任务时注入（防噪声污染其他业务），且编码场景下按 codingBoostFactor
 // 加权排序提前。
 const CODING_MEMORY_TYPES = new Set(["rejected_solution", "pitfall", "constraint"]);
+
+// pin 池类型（#249 第一批）：约束与偏好是「对谁都成立的边界」，需要逐字保真
+// 而不是相关性排序——它们与情景日志同池同速率摘要会被静默降级（立项依据）。
+// 注意 constraint 同时属于 CODING_MEMORY_TYPES，非编码任务里已被 codingGate
+// 滤掉，pin 池同样拿不到它；是否豁免该门控是待维护者拍板的口径问题，本批次
+// 不动既有门控（不放大行为面）。
+// 导出给写入准入（#254 的穿透口）与注入侧共用一份定义：两处各写一份 list 迟早
+// 漂移成「pin 池豁免了、预算没豁免」这类两套口径。
+export const PINNED_MEMORY_TYPES = new Set(["constraint", "preference"]);
 
 /**
  * 判断一段文本是否编码类任务（关键词匹配，codingRetrospect 读取侧门控）。
@@ -39,8 +55,10 @@ const CONTENT_HISTORY_MAX = 20;
 
 // Issue #135 附属发现 2：质量过滤器写下的系统信号标签（「为什么被降权/归档」的
 // 唯一审计线索）。更新路径整组替换 tags 会把它们抹掉——更新时按此清单并集保留。
-// 清单必须与 quality-filter.js 的写入端对齐（6 个，含 type 自指的 self_referential）。
-const SIGNAL_TAGS = ["low_quality", "duplicate", "meta", "repetitive", "short_content", "self_referential"];
+// 清单必须与 quality-filter.js 的写入端对齐（6 个，含 type 自指的 self_referential）；
+// evidence_degraded 是 #230 注册端的求交标记（quality-filter 不写它，但同样
+// 不许被更新抹掉）。
+const SIGNAL_TAGS = ["low_quality", "duplicate", "meta", "repetitive", "short_content", "self_referential", "evidence_degraded"];
 
 // scopeKeyOf 已上提到 ./scope.js（v0.8.1，issue #170 第 2 步）：与 sleep 的跨
 // scope 配对共用同一把比较钥匙，避免两处定义漂移。
@@ -151,7 +169,7 @@ export function computeRetrievalMetrics(actualIds, expectedIds) {
   };
 }
 
-export function createService({ store, mirror, config, onWrite, logger }) {
+export function createService({ store, mirror, config, onWrite, logger, documentIndex, writeAdmission }) {
   const language = langOf(config);
   // Optional dream scheduler hook, installed via setDreamHook after creation
   // (the scheduler holds a reference back to the service, so it cannot be
@@ -860,12 +878,17 @@ export function createService({ store, mirror, config, onWrite, logger }) {
           mode,
           topK: lim,
           threshold: threshold ?? null,
+          // Per-source 信号随回执落盘（fuseRecall 本就无条件计算，此前只服务
+          // signalTransparency 展示）：复用侧查询画像（query 型 → 各路权重的
+          // 离线聚合，AssoMem arXiv 2510.10397 消融所示收益大头）需要这份原料。
+          // 纯加字段——recall_runs 无 schema 变更，旧行 candidates 缺该键照常读。
           candidates: result.map((m) => ({
             id: m.id,
             title: m.title,
             content: m.content,
             score: m.score ?? null,
-            source: m.source ?? "keyword"
+            source: m.source ?? "keyword",
+            signals: signals.get(m.id) ?? {}
           })),
           createdAt: new Date().toISOString()
         });
@@ -1110,6 +1133,13 @@ export function createService({ store, mirror, config, onWrite, logger }) {
    * @returns {{action: "created"|"merged", memory: object}}
    */
   function saveWithDedupe(memory) {
+    // #230 写入权分离：document 行只能经 registerDocument 铸造（注册校验 +
+    // doc_path + evidence 三样俱全）。通用保存路径（memory_save 工具 / MCP /
+    // standalone API / bootstrap）一律拒绝——防止绕过注册校验造出无指针无
+    // 回链的伪 document 行。与 updateMemory 的同款守卫构成双保险。
+    if (memory?.type === "document") {
+      throw new Error("type 'document' is minted only via registerDocument (summary + doc_path + evidence)");
+    }
     // Bug7: score quality once (after dedupe lookup, before write). Failures
     // inside the evaluator are impossible (pure function), but the write that
     // records the score must never fail the save — wrap defensively.
@@ -1220,6 +1250,17 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       scheduleEmbed(result);
       return { action: "merged", memory: result };
     }
+    // #254 写入准入（第一阶段只计量）：决策恒 allow、不拦写入，只把两个闸门的
+    // 测量点算出来。放在 store.save 之前——第二阶段要在这里拦下写入，接缝先摆好。
+    // 计量是旁路：任何一环失败只 warn，绝不反噬写入（与质量打分同款容错）。
+    let admission = null;
+    if (writeAdmission) {
+      try {
+        admission = writeAdmission.evaluate({ memory, sessionKey: memory._sessionKey });
+      } catch (e) {
+        try { logger?.warn?.(`[dsh-mneme] write admission evaluate failed: ${String(e)}`); } catch { /* 不反噬 */ }
+      }
+    }
     const created = store.save({
       type: memory.type,
       title: memory.title,
@@ -1240,6 +1281,17 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       ...(quality ? { quality_score: quality.score } : {})
     });
     const result = applyQualityDisposition(created, quality, qf);
+    if (admission) {
+      try {
+        writeAdmission.record({
+          sessionKey: memory._sessionKey,
+          verdict: admission,
+          memoryId: created.id
+        });
+      } catch (e) {
+        try { logger?.warn?.(`[dsh-mneme] write admission record failed: ${String(e)}`); } catch { /* 不反噬 */ }
+      }
+    }
     afterSync("write");
     notifyWrite();
     scheduleEmbed(result);
@@ -1301,8 +1353,13 @@ export function createService({ store, mirror, config, onWrite, logger }) {
    * lead the selection (up to maxItems*2 candidates) and the rule-based pick
    * fills + dedupes the remaining slots. Empty query / no cached recall /
    * hybridInject off → pure legacy rule-based selection.
+   *
+   * #249 第一批（B1 pin 池）：`pinnedInjectBudget` > 0 时，约束/偏好类先按相关性
+   * 取满独立预算、再从候选里摘除（于是轮换重排碰不到它们），由调用方前置到块
+   * 头。`pinnedStats` 是可选出参：回报实际 pin 条数与超预算未展示条数，不改变
+   * 本函数「返回数组」的既有契约。预算为 0 时整段不执行，行为逐字节不变。
    */
-  function injectCandidates({ query = "", maxItems = 5, threshold = 3, queryVector, scope = null, rotate = null, rotateWindow = 0 } = {}) {
+  function injectCandidates({ query = "", maxItems = 5, threshold = 3, queryVector, scope = null, rotate = null, rotateWindow = 0, pinnedStats = null } = {}) {
     const q = String(query ?? "").trim();
     // codingRetrospect 读取侧门控：编码记忆（rejected_solution / pitfall /
     // constraint）只在编码任务时注入，防噪声污染其他业务；编码任务时按
@@ -1321,11 +1378,19 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     const poolSize = rotateWindowN > 0
       ? Math.max(maxItems * 2, maxItems * (rotateWindowN + 1))
       : maxItems * 2;
+    // #230 拍板：注入档位合并设计（叙述条次优先档 + document 摘要行预算）。
+    // ①叙述条（source=narrative）从纯按需解禁进注入候选，落次优先档——但受
+    // 生成总闸 dreamNarrativeEnabled 约束（flag 关 = 该类行不再注入，存量行
+    // 仍可检索）；②document 摘要行同落次优先档，另有独立预算（见下方选取）。
+    const injectTypes = config?.documentMemoryEnabled === true ? INJECT_TYPES_WITH_DOCUMENT : INJECT_TYPES;
+    // #230 拍板：叙述条解禁进注入受生成总闸约束——门必须对全部候选路径一致
+    // （规则/向量/缓存/BM25），只锁规则路的话语义路仍会漏进 narrative 行。
+    const allowNarrative = config?.dreamNarrativeEnabled === true;
     const filtered = store.list({ limit: Math.max(200, poolSize), includeForgotten: false })
-      .filter((m) => !m.archived && INJECT_TYPES.has(m.type) && !m.forgotten &&
-        // 叙述条（#164 对齐）按需检索：source=narrative 的 per-topic 叙述不进
-        // 注入候选——常驻位只留给 dream 总览（source=dream）。
-        m.source !== "narrative" &&
+      .filter((m) => !m.archived && injectTypes.has(m.type) && !m.forgotten &&
+        // 叙述条：#228 落地为纯按需检索；#230 合并拍板解禁为次优先档注入
+        // （per-topic 叙述常驻位仍只留给 dream 总览 source=dream）。
+        (m.source !== "narrative" || allowNarrative) &&
         codingGate(m) &&
         (m.type === "summary" || m.type === "preference" || m.importance >= threshold));
     // #218 v1: heat 乘数——heatEnabled 时在优先级层内给 importance×quality 乘
@@ -1341,8 +1406,13 @@ export function createService({ store, mirror, config, onWrite, logger }) {
         // 编码记忆在编码任务时优先于普通 decision（与 preference 同级），
         // importance 乘 codingBoostFactor 加权（封顶 5，保持 importance 语义）。
         const priority = (m) => {
+          // #230：叙述条与 document 摘要行同为次优先档——蒸馏摘要（0）仍最
+          // 先，指针型聚合产物（1）先于普通 project/decision（2）。叙述条是
+          // type=summary，判 source 必须在判 type 之前。
+          if (m.source === "narrative") return 1;
           if (m.type === "summary") return 0;
           if (m.type === "preference") return 1;
+          if (m.type === "document") return 1;
           if (isCoding && CODING_MEMORY_TYPES.has(m.type)) return 1;
           return 2;
         };
@@ -1367,7 +1437,8 @@ export function createService({ store, mirror, config, onWrite, logger }) {
         try {
           const hits = vectorIndex.search(queryVector, { limit: poolSize, threshold: 0 });
           for (const m of hits) {
-            if (m && !m.archived && INJECT_TYPES.has(m.type) && !m.forgotten &&
+            if (m && !m.archived && injectTypes.has(m.type) && !m.forgotten &&
+              (m.source !== "narrative" || allowNarrative) &&
               codingGate(m) &&
               (m.type === "summary" || m.type === "preference" || m.importance >= threshold)) {
               semanticItems.push(m);
@@ -1377,7 +1448,8 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       }
       if (!semanticItems.length && lastSemanticRecall?.query === q && lastSemanticRecall.items?.length) {
         for (const m of lastSemanticRecall.items) {
-          if (m && !m.archived && INJECT_TYPES.has(m.type) && !m.forgotten && codingGate(m)) semanticItems.push(m);
+          if (m && !m.archived && injectTypes.has(m.type) && !m.forgotten &&
+            (m.source !== "narrative" || allowNarrative) && codingGate(m)) semanticItems.push(m);
         }
       }
       // Issue #198：首轮（无向量、无缓存召回）的同步兜底——BM25 词法召回领位。
@@ -1389,7 +1461,8 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       // 语义向量命中时本分支不参与，行为不变。
       if (!semanticItems.length) {
         for (const hit of bm25Recall(q, poolSize)) {
-          if (hit && !hit.archived && INJECT_TYPES.has(hit.type) && !hit.forgotten &&
+          if (hit && !hit.archived && injectTypes.has(hit.type) && !hit.forgotten &&
+            (hit.source !== "narrative" || allowNarrative) &&
             codingGate(hit) &&
             (hit.type === "summary" || hit.type === "preference" || hit.importance >= threshold)) {
             semanticItems.push(hit);
@@ -1434,6 +1507,20 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     if (config?.strictScope === true && scope) {
       candidates = candidates.filter((m) => isVisibleInScope(m, scope));
     }
+    // #249 第一批：B1 pin 池。取在相关性排序之后、轮换之前——取谁按此刻的候选
+    // 次序（即相关性次序），取到后从候选中摘除，于是下面的轮换重排碰不到它们
+    // （验收：pin 不参与跨轮轮换）。独立预算的两层意义：pin 既不占 maxItems
+    // 名额、也不被 document 预算截断，因此不会把当前任务需要的情景候选挤出去；
+    // 超预算的条数回报给调用方，在块内如实标注（绝不静默省略）。
+    const pinnedBudget = Math.max(0, Math.min(5, Math.floor(config?.pinnedInjectBudget ?? 0)));
+    // eligible 留到块外：未展示条数要等 general 槽选完才算得准（见 selected 之后）。
+    const eligible = pinnedBudget > 0 ? candidates.filter((m) => PINNED_MEMORY_TYPES.has(m.type)) : [];
+    let pinned = [];
+    if (pinnedBudget > 0 && eligible.length > 0) {
+      pinned = eligible.slice(0, pinnedBudget);
+      const pinnedIds = new Set(pinned.map((m) => m.id));
+      candidates = candidates.filter((m) => !pinnedIds.has(m.id));
+    }
     // Issue #205：注入位跨轮轮换。rotate = 最近 N 轮注入过的 id 集合（由注入层
     // 按会话维护并传入）：这些条目本轮不再优先——新鲜者前置（各自内部相对次序
     // 保持），不足时按原序回填，槽位数与 touchRecall 语义均不变。rotate 为空时
@@ -1442,7 +1529,33 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       const fresh = candidates.filter((m) => !rotate.has(m.id));
       if (fresh.length > 0) candidates = [...fresh, ...candidates.filter((m) => rotate.has(m.id))];
     }
-    const selected = candidates.slice(0, maxItems);
+    // #230 拍板：document 摘要行预算——次优先档内最多 documentInjectBudget
+    // 条，超预算的 document 行跳过、由后续候选补位（不占槽）。预算只约束
+    // 注入不约束检索：指针行价值在「按需读全文」，常驻注入若不设界就会把
+    // 注入块变成文档目录（#164 失败判据：批量把历史塞进上下文）。
+    const documentBudget = config?.documentInjectBudget ?? 2;
+    let documentSeen = 0;
+    const general = [];
+    for (const m of candidates) {
+      if (general.length >= maxItems) break;
+      if (m.type === "document") {
+        if (documentSeen >= documentBudget) continue;
+        documentSeen++;
+      }
+      general.push(m);
+    }
+    // #249 第一批：pin 前置到块内相关性排序之前（验收项），且不占 maxItems 名额。
+    // pinned 为空时 selected 就是 general 本身——关闭态与改动前逐字节一致。
+    const selected = pinned.length > 0 ? [...pinned, ...general] : general;
+    if (pinnedStats) {
+      // 「未展示」只数**真的没进块**的 pin 类条目：被 pin 预算挤下来的条目会回到
+      // 候选池，仍可能被 general 槽选中——那就是展示了。按 eligible - pinned 直接
+      // 相减会把它们也算成未展示，块头那一行于是虚报（评审实测：pref#2 已在块内，
+      // 仍报「另有 2 条未展示」）。所以统一按「有没有进 selected」判。
+      const shownIds = new Set(selected.map((m) => m.id));
+      pinnedStats.shown = pinned.length;
+      pinnedStats.suppressed = eligible.filter((m) => !shownIds.has(m.id)).length;
+    }
     touchRecalled(selected);
     // #217 口径（2026-09-19 拍板）：注入是曝光型访问事件，与检索命中同表分账
     // （mode='inject'，candidates 存实际注入集）。跟随 recallRecordDefault——
@@ -1476,6 +1589,10 @@ export function createService({ store, mirror, config, onWrite, logger }) {
    * Only content/title are taken; structure fields stay machine-owned.
    */
   function mergeHumanEdits(type, edits) {
+    // #296：只读 type 的结构性守卫。调用点（启动合并 / reconcileHumanEdits）都已
+    // 跳过它们，但这条不变量属于「人改回填」本身——将来多一个调用点不该重开这个口
+    // （指针行文本被当正文写回 document 行会污染摘要）。
+    if (MIRROR_READONLY_TYPES.has(type)) return 0;
     let applied = 0;
     for (const edit of edits) {
       if (!edit.id) continue; // corrupt/malformed edit: skip it, keep merging the rest
@@ -1628,7 +1745,10 @@ export function createService({ store, mirror, config, onWrite, logger }) {
       ...(m.workspace_scope_source !== undefined ? { workspace_scope_source: m.workspace_scope_source } : {}),
       ...(m.scope_decided_at !== undefined ? { scope_decided_at: m.scope_decided_at } : {}),
       ...(m.sensitivity !== undefined ? { sensitivity: m.sensitivity } : {}),
-      ...(m.occurred_at !== undefined ? { occurred_at: m.occurred_at } : {})
+      ...(m.occurred_at !== undefined ? { occurred_at: m.occurred_at } : {}),
+      // #230：document 指针行的文件定位随行透出——「全文按需读」的入口就是
+      // 这个路径；普通行恒不带键，DTO 与 #230 前逐字节同形。
+      ...(m.doc_path !== undefined && m.doc_path !== null ? { doc_path: m.doc_path } : {})
     }));
   }
 
@@ -1700,6 +1820,26 @@ export function createService({ store, mirror, config, onWrite, logger }) {
    * non-forgotten memories are mirrored: forgotten entries must not reach the
    * human-editable file (a human "edit" could otherwise resurrect them).
    */
+  // #296 第二批：documentDir/index.md 的写后语。与注册入口共用同一个
+  // documentMemoryEnabled 闸（默认关）：闸开时只列活跃指针行（正文永远不进这个
+  // 文件），闸关时把索引删掉——document 子系统整体退出，留一份陈旧索引会列出已
+  // 归档的行，正是镜像侧 documents.md 在闸关时被删掉要避免的那种「看着还在、其实
+  // 已关」的视图。两步都只 warn：索引是机器产物，不能让触发它的业务写失败。
+  function syncDocumentIndex() {
+    if (!documentIndex) return;
+    if (config?.documentMemoryEnabled !== true) {
+      const removed = documentIndex.remove();
+      if (!removed?.ok) logger?.warn?.("document index remove failed:", removed?.error);
+      return;
+    }
+    try {
+      const result = documentIndex.sync(store.list({ type: "document", limit: null }));
+      if (!result?.ok) logger?.warn?.("document index sync failed:", result?.error);
+    } catch (error) {
+      logger?.warn?.("document index sync failed:", error);
+    }
+  }
+
   // syncMirror: 同步 mirror，并在失败/成功时持久记录 dirty 状态；保证自身不抛出。
   // v0.3.6（audit peer 4 阻断）：
   //   - 开始时 incrementGeneration 绑定本次期望轮次 gen；成功用
@@ -1709,7 +1849,12 @@ export function createService({ store, mirror, config, onWrite, logger }) {
   //   - 逐 type 用 setTypeStatus 记录部分成功/失败（type_status JSON）；
   //   - 所有 store 状态写入各自 try/catch，失败只 warn，绝不向外抛（F-NEW-03）。
   function syncMirror() {
-    if (txDepth > 0 || !mirror) return { success: true, deferred: true }; // deferred to the transaction's commit
+    if (txDepth > 0) return { success: true, deferred: true }; // deferred to the transaction's commit
+    // #296 第二批：documentDir/index.md 走同一条写后语——它与镜像一样是「从库渲染
+    // 的机器产物」，同样只在内容变化时落盘、同样自己吞掉失败。放在 !mirror 短路
+    // 之前：索引在不在，不该取决于镜像是否装配（无镜像的宿主与测试同样要有它）。
+    syncDocumentIndex();
+    if (!mirror) return { success: true, deferred: true };
     const now = new Date().toISOString();
     let gen;
     try {
@@ -1725,8 +1870,20 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     // 合法的空 Set 可迭代，保证 syncMirror 自身绝不抛（fail-safe）。
     const coveredTypes = new Set();
     try {
-      // 预先获取本次要覆盖的 type 集合（只调一次 store.list）
-      const list = store.list({ limit: 500, includeForgotten: false });
+      // 预先取本次要覆盖的全部活跃行（只读一次）。这里曾经是
+      // store.list({ limit: 500 })——活跃集超过 500 时镜像会静默少掉尾部记忆，
+      // 而文件本身没有任何提示（#278 第一批）。store.list 的 limit 默认值只有
+      // 50，比原来显式传的 500 更小，所以改用 all() 并在这里做同一套过滤
+      // （forgotten/archived 都不进镜像，与 includeForgotten:false + 默认
+      // includeArchived:false 等价）。
+      // 代价是全表读，且落在每次业务写后的最热路径上（#202 自记 all() 5k 行
+      // 231ms → ~135ms）。要压这一层得换按 type 分页取，属另一批的事；
+      // 在这里退回任何截断都不行——「宣称覆盖活跃集」与静默截断不能共存。
+      const list = store.all().filter((m) => !m.forgotten && !m.archived
+        // #296 第二批：镜像里的 documents.md 与 index.md 共用 documentMemoryEnabled
+        // 闸。关掉时把 document 行也从渲染集里去掉——sync 对「空 type」的既有处理
+        // 会把陈旧的 documents.md 删掉，不留一个「看着还在、其实已关」的视图。
+        && (m.type !== "document" || config?.documentMemoryEnabled === true));
       for (const memory of list) {
         if (memory?.type && TYPE_FILE[memory.type]) {
           coveredTypes.add(memory.type);
@@ -1913,6 +2070,12 @@ export function createService({ store, mirror, config, onWrite, logger }) {
   // 处置）共用的写路径：mirror 同步、写通知、嵌入调度全部同源，不能各写一份。
   function updateMemory(id, p, ctx = {}) {
     const old = store.getById(id);
+    // #230 写入权分离（与 saveWithDedupe 同款守卫）：document 行只能经
+    // registerDocument 铸造。既有 document 行的摘要修复（memory_update 改
+    // content/title——设计定案的更新通道）照常放行，type 不许改入 document。
+    if (p?.type === "document" && old?.type !== "document") {
+      throw new Error("type 'document' is minted only via registerDocument (summary + doc_path + evidence)");
+    }
     // Issue #135 附属发现 2：质量过滤器把「为什么被降权/归档」写在系统信号标签
     // 上（SIGNAL_TAGS，applyQualityDisposition 以并集写入），而这里整组替换
     // tags——任何带 tags 的更新都会抹掉这条唯一的审计线索（报告实测 150 条低分
@@ -1999,11 +2162,54 @@ export function createService({ store, mirror, config, onWrite, logger }) {
   function archiveMemory(id, f) {
     const updated = store.setArchived(id, f);
     afterSync("write");
+    // #275 B 项：归档行的向量会被手动回收清掉（检索恒带 archived = 0，按定义不可达），
+    // 还原回活跃面时补一次嵌入——否则那行只剩关键词可检索，回收就成了单程票。
+    // 判据用真值（`!f`）而不是 `f === false`：store.setArchived 自己就是按真值归一
+    // （`archived ? 1 : 0`），API/工具传 0 或空串同样会把行放回活跃面，口径必须同一把尺。
+    // 排队语义与写入路径同一处（txDepth / 未就绪由 scheduleEmbed 自己挡）。
+    if (!f) scheduleEmbed(updated);
     return updated;
   }
 
+  // document 型记忆注册（#230）：内聚块在 src/document.js（AGENTS.md 尺寸
+  // 约定，同 recallStats 先例），这里只做依赖注入 + barrel 出口，调用方零改动。
+  // 写后语只做重嵌入：镜像同步与写通知由 transaction 的 commit 路径统一执行
+  // （notifyWrite 在 txDepth>0 时 deferred 到 finally），这里再调就是双份。
+  const registerDocument = createDocumentRegistrar({
+    store,
+    config,
+    embedQuery,
+    pushContentHistory,
+    transaction,
+    // #275 拍板 5：升格吸收的 evidence 行随之归档，但 pinned 池（#249）永不自动归档
+    // ——注册器不 import 这个集合，方向反了会成环，所以在这里注入。
+    pinnedTypes: PINNED_MEMORY_TYPES,
+    finalize: (rows) => {
+      for (const row of rows) scheduleEmbed(row);
+    }
+  });
+
+  // agent 主动整理接口（#231）：dryRun 比对报告 → agent 判断 → apply 落库，筛除项
+  // 进归档不删，全程复用 dream_runs 的 receipt 语义（不新建审计面）。走
+  // saveWithDedupe 落库 = 复用常规写路径的镜像/通知语；重嵌入由 finalize 在事务
+  // 提交后补（事务里的 scheduleEmbed 被 txDepth 挡掉）——document 同款先例。
+  const { organize } = createOrganizer({
+    store,
+    embedQuery,
+    saveWithDedupe,
+    transaction,
+    finalize: (rows) => {
+      for (const row of rows) scheduleEmbed(row);
+    }
+  });
+
   return {
     saveWithDedupe,
+    registerDocument,
+    // agent 主动整理接口（#231）：内聚块在 src/organize.js，这里只做依赖注入 +
+    // barrel 出口。刻意不加 opt-in 开关（维护者口径：功能本体不做开关，与 #249
+    // 同批暴露时再定配置面），也不进工具列表——工具注册在 #249 那批。
+    organize,
     recoverMirror,
     getMirrorHealth,
     getMirrorState: () => store.getMirrorState(),
@@ -2012,6 +2218,8 @@ export function createService({ store, mirror, config, onWrite, logger }) {
     toApiList,
     isVisibleInScope,
     transaction,
+    getDistillCursor: (sessionId) => store.getDistillCursor(sessionId),
+    setDistillCursor: (sessionId, lastSeq) => store.setDistillCursor(sessionId, lastSeq),
     enqueue,
     setDreamHook(fn) { dreamHook = fn; },
     setSleepHook(fn) { sleepHook = fn; },

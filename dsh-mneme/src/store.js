@@ -1,5 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
+import { contentHashOf } from "./content-hash.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS memories (
@@ -13,11 +15,13 @@ CREATE TABLE IF NOT EXISTS memories (
   archived    INTEGER NOT NULL DEFAULT 0,
   source      TEXT,
   content_history TEXT,
+  content_hash TEXT,
   embedding   TEXT,
   epistemic_status TEXT NOT NULL DEFAULT 'subjective',
   last_accessed_at  TEXT,
   _full_content     TEXT,
   evidence    TEXT,
+  doc_path    TEXT,
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 );
@@ -47,7 +51,7 @@ CREATE TABLE IF NOT EXISTS dream_runs (
   summary_stored INTEGER NOT NULL DEFAULT 0,
   receipt        TEXT NOT NULL,
   policy_epoch   INTEGER NOT NULL DEFAULT 0,  -- 裁决规则版本：规则升级后旧裁决降级为历史证据
-  run_type       TEXT NOT NULL DEFAULT 'auto', -- auto | sleep：睡眠周期的审计区分
+  run_type       TEXT NOT NULL DEFAULT 'auto', -- auto | sleep | organize：周期审计的类别区分
   skipped        TEXT                     -- JSON: degraded 轮被跳过的逐条明细（index/action/ids/error）
 );
 CREATE INDEX IF NOT EXISTS idx_dream_runs_created ON dream_runs(created_at);
@@ -191,10 +195,19 @@ CREATE TABLE IF NOT EXISTS llm_audit_logs (
   status            TEXT NOT NULL,          -- success | error | skipped
   error_message     TEXT,
   related_memory_ids TEXT,                  -- JSON: ids the call operated on
-  metadata          TEXT                    -- JSON: free-form extras
+  metadata          TEXT,                   -- JSON: free-form extras
+  session_key       TEXT                    -- #254 写入准入的会话键（LLM 调用行恒 NULL）
 );
 CREATE INDEX IF NOT EXISTS idx_llm_audit_timestamp ON llm_audit_logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_llm_audit_source ON llm_audit_logs(trigger_source);
+
+-- autoSummarize 的增量蒸馏游标：按 session.id 持久化最近一次成功消费的事件序。
+-- 游标是蒸馏窗口的恢复事实，不与 user_settings 或记忆内容混用。
+CREATE TABLE IF NOT EXISTS distill_cursors (
+  session_id TEXT PRIMARY KEY,
+  last_seq   INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
 
 -- entity gene (v0.3.0): named entities mentioned across memories, with
 -- time-boxed attributes (valid_from → valid_until) and typed relations.
@@ -263,12 +276,43 @@ CREATE TABLE IF NOT EXISTS mirror_state (
   applied_generation INTEGER NOT NULL DEFAULT 0 CHECK (applied_generation >= 0 AND applied_generation <= 9007199254740991 AND applied_generation = CAST(applied_generation AS INTEGER)), -- 已成功应用的轮次
   type_status TEXT                               -- JSON: 逐 type 状态 {type: {dirty, applied_gen, last_error}}
 );
+
+-- #249 N3（压缩边缘双落点）：连续性提案。压缩边缘只落**提案**行，不进 memories
+-- ——边缘产出若直接进记忆库，一个长会话就会攒出第 N 条同主题条目，正是 #275 记的
+-- 失败形态；转正通道与 #254 的二次确认共用一套，阶段二才打开，本批只写 pending。
+-- 唯一键 (session_id, kind) 就是形态约定里的「同一会话同一类只留一条」：再次触发
+-- 是刷新同一行，不是新增一行。status 为转正通道预留（pending → promoted/discarded）：
+-- 「实际触发率」= 提案行数、「采纳率」= promoted/总数，都能就地统计（#249 §8）。
+-- 时间戳是 ISO（与 memories 同款），created_at 在刷新时不动，updated_at 记最近边缘。
+CREATE TABLE IF NOT EXISTS continuity_proposals (
+  id             TEXT PRIMARY KEY,
+  session_id     TEXT NOT NULL,
+  kind           TEXT NOT NULL,
+  current_work   TEXT,
+  next_step      TEXT,
+  open_questions TEXT,
+  status         TEXT NOT NULL DEFAULT 'pending',
+  edge_seq       INTEGER,            -- 触发本次刷新的压缩事件 seq（证据/复现用）
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_continuity_session_kind ON continuity_proposals(session_id, kind);
+CREATE INDEX IF NOT EXISTS idx_continuity_status ON continuity_proposals(status, updated_at);
 `;
 
 // Exported for API-layer type validation (standalone API POST /memories and
 // the /status byType breakdown); the set itself stays the single source of
 // truth for what store.save accepts.
-export const TYPES = new Set(["preference", "project", "decision", "history", "summary", "pattern", "rejected_solution", "pitfall", "constraint"]);
+export const TYPES = new Set(["preference", "project", "decision", "history", "summary", "pattern", "rejected_solution", "pitfall", "constraint",
+  // #230：agent 产长文档的指针行（摘要 + doc_path + evidence）。铸造口唯一
+  // （registerDocument）——saveWithDedupe/updateMemory 另有守卫拒绝旁路铸造。
+  "document"]);
+
+// #249 N3：连续性提案的 pending 队列上限。「队列满则弃新」是形态约定的一半——满时丢
+// 掉本次触发，**不是**淘汰旧行：旧行是别的会话还没转正的活状态，用"更近的边缘"把它挤
+// 掉，等于让长会话的噪音吃掉短会话的真实工作状态。这个数是存储侧策略，与抽取/注入的
+// 截断上限（continuity.js）是两件事。
+const MAX_CONTINUITY_PENDING = 200;
 
 // Epistemic status: what kind of evidence a memory rests on. Defaults to
 // 'subjective' so legacy rows (and rows without any signal) stay compatible.
@@ -393,6 +437,7 @@ function toRow(row) {
     type: row.type,
     title: row.title,
     content: row.content,
+    content_hash: row.content_hash ?? undefined,
     tags: parseTags(row.tags),
     importance: row.importance,
     forgotten: row.forgotten === 1,
@@ -400,6 +445,7 @@ function toRow(row) {
     source: row.source ?? undefined,
     content_history: parseJsonArray(row.content_history),
     evidence: parseJsonArray(row.evidence),
+    doc_path: row.doc_path ?? undefined,
     quality_score: row.quality_score !== null && row.quality_score !== undefined ? Number(row.quality_score) : undefined,
     epistemic_status: row.epistemic_status ?? "subjective",
     agent_scope: row.agent_scope ?? undefined,
@@ -594,7 +640,9 @@ function toLlmAudit(row) {
     status: row.status,
     error_message: row.error_message ?? undefined,
     related_memory_ids: parseJsonArray(row.related_memory_ids),
-    metadata
+    metadata,
+    // #254 写入准入的会话键；LLM 调用行恒 NULL。
+    session_key: row.session_key ?? undefined
   };
 }
 
@@ -674,6 +722,8 @@ export function createStore(path) {
   // 叙述条证据链（#164 对齐）：[{memory_id, op, at}] JSON 数组——叙述/模式类
   // 记忆回链其支撑原子记忆，写入前与候选集求交防模型捏造。
   addColumn("memories", "evidence", "ALTER TABLE memories ADD COLUMN evidence TEXT");
+  // #230：document 指针行的文件定位。只有 registerDocument 写它，普通行恒 NULL。
+  addColumn("memories", "doc_path", "ALTER TABLE memories ADD COLUMN doc_path TEXT");
   addColumn("memories", "epistemic_status", "ALTER TABLE memories ADD COLUMN epistemic_status TEXT NOT NULL DEFAULT 'subjective'");
   addColumn("memories", "content_history", "ALTER TABLE memories ADD COLUMN content_history TEXT");
   addColumn("memories", "quality_score", "ALTER TABLE memories ADD COLUMN quality_score REAL");
@@ -696,6 +746,34 @@ export function createStore(path) {
   addColumn("memories", "workspace_scope_source", "ALTER TABLE memories ADD COLUMN workspace_scope_source TEXT");
   addColumn("memories", "scope_decided_at", "ALTER TABLE memories ADD COLUMN scope_decided_at TEXT");
 
+  // #254 计量信号：内容归一化哈希（口径与动机写在 content-hash.js 的文件头）。派生
+  // 列，不参与任何判定——只给「同一内容又被写了一次」当等值锚。索引建在加列之后：
+  // 老库打开时 SCHEMA 的 CREATE TABLE 对既有表不生效，列还不存在，把索引写进 SCHEMA
+  // 会直接报 no such column（与下方 llm_audit_logs.session_key 同理）。
+  addColumn("memories", "content_hash", "ALTER TABLE memories ADD COLUMN content_hash TEXT");
+  // 列序是 content_hash 打头：哈希几乎唯一，等值 seek 就已收窄到候选行，type 只当同
+  // 一次 seek 里的第二列过滤；反过来（type 打头）下面的存量回填就得全表扫——每次打开
+  // 都要把全部正文读一遍。
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash, type)");
+  // 存量回填：老库（含归档区）的行都没有值，而「归档行纳入去重候选集」这条口径正是
+  // 要靠既有归档行出数据。只算 NULL 行、幂等；改口径不是补 NULL 能修好的，要整列重算
+  // （见 content-hash.js 的文件头）。空标题空正文的行算不出锚，跳过不写——否则每次
+  // 打开都要为这些行再跑一遍 UPDATE。
+  {
+    const updates = db
+      .prepare("SELECT id, title, content FROM memories WHERE content_hash IS NULL")
+      .all()
+      .map((row) => [contentHashOf(row), row.id])
+      .filter(([hash]) => hash);
+    if (updates.length) {
+      const stmt = db.prepare("UPDATE memories SET content_hash = ? WHERE id = ? AND content_hash IS NULL");
+      // 一个事务包住整批：逐条自动提交是每行一次 WAL 提交，几千行的存量库上纯属浪费。
+      runAtomically(() => {
+        for (const [hash, id] of updates) stmt.run(hash, id);
+      });
+    }
+  }
+
   // Legacy dream_runs without policy_epoch → backfill with the default epoch.
   addColumn("dream_runs", "policy_epoch", "ALTER TABLE dream_runs ADD COLUMN policy_epoch INTEGER NOT NULL DEFAULT 0");
   addColumn("dream_runs", "run_type", "ALTER TABLE dream_runs ADD COLUMN run_type TEXT NOT NULL DEFAULT 'auto'");
@@ -708,6 +786,13 @@ export function createStore(path) {
   addColumn("mirror_state", "generation", "ALTER TABLE mirror_state ADD COLUMN generation INTEGER NOT NULL DEFAULT 0");
   addColumn("mirror_state", "applied_generation", "ALTER TABLE mirror_state ADD COLUMN applied_generation INTEGER NOT NULL DEFAULT 0");
   addColumn("mirror_state", "type_status", "ALTER TABLE mirror_state ADD COLUMN type_status TEXT");
+
+  // #254 写入准入（第一阶段只计量）：准入决策行按会话聚合——「会话内新建了几行」
+  // 与「同话题重复间隔」都靠它算出来，所以会话键必须是可等值查询的列，而不是塞在
+  // metadata 里做 JSON 匹配。列可空且不带 DEFAULT（存量行零重写）。索引建在加列
+  // 之后：老库打开时列还不存在（SCHEMA 的 CREATE TABLE 只对新建库生效）。
+  addColumn("llm_audit_logs", "session_key", "ALTER TABLE llm_audit_logs ADD COLUMN session_key TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_llm_audit_session ON llm_audit_logs(session_key);");
 
   // Audit peer F: a legacy DB may hold a non-integer generation/applied_generation
   // (pre-v0.3.9 the JS gate truncated with Math.trunc and SQLite's CHECK only
@@ -780,6 +865,37 @@ export function createStore(path) {
     }
     lastTs = ts;
     return ts;
+  }
+
+  /** 返回指定会话持久化的 autoSummarize 游标；不存在时返回 undefined。 */
+  function getDistillCursor(sessionId) {
+    if (typeof sessionId !== "string" || sessionId.length === 0) return undefined;
+    const row = db.prepare(
+      "SELECT session_id, last_seq, updated_at FROM distill_cursors WHERE session_id = ?"
+    ).get(sessionId);
+    return row
+      ? { session_id: row.session_id, last_seq: Number(row.last_seq), updated_at: row.updated_at }
+      : undefined;
+  }
+
+  /**
+   * 单调持久化会话游标。调用方若同时写入记忆，必须放在外层 SQLite 事务内。
+   */
+  function setDistillCursor(sessionId, lastSeq) {
+    if (typeof sessionId !== "string" || sessionId.length === 0) {
+      throw new TypeError("setDistillCursor: sessionId must be a non-empty string");
+    }
+    if (!Number.isSafeInteger(lastSeq)) {
+      throw new TypeError("setDistillCursor: lastSeq must be a safe integer");
+    }
+    db.prepare(`
+      INSERT INTO distill_cursors (session_id, last_seq, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        last_seq = MAX(distill_cursors.last_seq, excluded.last_seq),
+        updated_at = excluded.updated_at
+    `).run(sessionId, lastSeq, nowIso());
+    return getDistillCursor(sessionId);
   }
 
   function count(type, { minImportance = null, source = null, includeForgotten = false, includeArchived = false, onlyArchived = false, depositedOnly = false, updatedFrom = null, updatedTo = null, occurredFrom = null, occurredTo = null, visibility = null } = {}) {
@@ -863,7 +979,28 @@ export function createStore(path) {
     return toRow(row);
   }
 
+  // #230 写入权分离（存储层唯一铸造口，CodeRabbit 复核最终形态）：document
+  // 行只能经 saveDocument 铸造，通用 save 整类拒绝。doc_path 是任意调用方
+  // 都能捏造的字符串——「必带 doc_path」挡不住绕过注册校验（flag 闸 / 文件
+  // 存在 / 路径归一化 / evidence 可见性 / scope 匹配 / supersede 探测）的直
+  // 铸，必须整类拒绝；受控通道是独立方法而不是隐藏旗标（旗标可被载荷携带，
+  // 方法名在 DI 合同里可审计）。
   function save(memory) {
+    if (memory?.type === "document") {
+      throw new Error("document rows are minted only via store.saveDocument (registerDocument)");
+    }
+    return insertMemoryRow(memory);
+  }
+
+  function saveDocument(memory) {
+    // 指针行结构不变量：doc_path 是 document 的存在依据（无指针 = 死行）。
+    if (!(typeof memory?.doc_path === "string" && memory.doc_path.trim())) {
+      throw new Error("document rows are pointer rows: doc_path is required");
+    }
+    return insertMemoryRow(memory);
+  }
+
+  function insertMemoryRow(memory) {
     const id = memory.id ?? randomUUID();
     const type = memory.type;
     if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
@@ -874,6 +1011,9 @@ export function createStore(path) {
     const tags = JSON.stringify(memory.tags ?? []);
     const importance = Number.isInteger(memory.importance) ? memory.importance : 3;
     const evidence = Array.isArray(memory.evidence) ? JSON.stringify(memory.evidence) : null;
+    const docPath = typeof memory.doc_path === "string" && memory.doc_path.trim() ? memory.doc_path : null;
+    // #254 计量锚：由本行的 title/content 派生，调用方传什么都以这里算出的为准。
+    const contentHash = contentHashOf(memory);
     const embedding = Array.isArray(memory.embedding) && memory.embedding.length
       ? JSON.stringify(memory.embedding)
       : null;
@@ -884,8 +1024,8 @@ export function createStore(path) {
       : inferEpistemicStatus(memory);
     runAtomically(() => {
       db.prepare(
-        `INSERT INTO memories (id, type, title, content, tags, importance, forgotten, archived, source, content_history, quality_score, embedding, epistemic_status, agent_scope, workspace_scope, agent_scope_source, workspace_scope_source, scope_decided_at, sensitivity, occurred_at, evidence, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO memories (id, type, title, content, tags, importance, forgotten, archived, source, content_history, quality_score, embedding, epistemic_status, agent_scope, workspace_scope, agent_scope_source, workspace_scope_source, scope_decided_at, sensitivity, occurred_at, evidence, doc_path, content_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         id,
         type,
@@ -907,6 +1047,8 @@ export function createStore(path) {
         normalizeScopeText(memory.sensitivity),
         normalizeOccurredAt(memory.occurred_at),
         evidence,
+        docPath,
+        contentHash,
         now,
         now
       );
@@ -919,11 +1061,52 @@ export function createStore(path) {
     return getById(id);
   }
 
+  /**
+   * #254 计量：与本次写入「归一化内容哈希」相同的既有行（去重候选集）。
+   * 结构化锚先收窄成本：按哈希等值 seek（走 idx_memories_content_hash，哈希几乎唯
+   * 一，落在候选集上的行只有几条），再按 type 与 scope 三维过滤——不是全表扫、也不
+   * 逐行比哈希。scope 用 IS 比（NULL 安全）：未标注行互相匹配、与已标注行不匹配，
+   * 与 service.js 去重键（scopeKeyOf）同口径；入参先按 store 自己的 normalizeScopeText
+   * 归一，免得调用方传 " foo " 就漏配。
+   * 归档行与已遗忘行都在集内：#275 的分界是「出口止体积、不止重复」——被质量闸归档
+   * 的同一个事实必须仍能判成重复，否则同样的内容再写一次又是一条新行（#254 拍板：
+   * 归档行纳入去重候选集）。
+   * 排序即取舍：活跃行排在归档/遗忘行之前，再按 updated_at 倒序。LIMIT 先于调用方的
+   * 「活区优先」判断执行，而归档动作本身会顶 updated_at——纯按时间倒序时，同键命中一
+   * 旦超过窗口宽度，活跃行就被归档行挤出候选集，调用方只能看到归档命中，把「活跃重复」
+   * 误报成「归档重复」，恰好把这条信号要分流的两类弄反。
+   * @returns {Array<{id: string, archived: boolean, forgotten: boolean}>} 活跃行优先，其后按最近写入
+   */
+  function findContentHashMatches({ type, hash, agent_scope: agentScope, workspace_scope: workspaceScope, sensitivity, limit = 10 } = {}) {
+    if (!hash || !type) return [];
+    const lim = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 50) : 10;
+    const rows = db.prepare(
+      `SELECT id, archived, forgotten FROM memories
+       WHERE type = ? AND content_hash = ?
+         AND agent_scope IS ? AND workspace_scope IS ? AND sensitivity IS ?
+       ORDER BY archived ASC, forgotten ASC, updated_at DESC, id LIMIT ?`
+    ).all(
+      type,
+      hash,
+      normalizeScopeText(agentScope),
+      normalizeScopeText(workspaceScope),
+      normalizeScopeText(sensitivity),
+      lim
+    );
+    return rows.map((row) => ({ id: row.id, archived: row.archived === 1, forgotten: row.forgotten === 1 }));
+  }
+
   function update(id, patch) {
     const existing = getById(id);
     if (!existing) throw new Error(`memory not found: ${id}`);
     const type = patch.type ?? existing.type;
     if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
+    // #230：type 不许改入/改出 document——铸造与退役都只经 registerDocument
+    // （摘要修复走同 type 的 content/title 更新，doc_path 不在本 UPDATE 的
+    // SET 里，天然保持不变）。
+    if ((existing.type === "document") !== (type === "document")) {
+      throw new Error("memory type cannot be changed to or from 'document' (registerDocument is the only mint path)");
+    }
     if (patch.tags !== undefined && !Array.isArray(patch.tags)) {
       throw new Error("tags must be an array");
     }
@@ -959,13 +1142,18 @@ export function createStore(path) {
     const nextDecidedAt = patch.scope_decided_at !== undefined
       ? normalizeOccurredAt(patch.scope_decided_at)
       : (existing.scope_decided_at ?? null);
+    // #254：标题或正文变了，锚跟着重算——它是当前内容的派生物，留旧值等于让「这行
+    // 现在装的什么」和标记对不上。
+    const nextTitle = patch.title ?? existing.title;
+    const nextContent = patch.content ?? existing.content;
+    const contentHash = contentHashOf({ title: nextTitle, content: nextContent });
     runAtomically(() => {
       db.prepare(
-        `UPDATE memories SET type=?, title=?, content=?, tags=?, importance=?, source=?, content_history=?, quality_score=?, embedding=?, epistemic_status=?, agent_scope=?, workspace_scope=?, agent_scope_source=?, workspace_scope_source=?, scope_decided_at=?, evidence=?, updated_at=? WHERE id=?`
+        `UPDATE memories SET type=?, title=?, content=?, tags=?, importance=?, source=?, content_history=?, quality_score=?, embedding=?, epistemic_status=?, agent_scope=?, workspace_scope=?, agent_scope_source=?, workspace_scope_source=?, scope_decided_at=?, evidence=?, content_hash=?, updated_at=? WHERE id=?`
       ).run(
         type,
-        patch.title ?? existing.title,
-        patch.content ?? existing.content,
+        nextTitle,
+        nextContent,
         JSON.stringify(patch.tags ?? existing.tags),
         Number.isInteger(patch.importance) ? patch.importance : existing.importance,
         patch.source !== undefined ? patch.source : (existing.source ?? null),
@@ -979,6 +1167,7 @@ export function createStore(path) {
         nextWorkspaceSource,
         nextDecidedAt,
         evidence,
+        contentHash,
         now,
         id
       );
@@ -1015,6 +1204,11 @@ export function createStore(path) {
     if (!existing) throw new Error(`memory not found: ${id}`);
     const type = patch.type ?? existing.type;
     if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
+    // 同 update：document 类型转换在这里同样封死（CAS 路径绕过 updateMemory
+    // 的 service 守卫，必须在存储层兜住）。
+    if ((existing.type === "document") !== (type === "document")) {
+      throw new Error("memory type cannot be changed to or from 'document' (registerDocument is the only mint path)");
+    }
     if (patch.tags !== undefined && !Array.isArray(patch.tags)) {
       throw new Error("tags must be an array");
     }
@@ -1035,15 +1229,19 @@ export function createStore(path) {
     // dirty == false — recoverMirror sees no debt and the mirror stays stale.
     // Wrapping both in one transaction means a CAS miss rolls back cleanly too
     // (no write, no generation bump).
+    // 同 update：#254 的锚随标题/正文重算（CAS 路径也改这两列）。
+    const nextTitle = patch.title ?? existing.title;
+    const nextContent = patch.content ?? existing.content;
+    const contentHash = contentHashOf({ title: nextTitle, content: nextContent });
     let applied = false;
     runAtomically(() => {
       const result = db.prepare(
-        `UPDATE memories SET type=?, title=?, content=?, tags=?, importance=?, source=?, content_history=?, quality_score=?, embedding=?, epistemic_status=?, updated_at=?
+        `UPDATE memories SET type=?, title=?, content=?, tags=?, importance=?, source=?, content_history=?, quality_score=?, embedding=?, epistemic_status=?, content_hash=?, updated_at=?
          WHERE id=? AND updated_at=?`
       ).run(
         type,
-        patch.title ?? existing.title,
-        patch.content ?? existing.content,
+        nextTitle,
+        nextContent,
         JSON.stringify(patch.tags ?? existing.tags),
         Number.isInteger(patch.importance) ? patch.importance : existing.importance,
         patch.source !== undefined ? patch.source : (existing.source ?? null),
@@ -1051,6 +1249,7 @@ export function createStore(path) {
         qualityScore,
         embedding,
         epistemicStatus,
+        contentHash,
         now,
         id,
         expectedUpdatedAt
@@ -1102,15 +1301,15 @@ export function createStore(path) {
   function demoteToSummary(id, summary, { minRefTimeMs } = {}) {
     let changed = false;
     runAtomically(() => {
-      const row = db.prepare("SELECT last_accessed_at, content, _full_content FROM memories WHERE id = ?").get(id);
+      const row = db.prepare("SELECT title, last_accessed_at, content, _full_content FROM memories WHERE id = ?").get(id);
       if (!row || row._full_content) return;
       if (minRefTimeMs !== undefined && row.last_accessed_at) {
         const lastMs = Date.parse(row.last_accessed_at);
         if (lastMs >= minRefTimeMs) return; // touched after snapshot — still hot
       }
       db.prepare(
-        "UPDATE memories SET content = ?, _full_content = ?, updated_at = ? WHERE id = ?"
-      ).run(summary, row.content, nowIso(), id);
+        "UPDATE memories SET content = ?, _full_content = ?, content_hash = ?, updated_at = ? WHERE id = ?"
+      ).run(summary, row.content, contentHashOf({ title: row.title, content: summary }), nowIso(), id);
       incrementGeneration();
       changed = true;
     });
@@ -1121,11 +1320,11 @@ export function createStore(path) {
   function restoreContent(id) {
     let changed = false;
     runAtomically(() => {
-      const row = db.prepare("SELECT content, _full_content FROM memories WHERE id = ?").get(id);
+      const row = db.prepare("SELECT title, content, _full_content FROM memories WHERE id = ?").get(id);
       if (!row || !row._full_content) return;
       db.prepare(
-        "UPDATE memories SET content = ?, _full_content = NULL, updated_at = ? WHERE id = ?"
-      ).run(row._full_content, nowIso(), id);
+        "UPDATE memories SET content = ?, _full_content = NULL, content_hash = ?, updated_at = ? WHERE id = ?"
+      ).run(row._full_content, contentHashOf({ title: row.title, content: row._full_content }), nowIso(), id);
       incrementGeneration();
       changed = true;
     });
@@ -1135,11 +1334,15 @@ export function createStore(path) {
   // Live memories that have not been touched since `cutMs` (never-touched ones
   // fall back to created_at). Ordered by last access ascending — the coldest
   // first. Used by sleep phase 2 to pick archival-demotion candidates.
+  // #230: document pointer rows are excluded — they are heat-immune by design
+  // (λ=0) and their "unread" state is normal (full text lives outside the DB),
+  // so the cold scan must never demote/archive them for lacking access.
   function getUnrecalledSince(cutMs, { limit = 500 } = {}) {
     const cutIso = new Date(cutMs).toISOString();
     const rows = db.prepare(
       `SELECT * FROM memories
        WHERE forgotten = 0 AND archived = 0
+         AND type <> 'document'
          AND (last_accessed_at IS NULL OR last_accessed_at < ?)
        ORDER BY COALESCE(last_accessed_at, created_at) ASC, id
        LIMIT ?`
@@ -1147,12 +1350,19 @@ export function createStore(path) {
     return rows.map(toRow);
   }
 
-  function list({ type, limit = 50, offset = 0, order = "importance", includeForgotten = false, includeArchived = false, onlyArchived = false, depositedOnly = false, minImportance = null, source = null, updatedFrom = null, updatedTo = null, occurredFrom = null, occurredTo = null, visibility = null } = {}) {
+  function list({ type, excludeTypes = null, limit = 50, offset = 0, order = "importance", includeForgotten = false, includeArchived = false, onlyArchived = false, depositedOnly = false, minImportance = null, source = null, updatedFrom = null, updatedTo = null, occurredFrom = null, occurredTo = null, visibility = null } = {}) {
     const clauses = [];
     const params = [];
     if (type) {
       clauses.push("type = ?");
       params.push(type);
+    }
+    // #230：整类排除必须在 LIMIT 之前做——sleep 的模式扫描池（limit 200 +
+    // sleepPatternMinMemories 门槛）若先截断后过滤，document 行一多就会把
+    // 普通记忆挤出窗口，池子被饿空。
+    if (Array.isArray(excludeTypes) && excludeTypes.length) {
+      clauses.push(`type NOT IN (${excludeTypes.map(() => "?").join(", ")})`);
+      params.push(...excludeTypes);
     }
     // Optional server-side filters: importance floor and exact source match.
     // Both stay out of the query when unset so existing callers are unaffected.
@@ -1227,15 +1437,20 @@ export function createStore(path) {
         "(id IN (SELECT record_id FROM receipt_chain WHERE kind IN ('merge', 'update') AND verdict = 'live') OR source = 'dream')"
       );
     }
+    // limit == null = 无界（#230 注册器的精确 supersede 全量扫描用——同路径/
+    // 同标题判定不允许窗口截断）。其余调用传数字，走 sanitizePage 默认档。
+    const unbounded = limit == null;
     const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     // "chrono" is pure newest-first — the stable order paged browsing (month
     // tree, infinite scroll) needs; importance ordering would interleave
     // months across pages.
     const orderBy = order === "chrono" ? "updated_at DESC, id DESC" : "importance DESC, updated_at DESC, id";
-    const rows = db.prepare(
-      `SELECT * FROM memories ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
-    ).all(...params, lim, off);
+    const rows = unbounded
+      ? db.prepare(`SELECT * FROM memories ${where} ORDER BY ${orderBy}`).all(...params)
+      : db.prepare(
+          `SELECT * FROM memories ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
+        ).all(...params, lim, off);
     return rows.map(toRow);
   }
 
@@ -1434,6 +1649,22 @@ export function createStore(path) {
       "SELECT * FROM dream_runs ORDER BY created_at DESC, id LIMIT ? OFFSET ?"
     ).all(lim, off);
     return rows.map(toDreamRun);
+  }
+
+  // Issue #89：上次实际开跑时刻（epoch ms），从审计表恢复——调度器的 lastRunAt
+  // 只活在内存里，进程重启即归零，闸门对新实例放行 → 重启后立刻连发。审计表
+  // 本来就逐 run 落库（failed/degraded 也算 run），直接读它就是事实源，零迁移。
+  function lastDreamRunAt(runType = null) {
+    const row = runType
+      ? db.prepare(
+          "SELECT created_at FROM dream_runs WHERE run_type = ? ORDER BY created_at DESC, id LIMIT 1"
+        ).get(runType)
+      : db.prepare(
+          "SELECT created_at FROM dream_runs ORDER BY created_at DESC, id LIMIT 1"
+        ).get();
+    if (!row?.created_at) return 0;
+    const ms = Date.parse(row.created_at);
+    return Number.isFinite(ms) ? ms : 0;
   }
 
   /**
@@ -1654,8 +1885,8 @@ export function createStore(path) {
     db.prepare(
       `INSERT INTO llm_audit_logs (timestamp, trigger_source, operation_type, model_id,
         input_tokens, output_tokens, total_tokens, cost_usd, duration_ms, status,
-        error_message, related_memory_ids, metadata)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        error_message, related_memory_ids, metadata, session_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       entry.timestamp ?? now,
       entry.trigger_source,
@@ -1671,18 +1902,24 @@ export function createStore(path) {
       JSON.stringify(entry.related_memory_ids ?? []),
       entry.metadata !== undefined
         ? (typeof entry.metadata === "string" ? entry.metadata : JSON.stringify(entry.metadata))
-        : null
+        : null,
+      entry.session_key ?? null
     );
     return toLlmAudit(db.prepare("SELECT * FROM llm_audit_logs ORDER BY id DESC LIMIT 1").get());
   }
 
-  function listLlmAudits({ limit = 50, offset = 0, source } = {}) {
+  function listLlmAudits({ limit = 50, offset = 0, source, sessionKey } = {}) {
     const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
     const clauses = [];
     const params = [];
     if (source) {
       clauses.push("trigger_source = ?");
       params.push(source);
+    }
+    // #254 写入准入：会话内的话题回填只需要该会话的行（走 idx_llm_audit_session）。
+    if (sessionKey) {
+      clauses.push("session_key = ?");
+      params.push(sessionKey);
     }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = db.prepare(
@@ -1691,12 +1928,16 @@ export function createStore(path) {
     return rows.map(toLlmAudit);
   }
 
-  function countLlmAudits({ source } = {}) {
+  function countLlmAudits({ source, sessionKey } = {}) {
     const clauses = [];
     const params = [];
     if (source) {
       clauses.push("trigger_source = ?");
       params.push(source);
+    }
+    if (sessionKey) {
+      clauses.push("session_key = ?");
+      params.push(sessionKey);
     }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     return db.prepare(`SELECT count(*) AS c FROM llm_audit_logs ${where}`).get(...params).c;
@@ -1744,6 +1985,106 @@ export function createStore(path) {
   /** Delete audit rows older than `before` (ISO string). Returns count removed. */
   function deleteOldLlmAudits(before) {
     return db.prepare("DELETE FROM llm_audit_logs WHERE timestamp < ?").run(before).changes;
+  }
+
+  // --- 存储生命周期：无损回收（#275 第一批）--------------------------------
+  //
+  // 两项都零价值判断、零条数变化：行数不变，只把不可重建/不可达的内容丢掉。
+  // 删行不在本模块里（维护者拍板 3：裁列同意、删行不同意）——dream_runs 的骨架、
+  // LLM 决策原文与 receipt 永不删。
+
+  /**
+   * 历史 run 的输入快照统计（#275 A 项，dry-run 用）。
+   *
+   * `input` 这一列的含义**按 run_type 分叉**：auto / sleep 的 run 存的是当时的记忆库
+   * 快照（可由记忆库重建），organize 的 run 存的是 apply 的重放载荷——`organize.js`
+   * 的 apply 直接读它（`snapshot = Array.isArray(report.input) ? report.input : []`），
+   * 置空会让 apply 找不到候选、静默什么都不做却照写回执并盖上 applied_at，那份报告
+   * 从此永远重放不了。所以 organize 行不在可清范围里（同一列，两种语义，只能按 type 分）。
+   *
+   * `bytes` 是列文本大小，只作上界（真实释放看 VACUUM 前后）。
+   * @returns {{runs: number, bytes: number}}
+   */
+  function dreamRunInputStats(before) {
+    const row = db.prepare(
+      `SELECT count(*) AS c, COALESCE(SUM(LENGTH(input)), 0) AS b
+         FROM dream_runs
+        WHERE input IS NOT NULL AND created_at < ? AND run_type != 'organize'`
+    ).get(before);
+    return { runs: row.c, bytes: row.b };
+  }
+
+  /** 置空历史 run 的输入快照（organize 的重放载荷除外）。返回实际改动的行数。 */
+  function clearDreamRunInputs(before) {
+    return db.prepare(
+      `UPDATE dream_runs SET input = NULL
+        WHERE input IS NOT NULL AND created_at < ? AND run_type != 'organize'`
+    ).run(before).changes;
+  }
+
+  /**
+   * 归档行仍带的向量统计（#275 B 项）。检索 SQL 恒带 `archived = 0`，所以这部分
+   * 向量按定义不可达，清掉不改变任何检索结果。
+   * @returns {{rows: number, bytes: number}}
+   */
+  function archivedEmbeddingStats() {
+    const row = db.prepare(
+      `SELECT count(*) AS c, COALESCE(SUM(LENGTH(embedding)), 0) AS b
+         FROM memories WHERE archived = 1 AND embedding IS NOT NULL`
+    ).get();
+    return { rows: row.c, bytes: row.b };
+  }
+
+  /** 清掉归档行的向量。返回实际改动行数。 */
+  function clearArchivedEmbeddings() {
+    const changed = db.prepare(
+      "UPDATE memories SET embedding = NULL WHERE archived = 1 AND embedding IS NOT NULL"
+    ).run().changes;
+    // Issue #202 的单条失效点在 setEmbedding 里，批量清走不到它——整表清缓存最省事，
+    // 代价只是活跃行下次检索多解析一次（FIFO 上限 4000，自愈）。
+    if (changed > 0) embeddingCache.clear();
+    return changed;
+  }
+
+  /**
+   * 库文件与页统计（#275 报告口径）：回收收益按 VACUUM 前后体积量，不按列字节估——
+   * 实际释放来自溢出页与索引页的回收，列文本大小只是上界。
+   *
+   * 体积是**磁盘足迹**：WAL 模式下主文件之外还有 `-wal` / `-shm`，只量主文件会把
+   * 「刚清完还没落盘」的那部分算漏（实测过：VACUUM 后主文件可能一动不动，要等一次
+   * checkpoint）。所以三份一起量；`:memory:` 库没有文件。
+   */
+  function storageStats() {
+    const pageSize = db.prepare("PRAGMA page_size").get().page_size;
+    const pageCount = db.prepare("PRAGMA page_count").get().page_count;
+    const freelistCount = db.prepare("PRAGMA freelist_count").get().freelist_count;
+    const sizeOf = (p) => {
+      try {
+        return statSync(p).size;
+      } catch {
+        return 0;
+      }
+    };
+    let fileBytes = null;
+    if (typeof path === "string" && path !== ":memory:") {
+      fileBytes = sizeOf(path) + sizeOf(`${path}-wal`) + sizeOf(`${path}-shm`);
+    }
+    return { path: typeof path === "string" ? path : null, pageSize, pageCount, freelistCount, fileBytes };
+  }
+
+  /**
+   * 整库 VACUUM（#275 的手动步骤）：代价 O(库大小) 且需要排他写锁，所以只在显式
+   * 入口里跑，绝不挂启动路径、也不开 auto_vacuum。
+   *
+   * 收尾补一次 `wal_checkpoint(TRUNCATE)`：WAL 模式下 VACUUM 重排的是主文件里的页，
+   * 已回收的空间可能还挂在 WAL 里，不 checkpoint 就量不到体积下降——报告口径要的是
+   * 真实释放量，量不到等于没做（评审实测：VACUUM 后主文件长度不变，checkpoint 后才降）。
+   */
+  function vacuum() {
+    const started = Date.now();
+    db.exec("VACUUM");
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    return { duration_ms: Date.now() - started };
   }
 
   // --- failure memories ----------------------------------------------------
@@ -2332,6 +2673,60 @@ export function createStore(path) {
    *  Otherwise wrap in BEGIN/COMMIT so a memory write and its desired-generation
    *  bump commit together: a crash between them can never leave a mutated store
    *  with generation == applied (audit peer blocker 1, "crash window"). */
+  // --- #249 N3：压缩边缘的连续性提案（唯一写入口 = 压缩边缘监听器） -------------
+  /** Upsert one continuity proposal. (session_id, kind) is the形态约定「同一会话同一类
+   *  只留一条」：命中即刷新（created_at 不动、updated_at 记最近边缘），不新增行。
+   *  Queue full → drop the new one and say so (dropped: true) instead of throwing: an edge
+   *  that cannot be recorded must not break the host's step. Returns {id, created, dropped}. */
+  function saveContinuityProposal({
+    sessionId, kind, currentWork = null, nextStep = null, openQuestions = null, edgeSeq = null,
+    maxPending = MAX_CONTINUITY_PENDING
+  } = {}) {
+    if (!sessionId || !kind) throw new TypeError("continuity proposal needs sessionId and kind");
+    const now = new Date().toISOString();
+    const existing = db.prepare("SELECT id FROM continuity_proposals WHERE session_id = ? AND kind = ?").get(sessionId, kind);
+    if (!existing) {
+      const pending = db.prepare("SELECT COUNT(*) AS c FROM continuity_proposals WHERE status = 'pending'").get().c;
+      if (pending >= maxPending) return { id: null, created: false, dropped: true };
+    }
+    // 写入本身是一条 UPSERT：唯一索引 (session_id, kind) 是并发的裁决者。两个宿主共用
+    // memoryDir 时（AGENTS.md 的多进程 WAL 场景）先查后插会有一个撞 SQLITE_CONSTRAINT，
+    // 而这里只该有一条语句决定成不成功。上面的 SELECT 只用于「队列满」与 created 标记。
+    // created_at 与 status 刻意不在 SET 里：命中只刷新内容与最近边缘时刻，不把已转正的行打回 pending。
+    const id = randomUUID();
+    db.prepare(`
+      INSERT INTO continuity_proposals (id, session_id, kind, current_work, next_step, open_questions, status, edge_seq, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+      ON CONFLICT(session_id, kind) DO UPDATE SET
+        current_work = excluded.current_work,
+        next_step = excluded.next_step,
+        open_questions = excluded.open_questions,
+        edge_seq = excluded.edge_seq,
+        updated_at = excluded.updated_at
+    `).run(id, sessionId, kind, currentWork, nextStep, openQuestions, edgeSeq, now, now);
+    const row = db.prepare("SELECT id FROM continuity_proposals WHERE session_id = ? AND kind = ?").get(sessionId, kind);
+    return { id: row?.id ?? id, created: !existing, dropped: false };
+  }
+
+  /** The single proposal for (session, kind), or null. */
+  function getContinuityProposal(sessionId, kind) {
+    return db.prepare("SELECT * FROM continuity_proposals WHERE session_id = ? AND kind = ?").get(sessionId, kind) ?? null;
+  }
+
+  /** Newest-first proposals, optionally filtered by status (转正通道的读侧预置)。 */
+  function listContinuityProposals({ status, limit = 50 } = {}) {
+    const bounded = Number.isSafeInteger(limit) && limit > 0 ? limit : 50;
+    return status
+      ? db.prepare("SELECT * FROM continuity_proposals WHERE status = ? ORDER BY updated_at DESC, id LIMIT ?").all(status, bounded)
+      : db.prepare("SELECT * FROM continuity_proposals ORDER BY updated_at DESC, id LIMIT ?").all(bounded);
+  }
+
+  function countContinuityProposals({ status } = {}) {
+    return status
+      ? db.prepare("SELECT COUNT(*) AS c FROM continuity_proposals WHERE status = ?").get(status).c
+      : db.prepare("SELECT COUNT(*) AS c FROM continuity_proposals").get().c;
+  }
+
   function runAtomically(fn) {
     if (db.isTransaction) return fn();
     db.exec("BEGIN");
@@ -2368,8 +2763,13 @@ export function createStore(path) {
     count,
     getById,
     save,
+    // document 唯一铸造口（#230 写入权分离）：registerDocument 专用，通用
+    // save/update/CAS 均拒绝 document 创建或类型转换。
+    saveDocument,
     update,
     compareAndUpdate,
+    // #254：写入准入的内容哈希候选集（只读）。
+    findContentHashMatches,
     remove,
     setForget,
     setArchived,
@@ -2387,6 +2787,7 @@ export function createStore(path) {
     needsEmbedding,
     searchVector,
     saveDreamRun,
+    lastDreamRunAt,
     getDreamRun,
     listDreamRuns,
     getLatestPolicyEpoch,
@@ -2401,10 +2802,19 @@ export function createStore(path) {
     getRecallEval,
     listRecallEvals,
     saveLlmAudit,
+    getDistillCursor,
+    setDistillCursor,
     listLlmAudits,
     countLlmAudits,
     getLlmAuditStats,
     deleteOldLlmAudits,
+    // 存储生命周期（#275 第一批）：无损回收的统计、清理与体积口径。
+    dreamRunInputStats,
+    clearDreamRunInputs,
+    archivedEmbeddingStats,
+    clearArchivedEmbeddings,
+    storageStats,
+    vacuum,
     saveFailure,
     listFailures,
     getFailureStats,
@@ -2441,6 +2851,11 @@ export function createStore(path) {
     setTypeStatus,
     getTypeStatus,
     incrementGeneration,
+    // #249 N3：压缩边缘的连续性提案（落提案、转正才进 memories）。
+    saveContinuityProposal,
+    getContinuityProposal,
+    listContinuityProposals,
+    countContinuityProposals,
     close() {
       db.close();
     }

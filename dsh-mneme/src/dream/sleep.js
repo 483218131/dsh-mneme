@@ -49,12 +49,22 @@ function parseJsonArray(text) {
   }
 }
 
-/** Same stream consumption contract as dream.js. */
-async function streamText(ctx, options, onStreamError) {
+/**
+ * Same stream consumption contract as dream.js.
+ *
+ * `onUsage`（optional, issue #250）receives any usage chunk for token accounting.
+ * dream.js 那份一直有它；sleep 这份副本没有，导致 conflict / pattern 两条链路的
+ * token 从未进 llm_audit_logs（面板因此只看到 autoDream 与 autoSummarize）。
+ */
+async function streamText(ctx, options, onUsage, onStreamError) {
   if (!ctx?.llm?.stream) return undefined;
   let text = "";
   for await (const chunk of ctx.llm.stream(options)) {
     if (chunk.type === "text-delta" && typeof chunk.text === "string") text += chunk.text;
+    // DSH 的 StreamChunk 契约把用量嵌在 chunk.usage（TokenUsage：inputTokens /
+    // outputTokens / totalTokens）；兼容直接平铺在 chunk 上的旧形态。归一放在
+    // 这里，调用侧的 reporter 只需认平铺形状——与 dream.js:239 同一处理。
+    if (chunk.type === "usage" && typeof onUsage === "function") onUsage(chunk.usage ?? chunk);
     if (chunk.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) {
       // Same rc.1 error-as-finish-chunk behavior as dream.js — surface the
       // cause instead of discarding it.
@@ -65,6 +75,79 @@ async function streamText(ctx, options, onStreamError) {
     }
   }
   return text;
+}
+
+/**
+ * Issue #250：给 sleep 的一条 LLM 调用记一笔 llm_audit_logs（token / 时长 / 状态 /
+ * 触发源）。与 dream.js 的 runAuditedLlm 同口径但各自独立一份——dream 那两个
+ * checker 的调用形状绑定着它自己的排程细节，硬抽共享抽象只会收敛回 dream 的形态。
+ *
+ * 记账是 best-effort：写审计行失败只 warn，绝不反噬 sleep 本体（CONTRIBUTING 的
+ * fail-safe 硬约定）。`body(reportUsage)` 负责真实消费流，usage chunk 经
+ * reportUsage 上报。
+ *
+ * 审计诚实性：流被中止/报错时 body 返回 undefined，记 status='error'；流式成功但
+ * 输出不可用时 `spec.auditError` 给出原因，同样记 error——否则同一轮调用会在
+ * 「phase 报 failed」与「audit 报 success」之间自相矛盾（CONTRIBUTING 的审计诚实性
+ * 硬约定）。`auditError` 必须是**纯判据函数**：调用方的控制流不能依赖它的副作用，
+ * 因为审计关闭时这里整段早退、钩子根本不会被调用（dream 正是那样踩的，见 PR 正文）。
+ */
+async function auditedSleepLlm(ctx, service, config, logger, spec, body) {
+  if (config?.llmAudit?.enabled === false || typeof service?.saveLlmAudit !== "function") {
+    return body(() => {});
+  }
+  const startedAt = Date.now();
+  const timestamp = new Date(startedAt).toISOString();
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let status = "success";
+  let errorMessage = null;
+  try {
+    const result = await body((usage) => {
+      if (!usage) return;
+      const i = usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens ?? usage.promptTokens;
+      const o = usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens ?? usage.completionTokens;
+      if (Number.isFinite(i)) inputTokens = i;
+      if (Number.isFinite(o)) outputTokens = o;
+    });
+    if (result === undefined) {
+      status = "error";
+      const streamErr = typeof spec.streamError === "function" ? String(spec.streamError() ?? "") : "";
+      errorMessage = streamErr ? `llm stream aborted or errored (${streamErr})` : "llm stream aborted or errored";
+    } else if (typeof spec.auditError === "function") {
+      // 流式成功但输出不可用，仍然是一次失败的调用——记 error，不与调用方的
+      // failed 返回值打架。
+      const message = spec.auditError(result);
+      if (message) {
+        status = "error";
+        errorMessage = message;
+      }
+    }
+    return result;
+  } catch (error) {
+    status = "error";
+    errorMessage = String(error?.message ?? error);
+    throw error;
+  } finally {
+    try {
+      service.saveLlmAudit({
+        timestamp,
+        trigger_source: spec.triggerSource,
+        operation_type: spec.operationType,
+        model_id: spec.modelId,
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        total_tokens: inputTokens + outputTokens,
+        cost_usd: 0,
+        duration_ms: Date.now() - startedAt,
+        status,
+        error_message: errorMessage,
+        related_memory_ids: spec.relatedMemoryIds ?? []
+      });
+    } catch (auditError) {
+      logger?.warn?.(`dsh-mneme sleep: llm audit write failed: ${String(auditError)}`);
+    }
+  }
 }
 
 /** LLM route (Issue #25): explicit sleepProvider/Model wins, then the dream
@@ -106,7 +189,7 @@ async function phaseConflicts(ctx, service, config, logger, runId, semantic = nu
   }
   const strictness = config.sleepConflictStrictness ?? "normal";
   const threshold = CONFLICT_THRESHOLDS[strictness] ?? CONFLICT_THRESHOLDS.normal;
-  const memories = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary");
+  const memories = service.all().filter((m) => !m.archived && !m.forgotten && m.type !== "summary" && m.type !== "document");
   if (memories.length < 2) return { status: "skipped", reason: "too few memories" };
   if (signal?.aborted) return { status: "aborted", reason: "user activity" };
 
@@ -232,17 +315,29 @@ async function phaseConflicts(ctx, service, config, logger, runId, semantic = nu
   const conflictPrompt = actionSet === "full" ? STR.prompts.conflictFull[language] : STR.prompts.conflict[language];
   const runConflict = (withEffort) => {
     conflictStreamFailure = "";
-    return streamText(ctx, {
+    return auditedSleepLlm(ctx, service, config, logger, {
+      triggerSource: "sleep",
+      operationType: "sleep_conflict",
+      modelId: `${route.provider}:${route.model}`,
+      // 候选对的双方 id：面板的活动流用 related_memory_ids 解析「沉淀条数」。
+      relatedMemoryIds: samePairs.flatMap((p) => [p.a.id, p.b.id]),
+      streamError: () => conflictStreamFailure,
+      // 纯判据：输出里没有 JSON 数组 ⇒ 这轮是失败的调用，审计记 error。**不要**把
+      // 解析结果存进闭包给下面的控制流用——审计关闭时 auditedSleepLlm 整段早退、
+      // 这个钩子不会被调用，控制流会跟着失效（dream 的既有坑）。代价是审计开启时
+      // 多解析一次，换来两条路径彻底解耦。
+      auditError: (text) => (parseJsonArray(text) ? null : "no json array in llm output")
+    }, (reportUsage) => streamText(ctx, {
     provider: route.provider,
     model: route.model,
     purpose: "sleep-conflict",
     maxTokens: config.sleepMaxTokens ?? 2048,
     ...(withEffort && sleepEffort ? { reasoningEffort: sleepEffort } : {}),
     messages: [
-      { role: "system", content: [{ type: "text", text: conflictPrompt }], source: { kind: "plugin", plugin: "dsh-mneme" } },
-      { role: "user", content: [{ type: "text", text: listText }], source: { kind: "plugin", plugin: "dsh-mneme" } }
+      { role: "system", content: [{ type: "text", text: conflictPrompt }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } },
+      { role: "user", content: [{ type: "text", text: listText }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } }
     ]
-  }, (reason) => { conflictStreamFailure = describeStreamFailure(reason); });
+  }, reportUsage, (reason) => { conflictStreamFailure = describeStreamFailure(reason); }));
   };
   const text = await withEffortFallback(ctx, sleepEffort, () => runConflict(true), () => runConflict(false), () => conflictStreamFailure);
   if (text === undefined) {
@@ -368,8 +463,10 @@ async function phasePatterns(ctx, service, config, logger, runId, signal = null)
   const route = resolveSleepRoute(ctx, config, logger);
   if (!route) return { status: "skipped", reason: "no llm route" };
   const limit = config.sleepPatternMinMemories ?? 100;
+  // #230：document 在查询层排除（excludeTypes）而不是截断后过滤——LIMIT 200
+  // 先生效的话，指针行一多就会把普通记忆挤出扫描窗，池子饿到门槛以下。
   const memories = service
-    .list({ limit: 200, includeForgotten: false })
+    .list({ limit: 200, includeForgotten: false, excludeTypes: ["document"] })
     .filter((m) => !m.archived && m.type !== "summary" && m.type !== "pattern")
     .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
     .slice(0, limit);
@@ -383,17 +480,26 @@ async function phasePatterns(ctx, service, config, logger, runId, signal = null)
   let patternStreamFailure = "";
   const runPattern = (withEffort) => {
     patternStreamFailure = "";
-    return streamText(ctx, {
+    return auditedSleepLlm(ctx, service, config, logger, {
+      triggerSource: "sleep",
+      operationType: "sleep_pattern",
+      modelId: `${route.provider}:${route.model}`,
+      // 本轮扫描的记忆 id：与 dream 的 relatedMemoryIds 同义，供面板解析沉淀条数。
+      relatedMemoryIds: memories.map((m) => m.id),
+      streamError: () => patternStreamFailure,
+      // 纯判据，同 conflict 阶段：不把解析结果存进闭包供控制流使用。
+      auditError: (text) => (parseJsonArray(text) ? null : "no json array in llm output")
+    }, (reportUsage) => streamText(ctx, {
     provider: route.provider,
     model: route.model,
     purpose: "sleep-pattern",
     maxTokens: config.sleepMaxTokens ?? 2048,
     ...(withEffort && sleepEffort ? { reasoningEffort: sleepEffort } : {}),
     messages: [
-      { role: "system", content: [{ type: "text", text: STR.prompts.pattern[language].replace("N", String(maxPatterns)) }], source: { kind: "plugin", plugin: "dsh-mneme" } },
-      { role: "user", content: [{ type: "text", text: listText }], source: { kind: "plugin", plugin: "dsh-mneme" } }
+      { role: "system", content: [{ type: "text", text: STR.prompts.pattern[language].replace("N", String(maxPatterns)) }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } },
+      { role: "user", content: [{ type: "text", text: listText }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } }
     ]
-  }, (reason) => { patternStreamFailure = describeStreamFailure(reason); });
+  }, reportUsage, (reason) => { patternStreamFailure = describeStreamFailure(reason); }));
   };
   const text = await withEffortFallback(ctx, sleepEffort, () => runPattern(true), () => runPattern(false), () => patternStreamFailure);
   if (text === undefined) {
@@ -505,6 +611,9 @@ function deriveStatus(phases) {
  */
 export async function runSleep(ctx, service, config, logger, semantic = null, signal = null) {
   const runId = randomUUID();
+  // Issue #89：开跑时刻——审计行 created_at 的基准（= 冷却种子），run 耗时
+  // （LLM 各 phase）不应计入重启后的冷却窗口。
+  const sleepStartedAt = Date.now();
   const phases = {};
   const attempt = async (name, fn) => {
     if (signal?.aborted) return; // user resumed activity — stop before next phase
@@ -541,6 +650,9 @@ export async function runSleep(ctx, service, config, logger, semantic = null, si
   try {
     service.saveDreamRun({
       id: runId,
+      // Issue #89：审计行记开跑时刻而非完成时刻——run 耗时（含 LLM 各 phase）
+      // 不该计入重启后的 sleep 冷却种子。
+      created_at: new Date(sleepStartedAt).toISOString(),
       status,
       provider: route?.provider,
       model: route?.model,
@@ -580,10 +692,14 @@ export function createSleepScheduler({
   onRun = null,
   now = () => Date.now(),
   setTimeoutFn = setTimeout,
-  clearTimeoutFn = clearTimeout
+  clearTimeoutFn = clearTimeout,
+  // Issue #89 同族：冷却时刻由调用方从 dream_runs 审计表恢复（run_type='sleep'）——
+  // 内存变量进程重启即归零，冷却闸对新实例放行 → 重启后立即进入 sleep 冷却盲区。
+  // 测试注入 0（默认）即保持旧行为。
+  lastRunAtSeed = 0
 }) {
   let lastWriteAt = now();
-  let lastRunAt = 0;
+  let lastRunAt = lastRunAtSeed;
   let running = false;
   let disposed = false;
   let idleTimer = null;

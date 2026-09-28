@@ -16,6 +16,8 @@ export const TYPE_DECAY_DEFAULTS = Object.freeze({
   preference: 0,    // 免疫：用户画像需长期保持
   pattern: 0,       // 免疫：发现型稳定规律
   summary: 0,       // 免疫：已是压缩产物
+  document: 0,      // 免疫：指针行（#230）——全文在文件系统，行失效靠 supersede
+                    // 记账而非遗忘；遗忘曲线灭掉指针 = 按需读全文的入口消失
   project: 0.0008,  // 慢衰减
   decision: 0.002,  // 中速衰减
   history: 0.006,   // 较快（会话摘要不断被合并）

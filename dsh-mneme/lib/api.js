@@ -1,10 +1,11 @@
 import { URL } from "node:url";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import { FEATURE_FLAG_SPEC } from "./settings.js";
-import { TYPE_FILE, renderMirrorText, parseHumanEdits } from "./mirror.js";
+import { TYPE_FILE, renderMirrorText, renderFileHeader, parseHumanEdits, MIRROR_READONLY_TYPES } from "./mirror.js";
 import { langOf } from "./lang.js";
 import { computeHeat } from "./heat.js";
 import { describeStreamFailure, resolveRoute } from "./dream.js";
+import { getInjectionSnapshot } from "./inject.js";
 import { describeLocalRuntime, publicRuntimeStatus } from "./runtime/loader.js";
 import { hostModulesDir, provisionRuntime } from "./runtime/provision.js";
 import { classify, fetchLatestVersion, PACKAGE_VERSION } from "./version-check.js";
@@ -379,7 +380,7 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
           {
             role: "user",
             content: [{ type: "text", text: "Reply with exactly one word: ok" }],
-            source: { kind: "plugin", plugin: "dsh-mneme" }
+            source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" }
           }
         ]
       })) {
@@ -787,7 +788,11 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
         const page = Math.max(1, Number(url.searchParams.get("page") ?? 1) || 1);
         const pageSize = Math.min(200, Math.max(1, Number(url.searchParams.get("pageSize") ?? 50) || 50));
         const source = url.searchParams.get("source") ?? undefined;
-        const items = service.listLlmAudits?.({ limit: pageSize, offset: (page - 1) * pageSize, source }) ?? [];
+        // 写入准入（#254）的 session_key 是内部计数键——session_id 不是对外的归属
+        // 标识（见 scope.js 文件头），而本端点按注释在 apiToken 之下也保持开放，所以
+        // 不回传它。按会话离线聚合直接读库。
+        const items = (service.listLlmAudits?.({ limit: pageSize, offset: (page - 1) * pageSize, source }) ?? [])
+          .map((row) => (row.session_key === undefined ? row : { ...row, session_key: undefined }));
         const total = service.countLlmAudits?.({ source }) ?? items.length;
         sendJson(res, 200, { items, total, page, pageSize });
       } catch {
@@ -972,9 +977,15 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
   });
 
   // --- 导出（面板备份/迁移）---------------------------------------------------
-  // 只读。json：全字段行（含 archived/forgotten，布尔化），updated_at DESC；
-  // markdown：按类型分节，块格式与磁盘镜像完全同构（renderMirrorText 与
-  // mirror.sync 共用同一条渲染路径），因此导出文本可以被 /import 原样吃回。
+  // 只读。json：全字段行（含 archived/forgotten，布尔化），updated_at DESC。
+  // markdown：一个文档 = 文档级 frontmatter + 按类型分节。frontmatter 只放文档
+  // 最前一份（分节不再各自带文件头，否则 9 个 `---` 块串在一个 .md 里，外部
+  // frontmatter 解析器只认第一段、其余降级成正文），它的 coverage: all 就是一句
+  // 看得见的声明：这份导出含 archived/forgotten（document 指针行除外——它两个
+  // 落点都不进，见 mirror.js 的 MIRROR_EXCLUDED_TYPES）。条目块与磁盘镜像同构（共用
+  // renderMirrorText 的条目渲染），所以导出文本能被 /import 原样吃回；「同构」
+  // 止于条目——磁盘镜像只写活跃集，导出的行集更宽，两者的覆盖声明因此不同
+  // （active-only vs all）。
   // 全量一次性取回（store.all 按 updated_at DESC）——导出是一次性备份动作，
   // 不需要流式。
   register({
@@ -1001,13 +1012,21 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
         }
         const byType = {};
         for (const row of rows) {
-          if (TYPE_FILE[row.type]) (byType[row.type] ??= []).push(row);
+          // 没有 TYPE_FILE 条目的 type 不进 markdown 导出，只读 type（#296 的
+          // document 指针行）同样不进：导出/导入是 round-trip 通道，只读视图没有
+          // 可回填的正文。两个排除都在 mirror.js 那张表里（MIRROR_EXCLUDED_TYPES /
+          // MIRROR_READONLY_TYPES）。json 分支是全字段导出，不受影响。
+          if (TYPE_FILE[row.type] && !MIRROR_READONLY_TYPES.has(row.type)) (byType[row.type] ??= []).push(row);
         }
         const sections = [];
         for (const type of Object.keys(TYPE_FILE)) {
-          if (byType[type]?.length) sections.push(renderMirrorText(type, byType[type], langOf(config)));
+          if (byType[type]?.length) {
+            sections.push(renderMirrorText(type, byType[type], langOf(config), { fileHeader: false }));
+          }
         }
-        sendAttachment(res, 200, "text/markdown; charset=utf-8", `dsh-mneme-export-${stamp}.md`, sections.join("\n"));
+        const included = Object.values(byType).flat();
+        const docHeader = renderFileHeader("memory-export", included, "all");
+        sendAttachment(res, 200, "text/markdown; charset=utf-8", `dsh-mneme-export-${stamp}.md`, docHeader + sections.join("\n"));
       } catch {
         sendJson(res, 500, { error: "internal" });
       }
@@ -1015,9 +1034,8 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
   });
 
   // --- 导入（Markdown 镜像回填）----------------------------------------------
-  // 写路径（requireAuth）。body {type, markdown}：type 是镜像 TYPE_FILE 键
-  // （preference/project/decision/history/summary），markdown 是与镜像文件同构
-  // 的文本。解析复用 readHumanEdits 的纯函数核心 parseHumanEdits（同一实现，
+  // 写路径（requireAuth）。body {type, markdown}：type 是镜像 TYPE_FILE 键，
+  // markdown 是与镜像文件同构的文本。解析复用 readHumanEdits 的纯函数核心 parseHumanEdits（同一实现，
   // 行为一致是硬约束），合并走 mergeHumanEdits（只吃 title/content；digest 命
   // 中或无差异的条目在 service 侧自动跳过）。解析出 0 条不算错误。
   register({
@@ -1034,6 +1052,12 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
           const body = parseBody(text);
           if (typeof body.type !== "string" || !Object.hasOwn(TYPE_FILE, body.type)) {
             sendJson(res, 400, { error: "invalid-type" });
+            return;
+          }
+          // 只读 type 是合法 type，只是没有可回填的正文（#296）：单独的码，调用方
+          // 不会被误导去改 type 名重试。
+          if (MIRROR_READONLY_TYPES.has(body.type)) {
+            sendJson(res, 400, { error: "readonly-type" });
             return;
           }
           if (typeof body.markdown !== "string" || !body.markdown.trim()) {
@@ -1330,6 +1354,26 @@ export function createApi(ctx, service, settings, commands, embedder, semantic =
         const agentPreset = lastAgentPreset;
         const suppressed = autoInject && agentPreset === "minimal";
         sendJson(res, 200, { autoInject, agentPreset, suppressed });
+      } catch {
+        sendJson(res, 500, { error: "internal" });
+      }
+    }
+  });
+
+  // 注入预览（#179，只读）：最近一帧 systemPrompt 组装的构成与体积——快照由
+  // inject.js 在真实渲染路径旁路缓存（同一份 candidates，不二次检索）。null =
+  // 尚未发生过渲染（新宿主/新会话）或 autoInject 关闭（注入器未注册），面板对
+  // 两者都以「暂无预览」呈现，不区分也不猜。
+  register({
+    kind: "exact",
+    path: "/api/dsh-mneme/inject-preview",
+    handler(req, res) {
+      try {
+        if (req.method !== "GET") {
+          sendJson(res, 404, { error: "not-found" });
+          return;
+        }
+        sendJson(res, 200, { snapshot: getInjectionSnapshot() });
       } catch {
         sendJson(res, 500, { error: "internal" });
       }

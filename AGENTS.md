@@ -32,7 +32,9 @@ dsh-mneme 是 DSH 宿主的记忆插件（蒸馏 / 注入 / 检索 / 巩固 / sc
 |---|---|---|
 | 宿主挂载入口 | `src/index.js` | ctx 接线、memoryDir 解析、各管线启动、实体抽取触发点 |
 | 存储 | `src/store.js` | SQLite schema（memories / 实体三表 / dream_runs / recall_runs / 审计表）、幂等迁移 |
+| 存储生命周期 | `src/maintenance.js` | 无损回收维护入口（#275 第一批；`dsh-mneme reclaim`，默认 dry-run，VACUUM 单独指定） |
 | 服务层 | `src/service.js` | saveWithDedupe（去重键 type+title+scope 三元组）、fuseRecall 检索融合（keyword/vector/bm25/entity）、注入候选、镜像同步、冲突队列 |
+| 写入准入 | `src/write-admission.js` | 写入前的会话写入预算与同话题冷却（#254；第一阶段只计量不拦截，测量点落 `llm_audit_logs`） |
 | 注入 | `src/inject.js` | 注入位构造、内容截断、跨轮轮换 |
 | 蒸馏 | `src/summarize.js` + `src/quality-filter.js` | 会话 → 记忆；质量打分与处置（归档/降权） |
 | 巩固与睡眠 | `src/dream.js` + `src/dream/{decisions,clustering,sleep}.js` | LLM 巩固决策、dream_runs 审计回执 |
@@ -56,7 +58,8 @@ dsh-mneme 是 DSH 宿主的记忆插件（蒸馏 / 注入 / 检索 / 巩固 / sc
 4. 新行为必须带回归测试；schema 变更配幂等迁移（PRAGMA 检查 + ALTER，存量库启动即建）；
 5. **防御段改动要保守**：幂等迁移、单调时间戳、scope 归一化、审计 receipt——都是踩坑沉淀，动前先读注释；
 6. 提交署名可归属与 AI 内容核验义务见 [CONTRIBUTING](CONTRIBUTING.md)（硬性要求）；
-7. **发布/打包只在 `dsh-mneme/` 包目录内执行**——根目录历史上发出过坏包（0.6.9、0.7.0–0.7.10），此条为防复发红线。
+7. **发布/打包只在 `dsh-mneme/` 包目录内执行**——根目录历史上发出过坏包（0.6.9、0.7.0–0.7.10），此条为防复发红线；
+8. **注释写「为什么」，不写「是什么」**：非常规实现、防御段、行为开关的动机（issue 编号、消融数据、基准数字）必须落注释，代码含义靠命名与测试名表达；测试同样适用——锁形状/锁字面量的用例要注释写清它在防哪类回归（例：`test/recall-evals.test.js` 的 signals 形状锁）。
 
 ## 闸门清单
 

@@ -45,6 +45,12 @@ const FEATURE_FLAG_BOOLEANS = [
   "hotMemoryEnabled",
   // Issue #239 第 5 项：注入条数的查询自适应（确定性强则收缩注入条数，默认关）。
   "injectUncertaintyAdaptive",
+  // Issue #249：能力说明（工具描述判断指引 + order 150 总则段）。第二批起它是
+  // 注入父开关 autoInject 的子项、默认开（父关时不生效，闸门见 config.js）。
+  "injectGuidanceEnabled",
+  // Issue #249 N3：压缩边缘双落点——上下文即将精简前落一条连续性提案 + 往
+  // 序列末尾追加同一份快照。默认关（新注入表面，见 config.js），父开关 autoInject。
+  "continuityRescueEnabled",
   "entityExtractionEnabled",
   // Issue #219：图召回轴——查询命中实体名时把挂联记忆并入检索融合池
   // （默认关；依赖实体抽取产出，lightMode 强制关闭）。
@@ -52,8 +58,14 @@ const FEATURE_FLAG_BOOLEANS = [
   // Issue #164：叙述条——dream 期间按 tag 主题簇合成叙述落库（source=
   // narrative，evidence 回链簇内记忆；按需检索不常驻注入；默认关）。
   "dreamNarrativeEnabled",
+  // Issue #230：document 型记忆——agent 产长文档的指针行（注册校验/摘要+
+  // doc_path 落库/C2 去重/supersede 记账；全文归 agent；默认关，lightMode 强制关）。
+  "documentMemoryEnabled",
   "codingRetrospect",
   "autoDream",
+  // Issue #292：autoDream 连续失败退避（默认关）。基数是 dreamMinIntervalMinutes，
+  // 有效间隔 = 基数 × 2^连续失败数（成功清零），封顶 30 分钟；面板可启停。
+  "autoDreamFailureBackoff",
   "sleepModeEnabled",
   "heatEnabled",
   "hybridInject",
@@ -80,6 +92,10 @@ const FEATURE_FLAG_BOOLEANS = [
   // Issue #17（v0.8.0 A3）：strictScope 硬过滤——他 scope 完全不可见（关闭时
   // 为 A2 软隔离：降权保留可见）。
   "strictScope",
+  // 工具暴露开关（v0.8.5）：记忆已每轮自动注入，memory_search/memory_archive
+  // 在慢/轻量模型上是多余往返，面板可关（默认关=行为不变）。
+  "disableMemorySearch",
+  "disableMemoryArchive",
   // 嵌套对象开关：config.js 里是 memoryQualityFilter / llmAudit 对象的 enabled
   // 子字段。kv 按点号键平铺存（"memoryQualityFilter.enabled": false），index.js
   // 合并时展开回嵌套对象，api.js 的 effective 从对象子字段取值。
@@ -104,12 +120,18 @@ const FEATURE_FLAG_INT_RANGES = {
   summarizeMaxRunsPerSession: [0, 1000],
   // Issue #239 第 4 项：高峰顺延上限（分钟，0 = 不设上限）。
   summarizePeakMaxDeferMinutes: [0, 1440],
+  // Issue #239 第 4 项镜像到巩固：同一口径（分钟，0 = 不设上限）。
+  dreamPeakMaxDeferMinutes: [0, 1440],
   // Issue #125：hybrid 候选量上限（0 = 复用 dreamMaxSnapshotSize）。
   dreamCandidateMax: [0, 5000],
   // Issue #164①：注入单条正文截断上限（默认 300 = 既有行为）。
   injectContentMaxChars: [60, 4000],
   // Issue #164：叙述条成簇门槛（共享同一 tag 的记忆数下限）。
   dreamNarrativeMinCluster: [2, 20],
+  // Issue #230：document 摘要行的注入预算（次优先档内最多几条指针行）。
+  documentInjectBudget: [1, 5],
+  // Issue #249 第一批：B1 pin 池（约束/偏好）的独立条数预算（0 = 关闭/现状）。
+  pinnedInjectBudget: [0, 5],
   // Issue #257：sleep 冲突/模式阶段的 LLM 输出预算（原硬编码 2048，实测不足）。
   sleepMaxTokens: [256, 131072],
   // Issue #258：总览（dream_summarize）输入条数硬上限（0 = 不设上限）。
@@ -142,7 +164,9 @@ const FEATURE_FLAG_STRINGS = [
   "localEmbedModel",
   "ollamaModel",
   // Issue #239 第 4 项：高峰时段串（"09:00-18:00"，空串 = 关闭）。
-  "summarizePeakHours"
+  "summarizePeakHours",
+  // Issue #239 第 4 项镜像到巩固：同一份时段语法，空串 = 关闭（行为与现状一致）。
+  "dreamPeakHours"
 ];
 // URL 字符串开关：trim 后必须为空或合法 http/https URL（new URL() 校验协议，
 // 拒绝其余协议——这是 SSRF 防线的一部分）。
@@ -155,12 +179,17 @@ const FEATURE_FLAG_ENUMS = {
   recallFusion: ["blend", "rrf", "minmax"],
   // 实体抽取思考强度（issue #109）：与 dreamReasoningEffort 枚举对齐。
   entityExtractionReasoning: ["low", "medium", "high", "none"],
+  // 蒸馏思考强度（issue #315）：与 entityExtractionReasoning 枚举对齐，
+  // 多一个 off（显式关思考，思考型模型蒸馏防推理烧预算）。
+  summarizeReasoningEffort: ["off", "low", "medium", "high", "none"],
   // Issue #127：落库前去重档位（off 默认，等同现状）。
   summarizeDedupeMode: ["off", "title", "vector"],
   // Issue #126：sleep 冲突阶段的动作集（conflict 默认 = 现状；full = 六分支）。
   sleepActionSet: ["conflict", "full"],
-  // Issue #125：dream 候选集构造方式（window 默认 = 现状；hybrid 并入向量组）。
-  dreamCandidateMode: ["window", "hybrid"]
+    // Issue #125：dream 候选集构造方式（window 默认 = 现状；hybrid 并入向量组）。
+    dreamCandidateMode: ["window", "hybrid"],
+    // 本地嵌入池化：auto = 按模型族判定（BGE → cls），可显式覆盖为 cls / mean。
+    localEmbedPooling: ["auto", "cls", "mean"]
 };
 const FEATURE_FLAG_STRING_MAX = 200;
 

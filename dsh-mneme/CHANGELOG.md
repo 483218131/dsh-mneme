@@ -1,9 +1,177 @@
 # Changelog
 
-## [Unreleased]
+## [0.8.9] - 2026-09-28
+
+## 🐛 修复
+
+- **V4 写入准入兼容（issue #326，PR #327）**：全部 16 处会话消息写入点（蒸馏、注入续接、巩固、
+  睡眠、实体抽取、连通性探测）的 `source.kind` 从裸 `"plugin"` 改为生产者自有 kind
+  `"plugin:dsh-mneme"`（`plugin` 字段保留）。DSH 0.1.7-alpha.1 起的 V4 写入校验把
+  kind 缺失/空串/恰好等于 `"plugin"` 的消息整条拒绝
+  （`format v4 message requires a producer-owned source kind`）：0.8.8 在新版宿主上
+  压缩边缘触发时当前轮直接报错（continuity 注入点，实测见 #326），且该次抢救因边缘
+  消费即删不会重试；其余 LLM 管线写入点同批统一，防宿主后续收紧时扩大受害面。
+  读侧过滤（`kind === undefined || kind === "user"` 白名单）不受影响，历史库里的旧形状
+  事件无需迁移。新增静态形状锁（`test/llm-message-source.test.js`）防止新增写入点回退
+  到裸 kind。
 
 ## 🆕 新增
 
+- **面板状态页与设置页重排版（PR #328）**：状态页九张卡拆成「库内一览 / 后台运转」两个扫读分组，
+  多指标卡片（记忆分类 / 实体分类 / 记忆复用 / 注入预览）从「·」串联的说明长句改成一行
+  一条的指标行（label 左、数值右），热度分布卡改三档堆叠条 + 分档计数——原「热门数」
+  大数字易误读成总量；注入预览的 `maxItems=` / `threshold=` 裸键名改白话标签。
+  设置页重组为「个性化 / 记忆引擎 / 搜索 / 连接与安全 / 帮助」五个分组（运行模式提前到
+  功能开关之前、向量搜索并入搜索组、API Token 与外部访问 API 相邻为「连接与安全」），
+  全部小节统一 boxed 卡片样式；功能开关说明全面白话化（document 记忆 / 严格隔离 /
+  高峰时段等），逐行「重启 DSH 后生效」后缀收敛到卡片级一处——生效语义不变
+  （feature_flags 仍是启动时合并，见 `src/index.js`）。意见与反馈入口重做：图标行 +
+  副标说明 + 版本 footer（兼当「关于」收尾）。补 `memory.tab.summary` 中文标签
+  （此前状态卡直接漏出英文 "summary"）。
+- **状态卡网格排布规整化（PR #328）**：概览区三卡改 `auto-fit` 恒铺满（行尾不再留洞）；「记忆复用 /
+  注入预览」在宽容器下各跨两列补齐引擎区的奇数行，跨列仅在 ≥2 列容器生效
+  （container query 守卫，单列下撤掉避免隐式轨道撑爆布局）；向量卡在 2 列档位跨满整行。
+- **面板星形全线统一（PR #328）**：详情抽屉编辑态的重要度下拉（文本星号，角尖锐且无法与 SVG 星
+  同形）改为 SVG 星形按钮行（实心/描边与查看态同一规则，radiogroup + 逐星 aria-label）；
+  重要度筛选 chip、图谱侧卡提及数、注入预览的行内星号统一走共享 `StarGlyph`
+  （同一份 Lucide 路径）。`test/client.test.js` 星形守卫同步收紧为「全文零文本星号」。
+
+## [Unreleased]
+
+## [0.8.8] - 2026-09-27
+
+## 🆕 新增
+
+- **蒸馏思考强度设置项（issue #315，PR #316）**：`summarizeReasoningEffort`（`off`/`low`/`medium`/`high`/`none`，默认 `none` = 不发送字段、行为不变）。思考型模型蒸馏时推理烧光输出预算、总结为空，配 `off`/`low` 可封顶推理；档位被拒自动去字段重试一次（`withEffortFallback` 共享、拒收判别式 `EFFORT_REJECT_RE` 提单一来源）；面板「功能开关 → 自动总结」下新增档位下拉。
+- **压缩边缘双落点（issue #249 N3，PR #314）**：`continuityRescueEnabled`（默认关）——宿主压缩前抢救「正在做什么」：连续性提案落新表 `continuity_proposals`（`(session_id, kind)` 唯一、满 200 弃新）+ 同一份快照追加为序列末尾插件消息（压缩摘要器只看对话内容）。三字段确定性抽取、全程不调模型；降级为持久规则不算失败。新增回归 14 条（`test/continuity.test.js`），文档见 [docs/CONTINUITY.md](docs/CONTINUITY.md)。
+- **错峰队列镜像到巩固（issue #239 第 4 项，PR #320）**：`dreamPeakHours` + `dreamPeakMaxDeferMinutes`（默认 120）——高峰不调模型，skip 审计 + 择时补跑，baseline 不刷新（攒到非高峰一次大 run）；时段解析三件套抽零依赖模块 `src/peak-hours.js`，顺带消除 #316 引入的 dream↔summarize 循环依赖。新增回归（`test/dream-peak-hours.test.js`）。
+- **autoDream 连续失败退避（issue #292，PR #322）**：`autoDreamFailureBackoff`（默认关 = 行为逐字节不变）——开启后有效最小间隔 = `dreamMinIntervalMinutes` × 2^连续失败数，成功清零，封顶 30 分钟（只拦增长、不压小用户配的大基数）。计数内存态，跨重启冷却由 #291 持久化负责。新增回归 5 条（`test/dream-failure-backoff.test.js`）。
+- **配置说明一页（issue #290，PR #322）**：新增 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)——以 `src/config.js` schema 为唯一正本，147 键全覆盖：按功能面分组，每键给默认值 / 作用 / 开启后果与冲突；lightMode 联动键逐行标注。两个 README 文档索引各加一行。
+
+## 🧹 工程
+
+- **GitHub issue 模板三件套（PR #321）**：bug / feature YAML forms（双语、环境字段对齐历史高质量报告）+ config.yml（空白 issue 关闭、问答引导 Discussions、漏洞引导私密通告）；feature 模板内置实现口径自查与 AI 辅助披露。
+- **双 README 重复徽章行去重（PR #319）**：9-24 合并解冲突复制出的 tests 徽章与 `npm test` 注释重复行（根 README 三处、包内两处）手工去重——`badge:sync` 全文替换只会一起刷新、永不自愈。
+
+## [0.8.7] - 2026-09-24
+
+## 🐛 修复
+
+- **DSH 0.1.7 系宿主上面板入口整块消失（issue #287 / #309，PR #310）**：宿主 `dsh-client-ui-primitives`
+  在 0.1.7-alpha.1 起把图标命名从「像素后缀」（`IconArchiveOutline20`）换成「字重后缀」
+  （`OutlineRegular` / `OutlineMedium`）且不留旧名别名，`lib/client.js` 取到 `undefined`
+  交给 `h()` 渲染，落成 React #130，宿主 slot 把崩溃的 entry 整条摘除——侧栏「记忆」入口
+  与记忆库面板一起消失（0.8.5/0.8.6 均受影响，跨 Windows/macOS 实测一致）。修复：运行时
+  按旧名 → `Regular` → `Medium` 顺序探测，全缺时降级为无图标而非崩溃；0.1.6 系旧宿主
+  链首命中不丢图标。回归守卫锁链序、裸常量不得直达 `h()`、4 个渲染点全过助手。
+  感谢 chengxinshengglj-png（#257/#258/#287 三份高质量报告 + 本修复）、idoall（0.1.7-rc.1
+  macOS 复现与 0.8.6 未带修复的拆包证据）、idonweb（五版本 primitives 拆包对拍钉住断点）、
+  lqs50（Windows 复现与控制台日志）。
+
+## 🆕 新增
+
+- **存储无损回收维护入口（issue #275 第一批，PR #307）**：新增 `src/maintenance.js` 与
+  `dsh-mneme reclaim` 子命令（standalone 数据面 `POST /maintenance/reclaim`）。两项零价值
+  判断、零条数变化的回收：`dream_runs.input` 按保留窗口（默认 7 天）置空（run 的骨架、
+  LLM 决策原文与 receipt 一律留住、永不删行）；归档行向量置空（检索 SQL 恒带 `archived = 0`、
+  按定义不可达）。刻意不挂启动路径、不接定时器、不开 `auto_vacuum`：这是不可逆的内容丢弃，
+  只由人显式触发（默认 dry-run，带 `--apply` 才执行，`--vacuum` 单独指定）。报告口径按
+  VACUUM 前后体积量，列文本大小只作上界；执行留一行 receipt。取消归档时服务端重新排队嵌入，
+  回收不是单程票。实测（活库副本：177 个 run 的输入快照 + 295 行归档向量，磁盘足迹
+  69.5 MiB → 50.8 MiB，VACUUM 含 checkpoint 1.2 s）与代价见 `docs/STORAGE.md`。
+- **升格吸收的 evidence 随之归档 + 归档侧第五指标（issue #275 拍板 5，PR #312）**：
+  `memory_document` 注册成功后同一事务把被吸收的原子 evidence 行翻归档（只翻标志位、
+  内容与审计全留、可还原；`keep_evidence_active: true` 可退出；pinned 池 constraint /
+  preference 永不自动归档；document / summary 两类自有生命周期不吸收）。重注册新版文档时
+  认回自己此前吸收过的 evidence 行（窄口径：别的文档引用照旧拒绝、捏造判据不变）。
+  `recall-stats` 新增 `archive` 块（归档总行数 / 窗口内净增 / 日均速率 / 按内容哈希可压掉
+  行数），面板「记忆复用」卡同步展示；判据用内容哈希而不用向量近重复——回收动作本身会清
+  归档行向量，指标不能建在会被自己回收掉的数据上。
+- **写入准入第一阶段：只计量、不拦截（issue #254，PR #305 + #311）**：新增
+  `src/write-admission.js`。三个确定性测量点随每次会话内新建行落进 `llm_audit_logs`
+  （一行一个新建行，全程旁路、任一步失败只 warn、绝不反噬写入）：
+  ① g1 会话写入预算——`session_key` 可空列 + 索引，按会话直接计数即得「会话内新建条数」分布；
+  ② g2 同话题冷却——话题锚只收机械可判的两类（issue/PR 引用、文件路径），重复时附
+  `metadata.g2`（topic + gap_ms）即得「同话题重写间隔」分布；
+  ③ dup 内容哈希——`memories.content_hash` 派生列（归一化 NFKC/小写/去标点/空白折叠后取
+  sha256，存量回填 + 索引 + 五个写入口全重算），归档行与已遗忘行一并纳入去重候选集，
+  命中区分活区 / 归档 / 遗忘三个出口分字段落盘——「出口止体积、不止重复」的另一半由
+  去重候选集兜住。
+  口径收口：只在新行上取测量点（并入已有行不算）；pinned 类型不进预算也不进基准，仍照记
+  一行（穿透频率可观测）；无会话身份的写入（dream / summarize / import / organize）不进
+  预算；`llmAudit.enabled=false` 时一行都不写。不装阈值、不加拦截分支，N 与 X 等真实分布
+  再定（2026-09-23/24 拍板）。
+- **MCP server 拆出独立包 `mneme-memory`（讨论 #300 双包方案第一批，PR #302）**：根目录
+  新增 `mcp/` 包目录（bin 名 `mneme-mcp`），零依赖单文件从 `dsh-mneme/bin/` 迁出——工具面、
+  渲染与 standalone API 数据面完全不变，插件包内旧 bin `dsh-mneme-mcp` 原样保留（向后
+  兼容，已部署挂载零迁移）。新增 env 别名 `MNEME_URL` / `MNEME_TOKEN`（与 `DSH_MNEME_*`
+  同级、后者优先）；跨包平价回归测试锁新包工具定义与 `src/tools.js` 逐字一致。
+  `mneme-memory@0.1.1` 已上 npm 并带 `mcpName` 字段（官方 MCP Registry 发布准备，PR #304）。
+- **MCP 生态收录配套（PR #306 / #308）**：`mcp/server.json` description 压到官方 Registry
+  校验的 100 字符上限内；新增 Dockerfile 与 `glama.json`（Glama 目录的 running-server
+  检查用，`slow-stack/mneme` 已通过 Glama 提交与徽章检查）。
+- **recall_runs 审计回执附带 per-source 检索信号（PR #299）**：`searchMemories` 的 recall
+  回执里每个 candidate 附 `signals`——keyword/vector/bm25/entity 四路的融合前原始分。
+  纯加字段：无 schema 迁移、无新配置开关、不改任何排序行为。动机：自适应融合加权的收益
+  已被消融实验锚定（AssoMem, arXiv 2510.10397），权重画像要靠这组逐路分数才能在真实
+  工作负载上算。
+
+## 🧹 清理
+
+- **README 版本历史瘦身**（PR #301）：包 README 移除「最近版本亮点」逐版本大表与逐小版本
+  路线图表（~140 行），压缩为指向 CHANGELOG 与 GitHub Releases 的短节 + 一行进化链——
+  版本说明以 Release 为唯一事实来源，日后发版不再需要同步改 README。新增「用在其他 AI
+  工具里（MCP）」速查节（根 README 双语）：六客户端最小挂载配置表。移除过时文档：
+  `docs/devlog/`（6 篇 v0.1.x 开发日志）、`docs/MIGRATION.md`（迁移幂等自动执行）、根目录
+  `IDEA.md`（未跟踪草稿）。
+- **仓库更名 slow-stack/dsh-mneme → slow-stack/mneme**（讨论 #300 拍板，PR #303）：旧链
+  GitHub 自动 301，协作者零操作；源码内活引用（徽章图片源、package.json 元数据、运行时
+  issue 链接等 30 处）同步清扫。npm scope `@modusensus/` 不随仓库改名而变。
+
+## [0.8.6] - 2026-09-23
+
+## 🆕 新增
+
+- **Sleep Mode 与实体抽取接入 LLM 审计（issue #250，#286）**：三条从未记账的后台 LLM 链路补进
+  `llm_audit_logs`——sleep 冲突裁决与模式挖掘（`dream/sleep.js` 有自己的一份 `streamText` 副本，
+  此前漏接 `onUsage`，现按 #242 同口径读 `chunk.usage`）与**每次写入记忆都会触发**的实体抽取
+  （适配器此前没有 `service`，根本无记账能力，补 `service`/`config` 入参）。新增 `operation_type`：
+  `sleep_conflict` / `sleep_pattern` / `entity_extract`，`trigger_source` 记 `sleep` / `entityExtract`。
+  不新增配置键——三条链路共用 `llmAudit.enabled` 一个闸门；审计写失败只 warn、绝不反噬功能本体；
+  顺带修审计诚实性（流式成功但输出无 JSON 时记 `status='error'`，与 dream_runs 不再自相矛盾），
+  README 审计节覆盖面改准（autoDream 实为三次调用）。测试 1277 → **1285**。
+
+## 🐛 修复
+
+- **autoDream / sleep 的节流与冷却时刻跨重启持久化（issue #89 连发根因）**：两个调度器的
+  `lastRunAt` 只活在内存里，进程重启即归零——最小间隔 / 冷却闸对新实例放行，重启后立刻连发
+  （#89 Sample A/C 实测：横跨重启边界的 8.7 / 23.1 分钟间隔连发）。修复走审计表：`dream_runs`
+  本来就逐 run 落库（failed/degraded 也算 run），新增 `store.lastDreamRunAt(runType)` 读回最近
+  一次开跑时刻，构造 dream 调度器（`run_type='auto'`）与 sleep 调度器（`run_type='sleep'`）时
+  注入种子——零 schema 迁移、零新配置键。审计行 `created_at` 同时改为记录**开跑时刻**而非完成
+  时刻（run 耗时不应计入下一轮间隔窗口）。回归测试 +5（审计读回与 run_type 过滤、dream/sleep
+  重启闸、index.js 接线源码锁 ×2）。
+
+- **本地嵌入对 BGE 系用错池化（静默偏差，不报错，#285）**：`LocalEmbedder.embed()` 对所有本地模型硬编码
+  `pooling: "mean"`，但 BGE 系（含默认的 `Xenova/bge-small-zh-v1.5`）是按 **CLS** 训练的——模型自带的
+  `1_Pooling/config.json` 明确写着 `pooling_mode_cls_token: true` / `pooling_mode_mean_tokens: false`，
+  官方 README 亦为「select the last hidden state of the first token」+ L2 normalize。此前每次嵌入都用了
+  非训练口径的池化，向量系统性偏移、检索排序受损，且因为不抛错而完全不可观测。
+  新增 `localEmbedPooling`（`auto` 默认 = 按模型族判定，BGE → `cls`，其余 → `mean` 保持既有行为；
+  也可显式钉 `cls` / `mean`）。池化同时进 `modelHash`：默认 `mean` 保持历史指纹形状（未受影响的索引
+  无需重建），`cls` 独立成指纹 ⇒ 既有 mean 空间的索引会被索引一致性闸门判失配并自动重建。
+  测试 1275 → **1277**。
+
+## [0.8.5] - 2026-09-21
+
+## 🆕 新增
+
+- **工具暴露开关：`disableMemorySearch` / `disableMemoryArchive` + 工具描述的调用纪律（默认关＝行为不变）**：跨会话记忆已由注入每轮带上，`memory_search` 只在「注入块里没有、需要深挖」时才值得一次串行往返（生成参数 → 执行 → 回填 → 再生成），`memory_archive` 是整理动作、正常会话很少需要——轻量/慢模型对「何时该调」判断弱，容易顺手每轮调一遍。两个开关把对应工具直接从注册表摘掉（模型看不到就不会调，比在描述里劝更可靠），走 feature_flags 白名单、面板可启停＝线上回滚开关；默认关即工具全暴露，隐藏仅对全新会话生效（live patch reload 下宿主不会反注册已注册的工具）。同批收紧两份常驻文案：`memory_search` 描述点明「相关记忆每轮已注入，只在注入块没有所需内容时才搜」，`memory_archive` 描述补「只在用户要求或条目确已过时时归档，不要中途主动整理」。
+- **agent 主动整理接口（issue #231）：dryRun 比对报告 → 判断 → apply，全程留审计**：内聚块 `src/organize.js`，service 层只做依赖注入 + barrel 出口（`service.organize`，一个入口带 mode 参数——`{ mode: "dryRun" | "apply" }`）。按维护者口径只做功能本体：**不进工具列表、不加独立 opt-in 开关**，#249 到位时只差「注册工具 + 注入指引」一步。① `dryRun({ candidates, agent_scope?, workspace_scope?, sensitivity? })`：逐条与库内**同类型同 scope** 的行比对（精确层 = 标题归一后相等；向量层 = `MIN_SIM 0.92`，与 document 的 C2 档和 `findSessionDuplicate` 的 vector 档同源，不在第三个地方发明阈值），产出 `verdict: exact | near | new` 与命中行（含相似度），**不写记忆表**、只落一行 `dream_runs`（`run_type='organize'`）；行扫描与向量读取按 type 缓存，候选硬上限 50 条（整理不是批量导入）。② `apply({ run_id, decisions })`：`save`（走 `saveWithDedupe`，复用常规写路径的镜像/通知/重嵌入语，不另起一套 epilogue）/ `discard`（只进回执）/ `archive`（**筛除 = 归档，绝不物理删除**），整批一个事务；apply 回执行经 `outcome.dry_run_id` 指回它所依据的那份报告，审计可还原「报告 → 判断 → 落地」三步，receipt 走 `buildReceipt`——与 dream 同一格式，`parseReceipt` 可解。三条硬规则都是「宁可什么都不做」形态：dryRun 不写库；apply 必须引用一次真实 dryRun（没有比对过的候选一律不落库，堵死「跳过报告直接写」的绕过路径）；筛除只归档。宽容形态同仓库红线 4：单条非法候选/决策跳过 + 应用合法子集 + run 记 `degraded`（逐条明细进 `skipped` 列），基础设施级错误记 `failed` 并原样上抛——绝不虚报 ok。`document` 候选在 dryRun 即被拦（唯一铸造口是 `registerDocument`，#230）。`dream_runs.run_type` 的注释补第三档 `organize`（列本身无需迁移）。测试 1220 → **1228**。
+- **注入形态（issue #249 第一批）：能力说明 + 约束/偏好分池逐字保真**：两个 opt-in 键，默认关/零，默认档下注入块与既有行为逐字节一致。① `injectGuidanceEnabled`（默认关）——把「怎么用记忆」的判断指引落到两个零注入成本的位置：`memory_search` / `memory_save` 的工具描述尾部各追加一句判断指引（工具描述常驻、不进每轮上下文），以及一段 order 150 的系统提示段（常量文本、`[dsh-mneme memory]` 前缀——常驻段内容必须同会话内稳定，否则每轮变化会作废其后的前缀缓存；宿主不提供 section seam 时静默跳过，能力说明仍落在工具描述上，不算失败）。指引只加在「何时不该用」真有歧义处：`memory_list` / `memory_get` / `memory_update` 的触发是机械的，`memory_register_document`（#230 已内建 `Use for … lookups`）与 `memory_runtime`（已自带 provision 成本告诫）不重复；跨工具的克制判断进总则段——第 5 条点明可逆替代品（`memory_archive` 隐藏、`memory_forget` 只停注入，两者均可恢复）与**不可逆**的 `memory_delete`，这是全 guide 里唯一有数据损失后果的一句（回归测试锁它在场）。指引写**英文单一正本**（新内聚块 `src/guide.js`）：注入指引的三条参照实现（ACP 的 `ACP_SYSTEM_PROMPT` + `HOW_TO_COMPRESS_RULES`、mnemon 的 `ROUTING_GUIDANCE`、宿主压缩摘要规则）全为英文，仓库既有先例也是工具描述硬编码英文，而 `memory.language` 管的是「生成出来的记忆内容与块内标题」，与本模块是两件事——故不并入 `STR`、不做 zh/en 双写（双写只会让两份文本日后漂移）。② `pinnedInjectBudget`（0–5，默认 0 = 关闭）——约束/偏好类进独立 pin 池：不进相关性竞争（取满预算后前置到块内排序之前）、不参与跨轮轮换（也不进轮换历史——每轮固定出现的 pin 若记进去只会占满轮换窗口、挤掉情景候选的新鲜度）、逐字保真（不受 `injectContentMaxChars` 的常规截断，只受 2000 字硬顶：逐字不等于无界，一条超长约束若无上限会每轮把常驻段吃满，超顶照旧带截断提示）。独立预算的意义是 pin 不占 `maxInjectedItems` 名额、也不会把当前任务需要的情景候选挤出去；超预算条数在块内如实标注「另有 N 条未展示」，绝不静默。选路统计经可选出参 `pinnedStats` 透出，`injectCandidates` 的「返回数组」契约不变。待维护者拍板（PR 内说明，本批次不自行决定）：`constraint` 同属 `CODING_MEMORY_TYPES`，非编码任务里已被 `codingGate` 滤掉、pin 池同样拿不到它。测试 1220 → **1228**。
+- **注入预览（issue #179）**：面板状态页新增「注入预览」卡——展示最近一帧 prompt 组装实际注入了什么：条目构成（类型/标题/重要性/字符数）、hot memory 与总体积、生效参数（maxItems / threshold / 自适应条数 / scope / 轮换抑制）。实现走旁路快照：`src/inject.js` 在真实渲染路径上缓存同一份候选与最终文本（`getInjectionSnapshot()`，不二次检索、零额外开销），`GET /api/dsh-mneme/inject-preview` 只读透传，无快照（autoInject 关闭 / 新会话 / 旧宿主）整卡退化为「暂无预览」不猜；注入器卸载即清空快照，不跨生命周期存留。与 #182 的「极简模式注入关闭」提示卡同区呈现，状态页至此覆盖注入可观测性两端：为什么没注入（minimal 压制）+ 注入了什么（本卡）。另含 #178 无障碍批次一（面板 aria-live 播报网络 / 状态卡语义标题 / 弹层焦点圈 / 冲突按钮可区分标签 / ego 图摘要，对比度审计待宿主主题联调）。
+
+- **document 型记忆——agent 产长文档入库为指针行（issue #230）**：写入权分离——全文归 agent（管线零读零写零改），库里只存摘要 + doc_path + evidence 三样；新工具 `memory_register_document({path,title,summary,tags,importance,evidence})` 作唯一铸造口（内聚块 `src/document.js`，service barrel 出口）：注册校验（~ 展开后绝对路径、存在 + 非空常规文件、evidence 与库求交——合法子集落库 + `evidence_degraded` 系统标记、全捏造整单拒绝）；C2 vector 档比对（minSim 0.92 复用 #127 档语义；同 doc_path/同标题 = 出新版显式 supersede——旧行归档 + `[superseded by <id>]` 指针注记 + content_history 存旧摘要，旧文件不删；仅向量近重复而路径标题都不同 = 拒绝并指路，不越 C1 矛盾检测替 agent 裁决）；store 新增 doc_path 列（幂等迁移），toApiList 条件透出 doc_path（普通行 DTO 逐字节同形），memory_get 渲染亮出文件路径；`documentMemoryEnabled`（默认关，白名单 + lightMode 强制关，面板「记忆增强」组第三处落位）+ `documentInjectBudget`（1–5 默认 2）；注入档位合并拍板（#164 评审线，#230 内一次落地）：叙述条（source=narrative）从纯按需解禁进注入落次优先档（受 dreamNarrativeEnabled 约束，语义/检索路径不变），document 摘要行同档 + 独立预算封顶（超预算跳过由后续候选补位），dream/sleep 五个候选池排除 document（互不代管），heat 免疫（λ=0，指针行不衰减）；写入权分离守卫双保险（saveWithDedupe / updateMemory 拒绝铸造或改入 document，standalone API 数据面给 400 `document-requires-register`），MCP 六件套 memory_list 枚举平价同步 +document（注册工具不进 MCP，接口面归 #231）。
 - **总览（dream_summarize）独立路由与输入硬上限（issue #258）**：`dreamSummaryProvider` / `dreamSummaryModel`（默认空 = 沿用巩固路由，行为逐字节不变）——consolidate 有 `dreamMaxSnapshotSize` 窗口而总览输入为全库无界，两者 ctx 需求差数倍却强制共用 dream 路由：`dreamProvider` 指向小 ctx 模型时总览当场 `CONTEXT_WINDOW_EXCEEDED`（实测 120,969 > 32,768 tokens），指向大 ctx 模型则 consolidate 的卸载收益归零；`dreamSummaryMaxInputs`（默认 0 = 不设上限，0–100000 可调）>0 时按 `updated_at` 倒序保留最新 N 条（与 consolidate 窗口同一排序口径），总览口径脚注的条数随实际输入变化。三键 schema 与 settings 白名单成对落位，面板可调。
 
 - **注入命中留痕与注入命中率（issue #217 增量，2026-09-19 口径确认）**：注入终选集落一行 `mode='inject'` 审计（candidates 存实际注入条目，跟随 `recallRecordDefault` 不设新配置键；`heatEnabled=false` 时照写——留痕与消费解耦）；recall-stats 新增注入口径（轮数 / 注入条数 / 槽位填充率 `slotFillRate`，注入候选计入 Top-N 与僵尸零曝光判定）；面板「记忆复用」卡追加注入段（窗口内无注入行时省略）。
@@ -16,11 +184,19 @@
 
 ## 🐛 修复
 
+- **旧版 service 缺游标 API 时降级为内存游标，不再打断每轮蒸馏（#274 回归修复）**：第三方宿主用旧版 service 构造时没有 `setDistillCursor`，此前直接抛错、一轮都蒸不了——改为记一条 warn 后降级为内存游标（#274 之前的行为）：本进程内不重复蒸馏，重启后的窗口重放由 `saveWithDedupe` 的 (type,title,scope) 三元组兜底；**方法存在但抛错仍向上传播**，那是「写失败须回滚」的恰一次语义，两条语义各带回归锁。
+- **蒸馏游标持久化：重启不再重放历史窗口（issue #229）**：新增 `distill_cursors` 表（幂等迁移，按 `session.id` 记最近成功消费的事件序），游标只向前推进——较小 seq 不覆盖已存进度；记忆写入与游标推进同一事务，LLM 失败 / 解析失败 / 中止 / 记忆写入失败 / 游标写入失败任一处出错都保留窗口、回滚并如实记失败审计（此前游标只在内存里，进程重启后历史窗口被重复蒸馏）。
+- **能力说明第 5 条写全 `memory_forget` 的副作用面，`memory_save` 尾句收短（#249 文案精确性）**：原文只写「`memory_forget` 只停注入」，比工具实况窄——它实际让条目从注入、检索结果与列表三处消失，写窄会让模型低估其影响面；改为与 `memory_archive`（从列表 / 检索 / 注入 / 巩固四处隐藏）同口径，回归测试锁完整短语在场。
+- **运行时完整性判据从未生效：状态词对不上，而且结论根本没读（issue #268）**：`verifyPayload` 只认 `integrity.status === "sha512-matched"`，而下载通道在 `mneme-runtime.json` 里记的是 `{status: "verified", checked, detail}`（`src/runtime/download.js`，自 #133 起）——这份结论一喂进来就恒判 `ok:false`，接线即系统性判失败；更根本的是两个生产调用方（`memory_runtime` 的 verify 分支、`scripts/mneme-runtime.mjs` 的 `runVerify`）都只传 `cacheDir`，**这一层在生产路径上从未运行过**：清单里明写的 mismatch 也被静默放过（红测试证实）。附带第二处形状违约：`loader.js` 把清单里的**对象**直接填进 `describeLocalRuntime` 里声明为 `string|null` 的 `integrity` 字段，经免鉴权的 `/api/dsh-mneme/semantic` 外发，CLI `status` 还会把它打印成 `[object Object]`。修法收成一处：新增 `layout.js` 的 `recordedIntegrity()` 归一清单字段的两种形态（对象 / 缺失），判据与投影都只调它——`verifyPayload` 在调用方未显式传结论时读 `describePayload` 已解析的清单，判据同时认 `verified` 与 `sha512-matched`，并把显式 `unverified` 与「没传」同判（原先一个 `ok:true`、一个 `ok:false`）；不一致的结论（含清单里记下的 mismatch）照样判失败。
+
 - **睡眠冲突/模式阶段的输出预算可配（issue #257）**：`src/dream/sleep.js` 冲突消解与模式发现两处 `maxTokens: 2048` 硬编码提为 `sleepMaxTokens`（默认 8192，schema + 整数白名单成对落位，面板可调）。实测依据（报告者 llama.cpp 环境）：默认档 24 对裁决需 2097 token，恰好压在 2048 边界（53 次运行 48 败 5 胜的「间歇性失败」指纹）；`sleepActionSet: full` 六分支实测需 6967（3.4 倍越界）——该档位自 #126 引入起从未跑通过。流式计费按实际用量，调大不增加成本。
 
 - **审计记账改读 `chunk.usage`，token 不再恒为 0（issue #242）**：dsh-llm 的 StreamChunk 契约把用量嵌在 `{type:"usage", usage:TokenUsage}`（TokenUsage = inputTokens / outputTokens / …），chunk 顶层没有 token 字段——dream / summarize 的审计读取把整个 chunk 当用量对象，input/output 恒为 undefined，审计行落 0（实测 7 天 49 次 success 调用 token 全 0，面板「LLM 消耗」长期显示 0）。改读 `chunk.usage ?? chunk`，`?? chunk` 兜底兼容用量平铺在顶层的替身（嵌套 + 平铺双形状回归测试）。
 
 ## 🧪 工程
+
+- **CI 与徽章口径收敛**：tests 徽章改为本地手工对齐（`npm run badge:sync` 自跑全量取套件总数），ci.yml / release.yml 里的 badge job 全部撤除——github-actions[bot] 推不进受保护的 main（GH006），徽章不再由 CI 自动刷；新增安全扫描三件套（gitleaks 全历史密钥扫描 + PR 依赖审查 + OSV 提醒级兜底，warn-first 起步）；仓库 slug 由 modusensus 迁移至 slow-stack（npm scope 与包名不变）。
+- **依赖告警清零（GitHub code-scanning 四条 open）**：`@huggingface/transformers` 4.2.0 → **4.3.0**（其 sharp 依赖声明升至 `^0.35.4`，消掉 sharp 的两条 high——path 处理与 DoS），`package.json` overrides 的 `adm-zip` 0.6.0 → **0.6.1**（消掉 adm-zip 的 high + medium 各一条；两者均处 devDependency 链——本地嵌入运行时构建面，npm 用户装不到）。连带项：runtime-manifest 闭包在 sharp 0.35 下新走到无 `os` 约束的 `@img/sharp-wasm32` 及 freebsd/webcontainers 两个 WASM 回退包（Node 构建从不 import），按 onnxruntime-web 先例加入 `scripts/build-runtime-manifest.mjs` 的 EXCLUDED 并重生成清单；`test/runtime-manifest.test.js` 的 payloadId 断言由硬编码版本号改为取生成器输出本身（锁格式不锁版本，升级不再碎）。`npm audit`（含 dev 与 --omit=dev 双口径）0 vulnerabilities；全量测试 1243/1242 pass/0 fail/1 skip。
 
 - **全工具矩阵的「DTO 键集 ⊆ output schema」系统性断言（issue #195）**：#184（memory_get 内联 schema 漏声明 v0.8.1 的 scope 来源三键 → 任何被标注过的行都过不了 in-process 校验）此前只有单点回归护住 `memory_get` 一个工具，换一个工具、换一个键，同类事故可以原样重演。新增 `test/tools-dto-schema-matrix.test.js`，四层断言各管一段：① 9 个工具每个可安全触达分支的**真实 execute 返回值**过生产同款校验器 `validateJsonSchemaValue`（不写手抄期望值）；② DTO 唯一产地 `toApiList` 在全形态（极简 / 敏感度 / 事件时间 / 单维与全量 scope 标注）下的输出 ⊆ `MEMORY_ITEM_SCHEMA`，并**反向**要求声明里的每个键都被至少一种形态真实产出（死声明会在下次增键时暴露）；③ 全部工具 schema 的结构不变量（闭合、required ⊆ properties、每项带 type——否则前两层会因校验器形同虚设而静默失效）；④ 负例锁：注入未声明键**必须**报错。护栏自证：两次变异测试（删共享 schema 一个键 / 给 memory_get 塞手抄小副本）分别让 2 条与 3 条断言转红。`memory_runtime` 的 provision（联网下载）与 verify 命中载荷（真实加载模型）不在单测内驱动，由 ③ 兜底声明合规。
 
@@ -28,7 +204,7 @@
 
 ## 🏗️ 工程
 
-- 致谢：heptaspirit（#247 注入命中留痕）、davidekingsss（#248 审计记账修复 + #253 审计边界测试）。
+- 致谢：heptaspirit（#247 注入命中留痕 + #267 agent 主动整理接口 + #277 能力说明文案精确性）、davidekingsss（#248 审计记账修复 + #253 审计边界测试）。
 
 ## [0.8.4] - 2026-09-19
 
