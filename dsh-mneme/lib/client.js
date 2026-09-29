@@ -415,6 +415,8 @@ window.__ModuleLoader__.load({
         "memory.features.autoSummarize.hint": "对话结束自动提炼记忆条目",
         "memory.features.hotMemoryEnabled": "热记忆",
         "memory.features.hotMemoryEnabled.hint": "最近几轮对话原文随注入携带，不写入长期记忆",
+        "memory.features.injectTimePrefix": "对话开始注入当前时间",
+        "memory.features.injectTimePrefix.hint": "每次新会话的首轮注入一次日期与星期（默认关）",
         "memory.features.entityExtractionEnabled": "实体抽取",
         "memory.features.entityExtractionEnabled.hint": "从记忆中提取人物/项目/概念，图谱随之生长",
         "memory.features.entityExtractionProvider": "实体抽取 Provider",
@@ -846,6 +848,8 @@ window.__ModuleLoader__.load({
         "memory.features.autoSummarize.hint": "Distill memory entries when a conversation ends",
         "memory.features.hotMemoryEnabled": "Hot memory",
         "memory.features.hotMemoryEnabled.hint": "Carry the last few turns verbatim; never written to long-term memory",
+        "memory.features.injectTimePrefix": "Inject current time at conversation start",
+        "memory.features.injectTimePrefix.hint": "Adds the date and weekday once at each new session's first turn (off by default)",
         "memory.features.entityExtractionEnabled": "Entity extraction",
         "memory.features.entityExtractionEnabled.hint": "Extract people / projects / concepts so the graph grows by itself",
         "memory.features.entityExtractionProvider": "Entity extraction provider",
@@ -2085,7 +2089,7 @@ window.__ModuleLoader__.load({
     // test/inject-parent-gate.test.js 钉住。
     const FEATURE_CHILDREN = { autoInject: ["injectGuidanceEnabled", "continuityRescueEnabled"] };
     const FEATURE_GROUPS = [
-      { key: "group.core", items: ["autoInject", "autoSummarize", "hotMemoryEnabled", "memoryQualityFilter.enabled", "llmAudit.enabled", "writeAdmission.enabled", "writeAdmission.enforce"] },
+      { key: "group.core", items: ["autoInject", "autoSummarize", "hotMemoryEnabled", "injectTimePrefix", "memoryQualityFilter.enabled", "llmAudit.enabled", "writeAdmission.enabled", "writeAdmission.enforce"] },
       { key: "group.enhance", items: ["entityExtractionEnabled", "codingRetrospect", "rerankEnabled", "resilientModelDownload", "searchSemanticDedup", "bm25SearchEnabled", "heatEnabled", "documentMemoryEnabled"] },
       { key: "group.dream", items: ["autoDream", "sleepModeEnabled"] },
       // v0.8.0 A4（issue #17）：作用域隔离组——标注总开关 + 严格硬过滤。

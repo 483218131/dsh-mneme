@@ -668,8 +668,9 @@ test("GET /api/dsh-mneme/features returns empty overrides and effective config d
   // 本地嵌入池化新增 localEmbedPooling，issue #315 新增 summarizeReasoningEffort，
   // issue #239 第 4 项镜像到巩固新增 dreamPeakHours/dreamPeakMaxDeferMinutes，
   // issue #292 新增 autoDreamFailureBackoff、
-  // issue #254 新增 writeAdmission.enabled/writeAdmission.enforce）
-  assert.equal(Object.keys(data.effective).length, 59 + 3 + 2 + 1 + 2 + 2 + 2 + 1 + 1 + 1 + 2 + 1 + 2);
+  // issue #254 新增 writeAdmission.enabled/writeAdmission.enforce，
+  // issue #34 恢复（#333）新增 injectTimePrefix）
+  assert.equal(Object.keys(data.effective).length, 59 + 3 + 2 + 1 + 2 + 2 + 2 + 1 + 1 + 1 + 2 + 1 + 2 + 1);
   assert.equal(data.effective.dreamSkipInvalid, true);
   assert.equal(data.effective.allowCrossTypeMerge, false);
   assert.equal(data.effective.dreamMinIntervalMinutes, 0);

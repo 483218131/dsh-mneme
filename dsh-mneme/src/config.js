@@ -71,6 +71,9 @@ export const Config = z.object({
   // 提示：上限/原长/全文 memory_get 指引（BUDGET_EXCEEDED 原则——绝不静默）。
   // 默认 300 = 与既有行为一致。
   injectContentMaxChars: z.natural().min(60).max(4000).default(300),
+  // Issue #34（v0.7.2 引入；v0.7.11 误删后随 #333 恢复）：对话开始注入一次当前
+  // 时间。默认关 = 与既有行为一致；格式与键名不变，存量 feature_flags 恢复即生效。
+  injectTimePrefix: z.boolean().default(false),
   importanceThreshold: z.natural().min(1).max(5).default(3),
   // Issue #239（第 5 项）：注入条数的查询自适应（默认关）。确定性强的话题收缩注入
   // 条数（减半、下限 1），模糊话题（回指/时间线索，或极短查询）维持
