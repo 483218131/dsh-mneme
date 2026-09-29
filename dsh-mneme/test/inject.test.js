@@ -394,3 +394,27 @@ test("issue #34/#333: time prefix coexists with hot context (time first, then ho
   const hi = text.indexOf("[短期上下文]");
   assert.ok(ti >= 0 && hi > ti, "time prefix precedes the hot block");
 });
+
+test("issue #34/#333: latch survives interleaved sessions (A-B-A never re-injects A)", () => {
+  const { contexts, service } = setup({ injectTimePrefix: true });
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "用户用中文交流", importance: 5 });
+  contexts[0].text({ agent: { session: { id: "sA" } } });
+  contexts[0].text({ agent: { session: { id: "sB" } } });
+  // 回到 sA：单值闩锁会在这里重复注入（#335 review）；集合闩锁不会。
+  const back = contexts[0].text({ agent: { session: { id: "sA" } } });
+  assert.ok(!back.includes("当前时间"), "interleaved return to session A must not re-inject");
+});
+
+test("issue #334: snapshot query carries no lone surrogate (query path cut at exact limit)", () => {
+  // #335 review：先 slice 再 safeSlice 时，恰为上限的串会绕过检查。现在
+  // lastUserQuery 直接 safeSlice 全文，快照里的 query 必须干净。
+  const { contexts } = setup();
+  const events = [
+    { type: "user/message", data: { source: { kind: "user" }, content: [{ type: "text", text: "q".repeat(499) + "\u{1F534}" }] } },
+    { type: "assistant/message", data: { message: { content: [{ type: "text", text: "ans" }] } } }
+  ];
+  contexts[0].text({ agent: { session: { id: "s-q2", snapshotEvents: () => events } } });
+  const snap = getInjectionSnapshot();
+  assert.ok(snap.query.length > 0, "query recorded");
+  assert.ok(!hasLoneSurrogate(snap.query), "snapshot query is surrogate-clean");
+});

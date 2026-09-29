@@ -57,8 +57,7 @@ function lastUserQuery(ctx) {
         parts
           .map((p) => (typeof p === "string" ? p : p?.text ?? ""))
           .filter(Boolean)
-          .join("\n")
-          .slice(0, 500),
+          .join("\n"),
         500
       );
     }
@@ -223,19 +222,23 @@ export function createInjector(ctx, service, settings, config) {
   // CHANGELOG 开着开关，实际什么都不会发生。本次按 v0.7.2 语义原样恢复：键名、
   // 默认值（false）、格式 `[当前时间: YYYY-MM-DD 周X HH:MM]` 全部不变，存量
   // feature_flags 里的配置恢复即生效。
-  const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
-  let timePrefixSession = null;
+  // 已注入过时间前缀的会话集合（#335 review：单值闩锁在 A→B→A 交替渲染下会
+  // 重复注入）。上限 500 防长驻进程无界增长，超限逐出最早记录。
+  const timePrefixDone = new Set();
+  let timePrefixBare = false;
 
   function renderTimePrefix(ctx) {
     if (config.injectTimePrefix !== true) return "";
     const sessionId = ctx?.agent?.session?.id;
     if (sessionId === undefined) {
-      if (timePrefixSession !== null) return "";
-      timePrefixSession = true;
+      if (timePrefixBare) return "";
+      timePrefixBare = true;
     } else {
-      if (sessionId === timePrefixSession) return "";
-      timePrefixSession = sessionId;
+      if (timePrefixDone.has(sessionId)) return "";
+      if (timePrefixDone.size >= 500) timePrefixDone.delete(timePrefixDone.keys().next().value);
+      timePrefixDone.add(sessionId);
     }
+    const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
     const now = new Date();
     const pad = (n) => String(n).padStart(2, "0");
     const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
