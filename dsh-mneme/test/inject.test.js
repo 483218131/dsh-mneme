@@ -281,3 +281,140 @@ test("injection snapshot: records adaptive budget and rotation state (issue #179
   assert.equal(snap.rotated, 0, "no suppression on first render of a fresh session");
   assert.equal(snap.scoped, null, "no scope when strict scope is off");
 });
+
+
+// ---- issue #334: emoji 代理对截断——注入路径的 4 处截断点绝不留孤立代理项 ----
+//
+// 回归类（报告 #334）：UTF-16 slice 切在代理对中间留下孤立低位代理项，序列化成
+// 非法 UTF-8，DeepSeek API 对每个请求回 400；畸形文本随注入消息被永久写进会话
+// 历史，之后每一轮都带着它——会话级不可逆损坏。锁的是「少一个字符都行，绝不留
+// 半个」这个语义本身，不是某个具体上限值。
+
+// 孤立代理项检测：合法文本不含未配对的 UTF-16 代理项。
+function hasLoneSurrogate(text) {
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) return true;
+  }
+  return false;
+}
+
+// 复现 #334 的现场形状：`## Review 18/40 — 🔴` 恰好在 800 字符上限处切到 🔴。
+const EMOJI_PAD = "# Review 18/40 — ".padEnd(799, "x");
+test("issue #334: hot round response truncated mid-emoji leaves no lone surrogate", () => {
+  const { contexts } = setup();
+  // 799 个 ASCII + 🔴（2 个 UTF-16 码元）= 801：slice(0, 800) 恰好切在代理对中间。
+  const body = EMOJI_PAD + "🔴";
+  assert.equal(body.length, 801, "fixture: cut point lands inside the surrogate pair");
+  const text = contexts[0].text({
+    agent: {
+      session: {
+        id: "s-emoji",
+        events: [
+          { type: "user/message", data: { source: { kind: "user" }, content: ["看下评审进度"] } },
+          { type: "assistant/message", data: { message: { content: [{ type: "text", text: body }] } } }
+        ]
+      }
+    }
+  });
+  assert.ok(text.includes("[短期上下文]"), "hot block rendered");
+  assert.ok(!hasLoneSurrogate(text), "no lone surrogate survives the hot-round truncation");
+  assert.ok(text.includes("Review 18/40"), "truncated body still present up to the cut");
+});
+
+test("issue #334: memory content truncated mid-emoji carries no lone surrogate", () => {
+  const { contexts, service } = setup();
+  // injectContentMaxChars 最小 60：凑一条「恰好把 🔴 切成两半」的记忆。
+  const content = "r".repeat(59) + "🔴";
+  service.saveWithDedupe({ type: "preference", title: "评审", content, importance: 5 });
+  const text = contexts[0].text({});
+  assert.ok(!hasLoneSurrogate(text), "no lone surrogate in the truncated memory entry");
+  assert.ok(text.includes("评审"), "entry still rendered by title");
+});
+
+test("issue #334: lastUserQuery truncation never produces a lone surrogate", () => {
+  const { contexts } = setup();
+  const text = contexts[0].text({
+    agent: {
+      session: {
+        id: "s-q",
+        snapshotEvents: () => [
+          // 499 个 ASCII + 🔴：lastUserQuery 的 slice(0, 500) 切在代理对中间。
+          { type: "user/message", data: { source: { kind: "user" }, content: [{ type: "text", text: "q".repeat(499) + "🔴" }] } },
+          { type: "assistant/message", data: { message: { content: [{ type: "text", text: "答" }] } } }
+        ]
+      }
+    }
+  });
+  assert.ok(text.includes("[短期上下文]"), "round rendered from snapshot events");
+  assert.ok(!hasLoneSurrogate(text), "no lone surrogate from the query truncation path");
+});
+
+// ---- issue #34 恢复（#333）：对话开始注入当前时间，per-session 闩锁 ----
+
+test("issue #34/#333: injectTimePrefix off by default (byte-identical behavior)", () => {
+  const { contexts, service } = setup();
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "用户用中文交流", importance: 5 });
+  const text = contexts[0].text({ agent: { session: { id: "s-t0" } } });
+  assert.ok(!text.includes("当前时间"), "no time prefix when the flag is off (default)");
+});
+
+test("issue #34/#333: enabled prefix appears once per session and carries the date format", () => {
+  const { contexts, service } = setup({ injectTimePrefix: true });
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "用户用中文交流", importance: 5 });
+  const first = contexts[0].text({ agent: { session: { id: "s-t1" } } });
+  assert.match(first, /\[当前时间: \d{4}-\d{2}-\d{2} 周. \d{2}:\d{2}\]/, "prefix format matches v0.7.2 shape");
+  assert.ok(first.startsWith("[当前时间: "), "prefix leads the block");
+  // 同一会话第二次渲染：闩锁生效，不再出现。
+  const second = contexts[0].text({ agent: { session: { id: "s-t1" } } });
+  assert.ok(!second.includes("当前时间"), "latched: same session never re-injects");
+  // 新会话：重新注入。
+  const third = contexts[0].text({ agent: { session: { id: "s-t2" } } });
+  assert.match(third, /\[当前时间: /, "new session re-injects");
+});
+
+test("issue #34/#333: time prefix coexists with hot context (time first, then hot, then memory)", () => {
+  const { contexts } = setup({ injectTimePrefix: true, hotMemoryEnabled: true });
+  const text = contexts[0].text({
+    agent: {
+      session: {
+        id: "s-t3",
+        snapshotEvents: () => [
+          { type: "user/message", data: { source: { kind: "user" }, content: ["问题"] } },
+          { type: "assistant/message", data: { message: { content: [{ type: "text", text: "回答" }] } } }
+        ]
+      }
+    }
+  });
+  const ti = text.indexOf("当前时间");
+  const hi = text.indexOf("[短期上下文]");
+  assert.ok(ti >= 0 && hi > ti, "time prefix precedes the hot block");
+});
+
+test("issue #34/#333: latch survives interleaved sessions (A-B-A never re-injects A)", () => {
+  const { contexts, service } = setup({ injectTimePrefix: true });
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "用户用中文交流", importance: 5 });
+  contexts[0].text({ agent: { session: { id: "sA" } } });
+  contexts[0].text({ agent: { session: { id: "sB" } } });
+  // 回到 sA：单值闩锁会在这里重复注入（#335 review）；集合闩锁不会。
+  const back = contexts[0].text({ agent: { session: { id: "sA" } } });
+  assert.ok(!back.includes("当前时间"), "interleaved return to session A must not re-inject");
+});
+
+test("issue #334: snapshot query carries no lone surrogate (query path cut at exact limit)", () => {
+  // #335 review：先 slice 再 safeSlice 时，恰为上限的串会绕过检查。现在
+  // lastUserQuery 直接 safeSlice 全文，快照里的 query 必须干净。
+  const { contexts } = setup();
+  const events = [
+    { type: "user/message", data: { source: { kind: "user" }, content: [{ type: "text", text: "q".repeat(499) + "\u{1F534}" }] } },
+    { type: "assistant/message", data: { message: { content: [{ type: "text", text: "ans" }] } } }
+  ];
+  contexts[0].text({ agent: { session: { id: "s-q2", snapshotEvents: () => events } } });
+  const snap = getInjectionSnapshot();
+  assert.ok(snap.query.length > 0, "query recorded");
+  assert.ok(!hasLoneSurrogate(snap.query), "snapshot query is surrogate-clean");
+});

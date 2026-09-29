@@ -16,6 +16,23 @@ export function getInjectionSnapshot() {
   return injectionSnapshot;
 }
 
+// Issue #334：UTF-16 截断切开 emoji 代理对会留下孤立代理项（如 🔴 = D83D DD34
+// 在 800 处切，D83D 留下、DD34 被切走）。DSH 把它序列化成非法 UTF-8，DeepSeek
+// API 对每个请求回 400 INVALID_REQUEST——而且畸形文本随注入消息被永久写进会话
+// 历史，此后**每一轮**都带着它，表现为会话从某一轮起连续 400、换话题/重启都不
+// 恢复（会话级不可逆损坏）。防法是「少一个字符都行，绝不留半个」：尾字符是
+// 高位代理（0xD800–0xDBFF）说明它的低位搭档被切走了，把这个高位代理整个丢掉。
+// （反过来尾字符是低位代理不可能孤立——它的搭档必然紧邻在前、同在切点之内。）
+// ASCII-only 的文本零开销（length 相等直接短路）。
+function safeSlice(text, limit) {
+  const s = String(text);
+  if (s.length <= limit) return s;
+  let cut = s.slice(0, limit);
+  const tail = cut.charCodeAt(cut.length - 1);
+  if (tail >= 0xd800 && tail <= 0xdbff) cut = cut.slice(0, -1);
+  return cut;
+}
+
 // Best-effort extraction of the current user's latest message text from the
 // live session, for semantic-first injection (Bug4). The system-prompt
 // interpolator renders synchronously, so this walks the already-materialized
@@ -36,11 +53,13 @@ function lastUserQuery(ctx) {
       if (kind !== undefined && kind !== "user") continue;
       const parts = event.data?.content;
       if (!Array.isArray(parts) || parts.length === 0) continue;
-      return parts
-        .map((p) => (typeof p === "string" ? p : p?.text ?? ""))
-        .filter(Boolean)
-        .join("\n")
-        .slice(0, 500);
+      return safeSlice(
+        parts
+          .map((p) => (typeof p === "string" ? p : p?.text ?? ""))
+          .filter(Boolean)
+          .join("\n"),
+        500
+      );
     }
   } catch { /* session internals unavailable: degrade to no query */ }
   return "";
@@ -85,7 +104,7 @@ function extractRounds(ctx, maxRounds) {
       const isUser = event?.type === "user/message" && (kind === undefined || kind === "user");
       if (isUser) {
         if (pendingQuery) rounds.push({ query: pendingQuery, response: "" });
-        pendingQuery = textOf(event).slice(0, 500);
+        pendingQuery = safeSlice(textOf(event), 500);
         continue;
       }
       // Only assistant-originated events close a round; tool/system events
@@ -94,7 +113,7 @@ function extractRounds(ctx, maxRounds) {
         || kind === "assistant";
       const body = isAssistant ? textOf(event) : "";
       if (!body || !pendingQuery) continue;
-      rounds.push({ query: pendingQuery, response: body.slice(0, 800) });
+      rounds.push({ query: pendingQuery, response: safeSlice(body, 800) });
       pendingQuery = null;
     }
     if (pendingQuery) rounds.push({ query: pendingQuery, response: "" });
@@ -171,7 +190,7 @@ export function createInjector(ctx, service, settings, config) {
   function injectMemory(m, maxLength = maxContent) {
     const text = String(m?.content ?? "");
     if (text.length <= maxLength) return text;
-    return `${text.slice(0, maxLength)}…${STR.truncatedHint[language](maxLength, text.length, m.id)}`;
+    return `${safeSlice(text, maxLength)}…${STR.truncatedHint[language](maxLength, text.length, m.id)}`;
   }
 
   // Prompt-variable brace escaping (issue #162, restored from v0.7.4 #40):
@@ -190,6 +209,41 @@ export function createInjector(ctx, service, settings, config) {
   function escapePromptVars(text) {
     if (config.escapePromptVariables === false) return String(text);
     return String(text).replace(/[{}]{2,}/g, (run) => run.split("").join("\\"));
+  }
+
+  // Time-prefix injection (issue #34，恢复于 #333): opt-in, off by default.
+  // When enabled the current date/time is injected once per conversation — at
+  // the first prompt assembly of a new session — so the model can sense what
+  // time/day it is. A per-session latch means later assemblies in the same
+  // session never re-inject; a bare render ctx (no session id) falls back to
+  // once per injector lifetime.
+  // v0.7.11 面板大改版（ce4658e）时这段随一次批量删除被静默移除，CHANGELOG 无
+  // 登记（#162 的 escapePromptVars 同刀误删、后来恢复，本函数漏了）——用户按
+  // CHANGELOG 开着开关，实际什么都不会发生。本次按 v0.7.2 语义原样恢复：键名、
+  // 默认值（false）、格式 `[当前时间: YYYY-MM-DD 周X HH:MM]` 全部不变，存量
+  // feature_flags 里的配置恢复即生效。
+  // 已注入过时间前缀的会话集合（#335 review：单值闩锁在 A→B→A 交替渲染下会
+  // 重复注入）。上限 500 防长驻进程无界增长，超限逐出最早记录。
+  const timePrefixDone = new Set();
+  let timePrefixBare = false;
+
+  function renderTimePrefix(ctx) {
+    if (config.injectTimePrefix !== true) return "";
+    const sessionId = ctx?.agent?.session?.id;
+    if (sessionId === undefined) {
+      if (timePrefixBare) return "";
+      timePrefixBare = true;
+    } else {
+      if (timePrefixDone.has(sessionId)) return "";
+      if (timePrefixDone.size >= 500) timePrefixDone.delete(timePrefixDone.keys().next().value);
+      timePrefixDone.add(sessionId);
+    }
+    const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+    const time = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+    return escapePromptVars(`[当前时间: ${date} ${WEEKDAYS[now.getDay()]} ${time}]`);
   }
 
   // Hot memory (v0.5.0 1.3): the latest rounds of THIS session, rebuilt from
@@ -335,7 +389,12 @@ export function createInjector(ctx, service, settings, config) {
         // separate context) keeps the prompt assembly stable at two blocks.
         const hotText = renderHotContext(ctx);
         const body = render(candidates, pinnedStats);
-        const finalBody = !hotText ? body : body ? `${hotText}\n\n${body}` : hotText;
+        // #333（issue #34 恢复）：时间前缀只在会话首轮出现（per-session 闩锁），
+        // 排在整个记忆块的最前——模型先知道「今天几号」，再看热上下文与长期记忆。
+        const timePrefix = renderTimePrefix(ctx);
+        // 拼接次序：时间 → 热上下文 → 长期记忆（三者都可能为空，逐级判空拼接）。
+        const withHot = !hotText ? body : body ? `${hotText}\n\n${body}` : hotText;
+        const finalBody = !timePrefix ? withHot : withHot ? `${timePrefix}\n\n${withHot}` : timePrefix;
         // Issue #179：旁路缓存一帧——面板「注入预览」卡据此展示构成与体积。
         // chars 为条目内容的截断后近似值（与 render 同一函数计长），totalChars
         // 是本次实际返回块的精确长度。maxItems 反映自适应收缩后的生效值。

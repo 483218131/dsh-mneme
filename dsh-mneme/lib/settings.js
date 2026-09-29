@@ -43,6 +43,9 @@ const FEATURE_FLAG_BOOLEANS = [
   "autoInject",
   "autoSummarize",
   "hotMemoryEnabled",
+  // Issue #34（v0.7.2 引入；v0.7.11 误删后随 #333 恢复）：对话开始注入当前时间。
+  // 顶层扁平键，随白名单回面板（FEATURE_GROUPS 的 group.core）。
+  "injectTimePrefix",
   // Issue #239 第 5 项：注入条数的查询自适应（确定性强则收缩注入条数，默认关）。
   "injectUncertaintyAdaptive",
   // Issue #249：能力说明（工具描述判断指引 + order 150 总则段）。第二批起它是
