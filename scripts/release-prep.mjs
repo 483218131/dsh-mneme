@@ -5,6 +5,7 @@
 "use strict";
 
 import fs from "node:fs";
+import { applyTestCount } from "../dsh-mneme/scripts/test-count-sync.mjs";
 
 const version = (process.argv[2] || "").replace(/^v/, "");
 const testCount = process.argv[3];
@@ -31,14 +32,17 @@ for (const f of [PKG, LOCK]) {
   console.log(`✓ ${f} → ${version}`);
 }
 
-// ── 2. 测试徽章同步（两个 README）──
+// ── 2. 测试数同步（两个 README：徽章 + 4 种 `# N …测试` 注释形状）──
+// 规则收在 dsh-mneme/scripts/test-count-sync.mjs，与手动路径 sync-test-badge.mjs
+// 共用。原先两条路径各存一份、形状集合还不同——本脚本只 replace 徽章 URL，于是
+// v0.8.11 发版时徽章跳到 1437 而四条注释留在 1431，自动路径反倒成了漂移来源。
 if (testCount && /^\d+$/.test(testCount)) {
   for (const f of READMES) {
     const t = fs.readFileSync(f, "utf8");
-    const n = t.replace(/tests-\d+%20passed/g, `tests-${testCount}%20passed`);
+    const n = applyTestCount(t, testCount);
     if (n !== t) {
       fs.writeFileSync(f, n);
-      console.log(`✓ ${f} 测试徽章 → ${testCount}`);
+      console.log(`✓ ${f} 测试数 → ${testCount}`);
     }
   }
 }

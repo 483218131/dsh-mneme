@@ -183,7 +183,7 @@ dsh web
 
 ```bash
 cd dsh-mneme && npm install
-npm test        # 1431 个测试
+npm test        # 1437 个测试
 npm run stress  # 三轴线压测
 npm run sync    # src → lib 同步
 ```
@@ -366,7 +366,7 @@ The plugin ships a zero-dependency stdio MCP server (standalone npm package **`m
 
 ```bash
 cd dsh-mneme && npm install
-npm test        # 1431 tests
+npm test        # 1437 tests
 npm run stress  # three-axis stress test
 npm run sync    # src → lib sync
 ```

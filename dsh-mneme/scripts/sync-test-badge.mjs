@@ -6,7 +6,9 @@
 //   1. 跑一遍全量测试（npm test），取套件总数（`ℹ tests N` 汇总行）；
 //   2. 把双 README 的 tests 徽章（img.shields.io/badge/tests-N%20passed）与
 //      开发命令注释（# N 个测试 / # 运行 N 个测试 / # N 个 node:test 测试 /
-//      # N tests）刷成该数字；
+//      # N tests）刷成该数字——形状集合收在 scripts/test-count-sync.mjs，与发版
+//      自动路径 scripts/release-prep.mjs 共用（两条路径各存一份曾导致 v0.8.11
+//      徽章与注释不同数）；
 //   3. 有变化就写回文件（由调用方决定是否 commit/push），无变化静默退出。
 //
 // 测试失败（fail>0 或进程非零退出）时以非零退出且不改任何文件——徽章永远
@@ -16,6 +18,7 @@ import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { applyTestCount } from "./test-count-sync.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(scriptDir, "..", "..");
@@ -46,18 +49,17 @@ if (!count) {
   process.exit(1);
 }
 
-// 3) 刷双 README（徽章 + 两行开发命令注释）
+// 3) 刷双 README（徽章 + 四种开发命令注释形状）
+// 形状集合与 release-prep.mjs（发版自动路径）共用，收在 scripts/test-count-sync.mjs —
+// 两条路径各自维护一份规则正是 v0.8.11 注释漂移的根因。
 const targets = [
   join(repoRoot, "README.md"),
   join(repoRoot, "dsh-mneme", "README.md")
 ];
 let changed = 0;
 for (const file of targets) {
-  let text = readFileSync(file, "utf8");
-  const next = text
-    .replace(/tests-\d+%20passed-/g, `tests-${count}%20passed-`)
-    .replace(/(#\s*(?:运行\s*)?)\d+( 个(?:\s*node:test)?\s*测试)/g, `$1${count}$2`)
-    .replace(/(#\s*)\d+( tests)/g, `$1${count}$2`);
+  const text = readFileSync(file, "utf8");
+  const next = applyTestCount(text, count);
   if (next !== text) {
     writeFileSync(file, next);
     changed += 1;
