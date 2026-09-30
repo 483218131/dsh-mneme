@@ -253,7 +253,7 @@ v0.3.0 起新增**记忆基因**层：从记忆里抽取**命名实体**、**带
 
 ### 前置条件
 
-- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）— 兼容 DSH 0.1.x，已验证 0.1.2-rc.1（`Session.events` → `snapshotEvents()` 变更已由插件垫片兼容，新旧版本通吃；v0.7.9 确保该垫片真正进入发布产物 lib/）
+- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）— 兼容 DSH 0.1.x 与 0.2.x（三段式 peer 范围见 `package.json`）；开发与 CI 已对齐 0.2 线，`0.2.0-rc.1` / `0.2.0-rc.2` 实测全绿。旧版兼容垫片（`Session.events` → `snapshotEvents()`，v0.7.9 起确保进入发布产物 lib/）保留
 - Node 24+（`node:sqlite`）
 
 ### 安装步骤
